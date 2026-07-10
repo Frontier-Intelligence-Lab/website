@@ -1,36 +1,51 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Frontier Intelligence Labs — Website
 
-## Getting Started
+Marketing site for Frontier Intelligence Labs, an independent intelligence lab making frontier AI knowledge accessible. Implemented from the [Claude Design](https://claude.ai/design) project "Frontier Intelligence Labs Website".
 
-First, run the development server:
+![Status](https://img.shields.io/badge/status-in%20development-blue) ![Next.js](https://img.shields.io/badge/Next.js-16-black) ![React](https://img.shields.io/badge/React-19-149eca) ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6)
 
-```bash
+## Status at a glance
+
+| Page | Status |
+| --- | --- |
+| Home (`/`) | Implemented |
+| About, Vision, Objective, Team, Contact | Roadmap (designs exist in the Claude Design project) |
+
+## Quick start
+
+```powershell
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000. Production build: `npm run build`, then `npm run start`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Repository map
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```
+app/
+  layout.tsx        Root layout — fonts (Newsreader, IBM Plex Mono via next/font), metadata
+  page.tsx          Home page: hero, Fig. 01, What We Do, equations, position band
+  globals.css       Design tokens (--fil-* CSS variables) and all component styles
+components/
+  SiteHeader.tsx    Accent bar, sticky header, nav, meta strip
+  SiteFooter.tsx    Footer columns and colophon
+  TunnelingFigure.tsx  Client component — animated quantum-tunneling canvas (Fig. 01)
+```
 
-## Learn More
+## Design system
 
-To learn more about Next.js, take a look at the following resources:
+Tokens live as `--fil-*` CSS custom properties in `app/globals.css` (background, ink, muted, line, band, accent `#2E45B8`). Type: Newsreader (display serif, variable weight + optical size) and IBM Plex Mono (labels), self-hosted through `next/font/google`. The tunneling animation respects `prefers-reduced-motion` (renders a static frame).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Verification
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```powershell
+npm run lint    # ESLint — passing
+npm run build   # Type check + production build — passing, / prerenders statically
+```
 
-## Deploy on Vercel
+Visual check: page verified against the design in a headless browser at 1280 and 1440 widths with no console errors.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## License
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+No license file is currently checked in; all rights reserved by default.
