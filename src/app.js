@@ -13,6 +13,7 @@ import { createSigninLog } from './lib/signins.js';
 import { isSameOriginRequest } from './lib/origin.js';
 import { createStore } from './store/index.js';
 import { registerAccountRoutes } from './accounts.js';
+import { registerDatasetRoutes } from './datasets.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -22,7 +23,7 @@ const BUILD_DIRS = /^\/(assets|private)\//;
 const SAFE_SUBPATH = /^(?!.*\.\.)[\w./-]+$/;
 
 // Onboarding pages; the React app renders them and the API enforces sign-in and membership.
-const ACCOUNT_PAGES = ['/signup', '/signin', '/verify', '/start', '/setup/*', '/w/*'];
+const ACCOUNT_PAGES = ['/signup', '/signin', '/verify', '/start', '/setup/*', '/w/*', '/invite/*', '/staff', '/staff/*'];
 
 export async function buildApp({ config, logger = false, contactTransport, mailTransport, store, rateLimits = {}, distDir = DEFAULT_DIST }) {
   let indexHtml;
@@ -53,7 +54,8 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
         'style-src': ["'self'"],
         'img-src': ["'self'"],
         'font-src': ["'self'"],
-        'connect-src': ["'self'"],
+        // Sample uploads go straight to the ingest service, so the browser may also connect to it.
+        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'form-action': ["'self'"],
         'base-uri': ["'self'"],
         'frame-ancestors': ["'none'"],
@@ -116,7 +118,9 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
       return page(reply);
     });
   }
-  await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers: { sameOrigin, privateHeaders, problem } });
+  const helpers = { sameOrigin, privateHeaders, problem };
+  const { guards } = await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers });
+  registerDatasetRoutes(app, { config, store: accountStore, helpers, guards });
 
   const signInConfigured = config.reviewers.length > 0;
   app.get('/api/config', async () => ({

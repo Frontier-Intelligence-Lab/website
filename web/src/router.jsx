@@ -54,6 +54,8 @@ function accountRoutes() {
   const org = () => import('./app/org.jsx');
   const personal = () => import('./app/personal.jsx');
   const project = () => import('./app/project.jsx');
+  const invite = () => import('./app/invite.jsx');
+  const staff = () => import('./app/staff.jsx');
   return [
     { path: '/signup', lazy: page(auth, 'SignUp', 'signUpLoader') },
     { path: '/signin', lazy: page(auth, 'SignIn', 'signInLoader') },
@@ -70,5 +72,8 @@ function accountRoutes() {
     { path: '/w/:slug/projects/:projectId/success', lazy: page(project, 'ProjectSuccess', 'successLoader') },
     { path: '/w/:slug/projects/:projectId/data', lazy: page(project, 'ProjectData', 'dataLoader') },
     { path: '/w/:slug/projects/:projectId/model', lazy: page(project, 'ProjectModel', 'modelLoader') },
+    { path: '/invite/:token', lazy: page(invite, 'Invite', 'inviteLoader') },
+    { path: '/staff', lazy: page(staff, 'StaffQueue', 'queueLoader') },
+    { path: '/staff/reviews/:reviewId', lazy: page(staff, 'StaffReview', 'reviewLoader') },
   ].map((route) => ({ ...route, ErrorBoundary: RouteError, HydrateFallback: Loading }));
 }

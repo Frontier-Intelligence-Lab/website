@@ -14,6 +14,9 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const invitations = [];
   const joinRequests = [];
   const projects = new Map();
+  const uploads = [];
+  const reviews = [];
+  const versions = [];
   const audit = [];
   const copy = (value) => (value == null ? null : structuredClone(value));
   const stamp = () => now().toISOString();
@@ -113,6 +116,36 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
         .filter((i) => i.workspaceId === workspaceId && !i.acceptedAt && !i.revokedAt && new Date(i.expiresAt) > now())
         .map(({ tokenHash, ...i }) => copy(i));
     },
+    async getInvitationByTokenHash(tokenHash) {
+      const i = invitations.find((x) => x.tokenHash === tokenHash);
+      if (!i) return null;
+      const { tokenHash: _, ...rest } = i;
+      return { ...copy(rest), workspaceName: workspaces.get(i.workspaceId).name, workspaceSlug: workspaces.get(i.workspaceId).slug };
+    },
+    async acceptInvitation({ invitationId, userId }) {
+      const i = invitations.find((x) => x.id === invitationId);
+      if (!i) throw new StoreError('not_found');
+      if (i.acceptedAt || i.revokedAt) throw new StoreError('already_decided');
+      if (new Date(i.expiresAt) <= now()) throw new StoreError('invite_expired');
+      const existing = members.find((m) => m.workspaceId === i.workspaceId && m.userId === userId);
+      i.acceptedAt = stamp();
+      if (!existing) members.push({ workspaceId: i.workspaceId, userId, role: i.role, createdAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId: i.workspaceId, actorId: userId, action: 'invitation.accepted', targetType: 'invitation', targetId: i.id, metadata: { role: i.role }, createdAt: stamp() });
+      return { workspaceId: i.workspaceId, role: existing?.role ?? i.role, alreadyMember: Boolean(existing) };
+    },
+    async revokeInvitation({ workspaceId, invitationId, actorId }) {
+      const i = invitations.find((x) => x.id === invitationId && x.workspaceId === workspaceId);
+      if (!i) throw new StoreError('not_found');
+      if (i.acceptedAt || i.revokedAt) throw new StoreError('already_decided');
+      i.revokedAt = stamp();
+      audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'invitation.revoked', targetType: 'invitation', targetId: i.id, metadata: {}, createdAt: stamp() });
+    },
+    async updateWorkspaceProfile({ workspaceId, profile }) {
+      const w = workspaces.get(workspaceId);
+      if (!w) throw new StoreError('not_found');
+      w.profile = { ...w.profile, ...copy(profile) };
+      return copy(w);
+    },
 
     async createJoinRequest({ workspaceId, userId, note = '' }) {
       if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
@@ -167,6 +200,73 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     },
     async listProjects(workspaceId) {
       return [...projects.values()].filter((p) => p.workspaceId === workspaceId).map(copy);
+    },
+
+    async createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename }) {
+      const project = projects.get(projectId);
+      if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+      if (uploads.some((u) => u.objectKey === objectKey)) throw new StoreError('duplicate_upload');
+      const duplicateOf = uploads.find((u) => u.projectId === projectId && u.sha256 === sha256)?.id ?? null;
+      const upload = { id: randomUUID(), workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, duplicateOf, createdAt: stamp() };
+      uploads.push(upload);
+      return copy(upload);
+    },
+    async listUploads({ workspaceId, projectId }) {
+      return uploads.filter((u) => u.workspaceId === workspaceId && u.projectId === projectId).map(copy);
+    },
+    async getUpload(uploadId) {
+      return copy(uploads.find((u) => u.id === uploadId));
+    },
+
+    async submitForReview({ workspaceId, projectId, submittedBy }) {
+      const project = projects.get(projectId);
+      if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+      if (!['draft', 'changes_requested'].includes(project.status)) throw new StoreError('invalid_state');
+      const review = { id: randomUUID(), workspaceId, projectId, submittedBy, status: 'pending', reviewerId: null, notes: null, checks: {}, decidedAt: null, createdAt: stamp() };
+      reviews.push(review);
+      project.status = 'in_review';
+      project.updatedAt = stamp();
+      audit.push({ id: audit.length + 1, workspaceId, actorId: submittedBy, action: 'review.submitted', targetType: 'project', targetId: projectId, metadata: { reviewId: review.id }, createdAt: stamp() });
+      return copy(review);
+    },
+    async listReviews({ status = 'pending' } = {}) {
+      return reviews.filter((r) => r.status === status).map((r) => {
+        const p = projects.get(r.projectId);
+        return { ...copy(r), projectName: p.name, workspaceName: workspaces.get(r.workspaceId).name };
+      });
+    },
+    async getReview(reviewId) {
+      return copy(reviews.find((r) => r.id === reviewId));
+    },
+    async listProjectReviews({ workspaceId, projectId }) {
+      return reviews.filter((r) => r.workspaceId === workspaceId && r.projectId === projectId).map(copy);
+    },
+    async decideReview({ reviewId, reviewerId, decision, notes = null, checks = {} }) {
+      const review = reviews.find((r) => r.id === reviewId);
+      if (!review) throw new StoreError('not_found');
+      if (review.status !== 'pending') throw new StoreError('already_decided');
+      Object.assign(review, { status: decision, reviewerId, notes, checks: copy(checks), decidedAt: stamp() });
+      const project = projects.get(review.projectId);
+      project.status = decision;
+      project.updatedAt = stamp();
+      audit.push({ id: audit.length + 1, workspaceId: review.workspaceId, actorId: reviewerId, action: `review.${decision}`, targetType: 'project', targetId: review.projectId, metadata: { reviewId }, createdAt: stamp() });
+      return copy(review);
+    },
+
+    async createDatasetVersion({ workspaceId, projectId, createdBy, manifest }) {
+      const project = projects.get(projectId);
+      if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+      if (!['approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+      const number = versions.filter((v) => v.projectId === projectId).length + 1;
+      const version = { id: randomUUID(), workspaceId, projectId, number, createdBy, manifest: copy(manifest), createdAt: stamp() };
+      versions.push(version);
+      project.status = 'versioned';
+      project.updatedAt = stamp();
+      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'dataset_version.created', targetType: 'project', targetId: projectId, metadata: { number }, createdAt: stamp() });
+      return copy(version);
+    },
+    async listDatasetVersions({ workspaceId, projectId }) {
+      return versions.filter((v) => v.workspaceId === workspaceId && v.projectId === projectId).map(copy);
     },
 
     async recordAudit({ workspaceId = null, actorId = null, action, targetType = null, targetId = null, metadata = {} }) {

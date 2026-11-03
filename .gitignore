@@ -19,3 +19,8 @@ reviewers*.json
 *.pem
 *.log
 .gstack/
+
+# Rust build output
+services/*/target/
+# local object storage for development
+/.local/

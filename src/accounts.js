@@ -2,7 +2,7 @@ import { createHmac, randomBytes, randomInt } from 'node:crypto';
 import nodemailer from 'nodemailer';
 import { hashPassword, verifyPassword } from './lib/passwords.js';
 import { StoreError } from './store/index.js';
-import { PERSONAL_DOMAINS, emailDomain, isEmail, normalizeDomain, slugify, validateProjectPatch, validateProjectStart } from './lib/onboarding.js';
+import { PERSONAL_DOMAINS, emailDomain, isAcademicDomain, isEmail, normalizeDomain, slugify, validateProjectPatch, validateProjectStart } from './lib/onboarding.js';
 
 const ROLES = ['owner', 'admin', 'member', 'finance', 'viewer'];
 const CAN = {
@@ -12,13 +12,16 @@ const CAN = {
 };
 const CODE_TTL_MS = 15 * 60 * 1000;
 const INVITE_TTL_MS = 7 * 86400 * 1000;
-const STATUS = { email_taken: 409, slug_taken: 409, personal_exists: 409, already_member: 409, already_decided: 409, not_found: 404 };
+const STATUS = { email_taken: 409, slug_taken: 409, personal_exists: 409, already_member: 409, already_decided: 409, duplicate_upload: 409, invalid_state: 409, invite_expired: 410, not_found: 404 };
 const MESSAGES = {
   email_taken: 'An account with that email already exists. Sign in instead.',
   slug_taken: 'That workspace address is taken. Try another.',
   personal_exists: 'You already have a personal workspace.',
   already_member: 'You are already a member of this organization.',
   already_decided: 'This request was already decided.',
+  duplicate_upload: 'This upload was already recorded.',
+  invalid_state: 'This step is not available for the project right now.',
+  invite_expired: 'This invitation has expired. Ask for a new one.',
   not_found: 'Not found.',
 };
 
@@ -89,6 +92,7 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     const requests = await store.listJoinRequestsForUser(user.id);
     return {
       user,
+      isStaff: Boolean(user.emailVerifiedAt) && config.staffEmails.includes(user.email),
       workspaces: memberships.map(({ workspace: w, role }) => ({ id: w.id, kind: w.kind, name: w.name, slug: w.slug, role })),
       joinRequests: requests.filter((r) => r.status === 'pending').map((r) => ({ id: r.id, workspaceId: r.workspaceId, workspaceName: r.workspaceName, status: r.status })),
     };
@@ -197,10 +201,17 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
         industry: text(body.industry, 80) || null, sizeBand: text(body.sizeBand, 20) || null,
         profile: { creatorRole: text(body.creatorRole, 80) || null }, ownerId: request.user.id,
       });
+      let ownerInvite = null;
       if (body.forSomeoneElse) {
-        await store.createInvitations({ workspaceId: workspace.id, invitedBy: request.user.id, invites: [{ email: ownerEmail, role: 'owner', tokenHash: pepper(randomBytes(24).toString('base64url')), expiresAt: new Date(Date.now() + INVITE_TTL_MS) }] });
+        const token = randomBytes(24).toString('base64url');
+        await store.createInvitations({ workspaceId: workspace.id, invitedBy: request.user.id, invites: [{ email: ownerEmail, role: 'owner', tokenHash: pepper(token), expiresAt: new Date(Date.now() + INVITE_TTL_MS) }] });
+        const link = `${config.publicOrigin || `${request.protocol}://${request.host}`}/invite/${token}`;
+        if (mailer.configured) {
+          await mailer.send({ to: ownerEmail, subject: `${request.user.name} set up ${name} on Valcairn for you`, body: `${request.user.name} created the ${name} organization on Valcairn and invited you as its owner.\n\nAccept: ${link}\n\nThe link works once and expires in 7 days.` });
+          ownerInvite = { delivered: true };
+        } else ownerInvite = { delivered: false, ...(exposeCodes ? { devLink: link } : {}) };
       }
-      return { workspace, domainVerified };
+      return { workspace, domainVerified, ownerInvite };
     } catch (err) { return fail(reply, err); }
   });
 
@@ -262,10 +273,76 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     }
     if (!invites.length) return problem(reply, 400, 'Add at least one email address.');
     try {
-      const count = await store.createInvitations({ workspaceId: request.params.workspaceId, invitedBy: request.user.id, invites });
-      // Invite emails need SMTP and the accept flow; until then invites are saved but not delivered.
-      return { saved: count, delivered: false };
+      const workspace = await store.getWorkspace(request.params.workspaceId);
+      const tokens = invites.map(() => randomBytes(24).toString('base64url'));
+      invites.forEach((invite, i) => { invite.tokenHash = pepper(tokens[i]); });
+      const count = await store.createInvitations({ workspaceId: workspace.id, invitedBy: request.user.id, invites });
+      const origin = config.publicOrigin || `${request.protocol}://${request.host}`;
+      const links = invites.map((invite, i) => ({ email: invite.email, link: `${origin}/invite/${tokens[i]}` }));
+      if (mailer.configured) {
+        for (const { email, link } of links) {
+          await mailer.send({ to: email, subject: `${request.user.name} invited you to ${workspace.name} on Valcairn`, body: `${request.user.name} invited you to join ${workspace.name} on Valcairn.\n\nAccept the invitation: ${link}\n\nThe link works once and expires in 7 days. Sign in or create an account with this email address (${email}) to accept it.` });
+        }
+        return { saved: count, delivered: true };
+      }
+      return { saved: count, delivered: false, ...(exposeCodes ? { devLinks: links } : {}) };
     } catch (err) { return fail(reply, err); }
+  });
+
+  app.post('/api/workspaces/:workspaceId/invitations/:invitationId/revoke', post([signedIn, member('manageMembers')]), async (request, reply) => {
+    try {
+      await store.revokeInvitation({ workspaceId: request.params.workspaceId, invitationId: request.params.invitationId, actorId: request.user.id });
+      return { ok: true };
+    } catch (err) { return fail(reply, err); }
+  });
+
+  // Anyone holding the link may see which workspace it is for; accepting needs the invited email.
+  async function invitationFor(token) {
+    if (typeof token !== 'string' || token.length < 20 || token.length > 100) return null;
+    return store.getInvitationByTokenHash(pepper(token));
+  }
+  const inviteState = (i) => (i.acceptedAt ? 'used' : i.revokedAt ? 'revoked' : new Date(i.expiresAt) <= new Date() ? 'expired' : 'valid');
+
+  app.get('/api/invitations/:token', { ...get(), config: limit(rateLimits.invite ?? 30) }, async (request, reply) => {
+    const invite = await invitationFor(request.params.token);
+    if (!invite) return problem(reply, 404, 'This invitation link is not valid.');
+    return { workspaceName: invite.workspaceName, role: invite.role, email: invite.email, state: inviteState(invite) };
+  });
+
+  app.post('/api/invitations/:token/accept', { ...post([signedIn, verified]), config: limit(rateLimits.invite ?? 30) }, async (request, reply) => {
+    const invite = await invitationFor(request.params.token);
+    if (!invite) return problem(reply, 404, 'This invitation link is not valid.');
+    if (invite.email !== request.user.email) {
+      return problem(reply, 403, `This invitation is for ${invite.email}. Sign in with that email to accept it.`, { code: 'email_mismatch' });
+    }
+    try {
+      const result = await store.acceptInvitation({ invitationId: invite.id, userId: request.user.id });
+      return { workspaceSlug: invite.workspaceSlug, role: result.role, alreadyMember: result.alreadyMember };
+    } catch (err) {
+      if (err instanceof StoreError && err.code === 'invite_expired') return problem(reply, 410, 'This invitation has expired. Ask for a new one.', { code: 'invite_expired' });
+      if (err instanceof StoreError && err.code === 'already_decided') return problem(reply, 409, 'This invitation was already used or withdrawn.', { code: 'already_decided' });
+      return fail(reply, err);
+    }
+  });
+
+  app.post('/api/workspaces/:workspaceId/academic/send', { ...post([signedIn, verified, member('manageMembers')]), config: limit(rateLimits.resend ?? 5) }, async (request, reply) => {
+    const workspace = await store.getWorkspace(request.params.workspaceId);
+    if (workspace.kind !== 'personal') return problem(reply, 400, 'Academic verification is for personal workspaces.');
+    const email = text(request.body?.email, 254).toLowerCase();
+    if (!isEmail(email) || !isAcademicDomain(emailDomain(email))) return problem(reply, 400, 'Use your university or institute email address.', { errors: { email: 'Use an address at a university or research institute.' } });
+    const sent = await sendCode(request.user, 'academic', email);
+    if (!sent) return problem(reply, 503, 'Email delivery is not configured.');
+    return { ok: true, ...sent };
+  });
+
+  app.post('/api/workspaces/:workspaceId/academic/verify', { ...post([signedIn, verified, member('manageMembers')]), config: limit(rateLimits.verify ?? 20) }, async (request, reply) => {
+    const code = text(request.body?.code, 12).replace(/\s/g, '');
+    if (!/^\d{6}$/.test(code)) return problem(reply, 400, 'Enter the 6-digit code from your email.');
+    const result = await store.consumeEmailCode({ userId: request.user.id, purpose: 'academic', codeHash: pepper(code) });
+    if (!result.ok) return problem(reply, 400, result.reason === 'expired' ? 'That code has expired. Send a new one.' : 'That code is not right.', { reason: result.reason });
+    const workspace = await store.updateWorkspaceProfile({ workspaceId: request.params.workspaceId, profile: { academicEmail: result.email, academicVerifiedAt: new Date().toISOString() } });
+    await store.recordAudit({ workspaceId: workspace.id, actorId: request.user.id, action: 'academic.verified', targetType: 'workspace', targetId: workspace.id });
+    return { workspace };
   });
 
   app.post('/api/workspaces/:workspaceId/join-requests/:requestId/decision', post([signedIn, member('manageMembers')]), async (request, reply) => {
@@ -287,8 +364,18 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   });
 
   app.get('/api/workspaces/:workspaceId/projects/:projectId', get([signedIn, member('readProjects')]), async (request, reply) => {
-    const project = await store.getProject({ workspaceId: request.params.workspaceId, projectId: request.params.projectId });
-    return project ? { project, role: request.role } : problem(reply, 404, 'Not found.');
+    const where = { workspaceId: request.params.workspaceId, projectId: request.params.projectId };
+    const project = await store.getProject(where);
+    if (!project) return problem(reply, 404, 'Not found.');
+    const [uploads, reviews, versions] = await Promise.all([store.listUploads(where), store.listProjectReviews(where), store.listDatasetVersions(where)]);
+    return {
+      project,
+      role: request.role,
+      uploads: uploads.map(({ objectKey, ...u }) => u),
+      latestReview: reviews.at(-1) ? { status: reviews.at(-1).status, notes: reviews.at(-1).notes, checks: reviews.at(-1).checks, decidedAt: reviews.at(-1).decidedAt } : null,
+      versions: versions.map((v) => ({ id: v.id, number: v.number, createdAt: v.createdAt, files: v.manifest.files?.length ?? 0 })),
+      uploadsEnabled: Boolean(config.ingest),
+    };
   });
 
   app.post('/api/workspaces/:workspaceId/projects/:projectId', post([signedIn, member('writeProjects')]), async (request, reply) => {
@@ -302,5 +389,5 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     return { project };
   });
 
-  return { mailer };
+  return { mailer, guards: { signedIn, verified, member, post, get, fail, limit } };
 }

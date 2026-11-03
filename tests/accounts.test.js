@@ -94,7 +94,9 @@ test('workspaces are isolated: non-members get 404 and roles limit what members 
   assert.equal((await stranger.post(`/api/workspaces/${beta.id}/projects/${projectId}`, { success: { measure: 'recall' } })).statusCode, 404);
 
   const invited = await owner.post(`/api/workspaces/${alpha.id}/invitations`, { invites: [{ email: 'v@alpha.com', role: 'viewer' }, { email: 'f@alpha.com', role: 'finance' }] });
-  assert.deepEqual(invited.json(), { saved: 2, delivered: false });
+  assert.equal(invited.json().saved, 2);
+  assert.equal(invited.json().delivered, false);
+  assert.match(invited.json().devLinks[0].link, /\/invite\/[\w-]{20,}$/);
   assert.equal((await owner.post(`/api/workspaces/${alpha.id}/invitations`, { invites: [{ email: 'x@alpha.com', role: 'owner' }] })).statusCode, 400);
   await app.close();
 });

@@ -655,3 +655,6 @@ a { color: inherit; }
 .ob-signout { margin-top: auto; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 .ob-list > li > .ob-badge, .ob-list > li > .avatar { align-self: center; }
 .ob-org-switch { color: inherit; text-decoration: none; }
+.ob--amber { --step: var(--t-amber); --pick: var(--t-amber); --pick-bg: var(--t-amber-bg); }
+.ob-side nav a .ob-badge { margin-left: auto; font-size: 11px; }
+.ob code { font-size: 12.5px; }

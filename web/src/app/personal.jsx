@@ -60,7 +60,7 @@ export function Personal() {
             </div>
           )}
           {academic && (
-            <div className="ob-note tile--violet"><Tile icon="info" tone="violet" size="sm" /><span>Academic email verification, which unlocks datasets licensed only for non-commercial research, comes in a later release. You can add it then without starting over.</span></div>
+            <div className="ob-note tile--violet"><Tile icon="info" tone="violet" size="sm" /><span>After you create the workspace, you can verify a university email. That unlocks datasets licensed only for non-commercial research.</span></div>
           )}
           <div className="ob-field">
             <label htmlFor="work">What are you working on? <span className="ob-optional">(optional)</span></label>

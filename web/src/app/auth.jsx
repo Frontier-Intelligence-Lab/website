@@ -39,16 +39,21 @@ function AuthLayout({ children }) {
   );
 }
 
-export async function signUpLoader() {
+// Only same-site paths may be used as a post-sign-in destination.
+const safeNext = (value) => (typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : null);
+const params = (request) => new URL(request.url).searchParams;
+
+export async function signUpLoader({ request }) {
   const account = await api.account();
-  if (account.user) throw redirect(nextPath(account));
-  return account;
+  const next = safeNext(params(request).get('next'));
+  if (account.user) throw redirect(next ?? nextPath(account));
+  return { ...account, next, email: params(request).get('email') ?? '' };
 }
 
 export function SignUp() {
-  const { signupOpen } = useLoaderData();
+  const { signupOpen, next, email: invitedEmail } = useLoaderData();
   const navigate = useNavigate();
-  const [email, setEmail] = useState('');
+  const [email, setEmail] = useState(invitedEmail);
   const [errors, setErrors] = useState({});
   const [message, setMessage] = useState(null);
   const [pending, setPending] = useState(false);
@@ -59,7 +64,7 @@ export function SignUp() {
     setPending(true);
     const res = await api.signup(Object.fromEntries(new FormData(event.currentTarget))).catch(() => null);
     setPending(false);
-    if (res?.ok) return navigate('/verify', { state: { devCode: res.data.devCode } });
+    if (res?.ok) return navigate('/verify', { state: { devCode: res.data.devCode, next } });
     setErrors(res?.data.errors ?? {});
     setMessage(res?.data.error ?? 'Sign-up failed. Please try again.');
   }
@@ -70,7 +75,7 @@ export function SignUp() {
       <form className="ob-form" onSubmit={submit} noValidate>
         <div className="ob-intro">
           <h1 className="ob-h1">Create your account</h1>
-          <p className="ob-muted">Already have one? <Link to="/signin">Sign in</Link></p>
+          <p className="ob-muted">Already have one? <Link to={next ? `/signin?next=${encodeURIComponent(next)}` : '/signin'}>Sign in</Link></p>
         </div>
         {!signupOpen && <p className="ob-alert" role="status">New accounts aren't open yet. <Link to="/contact">Contact us</Link> for access.</p>}
         {message && <p className="ob-alert" role="alert">{message}</p>}
@@ -97,13 +102,15 @@ export function SignUp() {
   );
 }
 
-export async function signInLoader() {
+export async function signInLoader({ request }) {
   const account = await api.account();
-  if (account.user) throw redirect(nextPath(account));
-  return null;
+  const next = safeNext(params(request).get('next'));
+  if (account.user) throw redirect(next ?? nextPath(account));
+  return { next, email: params(request).get('email') ?? '' };
 }
 
 export function SignIn() {
+  const { next, email } = useLoaderData();
   const navigate = useNavigate();
   const [message, setMessage] = useState(null);
   const [pending, setPending] = useState(false);
@@ -113,8 +120,9 @@ export function SignIn() {
     setPending(true);
     const res = await api.signin(Object.fromEntries(new FormData(event.currentTarget))).catch(() => null);
     setPending(false);
-    if (res?.ok) return navigate(nextPath(await api.account()));
-    setMessage(res?.data.error ?? 'Sign-in failed. Please try again.');
+    if (!res?.ok) return setMessage(res?.data.error ?? 'Sign-in failed. Please try again.');
+    const account = await api.account();
+    return navigate(next && account.user.emailVerifiedAt ? next : nextPath(account), { state: { next } });
   }
 
   return (
@@ -123,10 +131,10 @@ export function SignIn() {
       <form className="ob-form" onSubmit={submit} noValidate>
         <div className="ob-intro">
           <h1 className="ob-h1">Sign in</h1>
-          <p className="ob-muted">New here? <Link to="/signup">Create an account</Link></p>
+          <p className="ob-muted">New here? <Link to={next ? `/signup?next=${encodeURIComponent(next)}` : '/signup'}>Create an account</Link></p>
         </div>
         {message && <p className="ob-alert" role="alert">{message}</p>}
-        <div className="ob-field"><label htmlFor="email">Email</label><input id="email" name="email" type="email" autoComplete="email" maxLength={254} /></div>
+        <div className="ob-field"><label htmlFor="email">Email</label><input id="email" name="email" type="email" autoComplete="email" maxLength={254} defaultValue={email} /></div>
         <div className="ob-field"><label htmlFor="password">Password</label><input id="password" name="password" type="password" autoComplete="current-password" maxLength={256} /></div>
         <button className="btn-app btn-block" type="submit" disabled={pending}>{pending ? 'Signing in…' : 'Sign in'}</button>
         <p className="ob-muted">Invited reviewers use the <Link to="/demo">demo login</Link> instead.</p>
@@ -156,7 +164,8 @@ export function Verify() {
     setPending(true);
     const res = await api.verify(new FormData(event.currentTarget).get('code')).catch(() => null);
     setPending(false);
-    if (res?.ok) return navigate(res.data.match ? '/setup/match' : '/start');
+    const next = safeNext(location.state?.next);
+    if (res?.ok) return navigate(next ?? (res.data.match ? '/setup/match' : '/start'));
     setMessage(res?.data.error ?? 'That did not work. Please try again.');
   }
 

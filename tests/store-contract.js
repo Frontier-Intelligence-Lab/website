@@ -100,6 +100,76 @@ export function runStoreContract(test, makeStore, label) {
     assert.ok(pending.every((i) => i.tokenHash === undefined));
   });
 
+  withStore('invitations are accepted once, by token, and expired or revoked ones are refused', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const guest = await store.createUser({ email: 'g@acme.com', name: 'G', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [
+      { email: 'g@acme.com', role: 'finance', tokenHash: 'tok-ok', expiresAt: later(7) },
+      { email: 'late@acme.com', role: 'viewer', tokenHash: 'tok-old', expiresAt: new Date(Date.now() - 1000) },
+      { email: 'gone@acme.com', role: 'viewer', tokenHash: 'tok-gone', expiresAt: later(7) },
+    ] });
+    const invite = await store.getInvitationByTokenHash('tok-ok');
+    assert.equal(invite.workspaceName, 'Acme');
+    assert.equal(invite.tokenHash, undefined);
+    assert.equal(await store.getInvitationByTokenHash('nope'), null);
+
+    assert.deepEqual(await store.acceptInvitation({ invitationId: invite.id, userId: guest.id }), { workspaceId: ws.id, role: 'finance', alreadyMember: false });
+    assert.deepEqual(await store.getMembership(ws.id, guest.id), { role: 'finance' });
+    await assert.rejects(store.acceptInvitation({ invitationId: invite.id, userId: guest.id }), { code: 'already_decided' });
+    const old = await store.getInvitationByTokenHash('tok-old');
+    await assert.rejects(store.acceptInvitation({ invitationId: old.id, userId: guest.id }), { code: 'invite_expired' });
+    const gone = await store.getInvitationByTokenHash('tok-gone');
+    await store.revokeInvitation({ workspaceId: ws.id, invitationId: gone.id, actorId: owner.id });
+    await assert.rejects(store.acceptInvitation({ invitationId: gone.id, userId: guest.id }), { code: 'already_decided' });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: owner.id });
+    await assert.rejects(store.revokeInvitation({ workspaceId: other.id, invitationId: invite.id, actorId: owner.id }), { code: 'not_found' });
+    assert.equal((await store.listInvitations(ws.id)).length, 0);
+
+    const updated = await store.updateWorkspaceProfile({ workspaceId: ws.id, profile: { academicEmail: 'g@uni.edu' } });
+    assert.equal(updated.profile.academicEmail, 'g@uni.edu');
+  });
+
+  withStore('uploads, review and dataset versions follow the project lifecycle', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const staff = await store.createUser({ email: 'r@valcairn.test', name: 'R', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: owner.id });
+    const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'P', task: 'Spot damaged boxes', modalities: ['Images'], startingPoint: 'own' });
+    const file = { uploadedBy: owner.id, sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'image/png', filename: 'a.png' };
+    const u1 = await store.createUpload({ workspaceId: ws.id, projectId: p.id, objectKey: 'k1', ...file });
+    assert.equal(u1.duplicateOf, null);
+    const u2 = await store.createUpload({ workspaceId: ws.id, projectId: p.id, objectKey: 'k2', ...file });
+    assert.equal(u2.duplicateOf, u1.id);
+    await assert.rejects(store.createUpload({ workspaceId: ws.id, projectId: p.id, objectKey: 'k1', ...file }), { code: 'duplicate_upload' });
+    await assert.rejects(store.createUpload({ workspaceId: other.id, projectId: p.id, objectKey: 'k3', ...file }), { code: 'not_found' });
+    assert.equal((await store.listUploads({ workspaceId: ws.id, projectId: p.id })).length, 2);
+    assert.equal((await store.listUploads({ workspaceId: other.id, projectId: p.id })).length, 0);
+    assert.equal((await store.getUpload(u1.id)).objectKey, 'k1');
+
+    await assert.rejects(store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id, manifest: {} }), { code: 'invalid_state' });
+    const review = await store.submitForReview({ workspaceId: ws.id, projectId: p.id, submittedBy: owner.id });
+    assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).status, 'in_review');
+    await assert.rejects(store.submitForReview({ workspaceId: ws.id, projectId: p.id, submittedBy: owner.id }), { code: 'invalid_state' });
+    const queue = await store.listReviews({ status: 'pending' });
+    assert.equal(queue.length, 1);
+    assert.equal(queue[0].workspaceName, 'Acme');
+
+    await store.decideReview({ reviewId: review.id, reviewerId: staff.id, decision: 'changes_requested', notes: 'Labels missing', checks: { rights: true, labels: false } });
+    assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).status, 'changes_requested');
+    await assert.rejects(store.decideReview({ reviewId: review.id, reviewerId: staff.id, decision: 'approved' }), { code: 'already_decided' });
+    const second = await store.submitForReview({ workspaceId: ws.id, projectId: p.id, submittedBy: owner.id });
+    await store.decideReview({ reviewId: second.id, reviewerId: staff.id, decision: 'approved', checks: { rights: true, labels: true } });
+    assert.equal((await store.listProjectReviews({ workspaceId: ws.id, projectId: p.id })).length, 2);
+
+    const v1 = await store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id, manifest: { files: [u1.sha256] } });
+    assert.equal(v1.number, 1);
+    assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).status, 'versioned');
+    assert.equal((await store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id, manifest: {} })).number, 2);
+    await assert.rejects(store.createDatasetVersion({ workspaceId: other.id, projectId: p.id, createdBy: owner.id, manifest: {} }), { code: 'not_found' });
+    assert.deepEqual((await store.listDatasetVersions({ workspaceId: ws.id, projectId: p.id })).map((v) => v.number), [1, 2]);
+  });
+
   withStore('projects are only reachable through their own workspace', async (store) => {
     const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
     const a = await store.createWorkspace({ kind: 'organization', name: 'A', slug: 'a', ownerId: owner.id });

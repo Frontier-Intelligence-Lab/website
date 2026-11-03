@@ -67,8 +67,8 @@ export function Invited() {
       <main className="ob-main ob-main--narrow">
         <Tile icon="mail" tone="amber" size="lg" />
         <h1 className="ob-h1">Open the link in your invitation</h1>
-        <p className="ob-lede">Invitations are tied to the email they were sent to. Open the link in that email while signed in with the same address, and you'll land in the right workspace with the access you were given.</p>
-        <p className="ob-alert ob-alert--info">Accepting invitations by link is still being built. Until then, ask the person who invited you to approve a join request instead.</p>
+        <p className="ob-lede">Invitations are tied to the email they were sent to. Open the link from that email and sign in with the same address. You'll land in the right workspace with the access you were given.</p>
+        <p className="ob-muted">Can't find it? Links expire after 7 days. Ask the person who invited you to send a new one, or, if your company uses Valcairn, confirm your work email and request to join.</p>
         <div className="ob-actions"><Link className="btn-ghost" to="/start">Back</Link></div>
       </main>
     </SetupShell>
@@ -367,6 +367,12 @@ function OrgTeamManage({ entry, detail }) {
   const [message, setMessage] = useState(null);
   const [saved, setSaved] = useState(null);
   const canAdmin = detail.role === 'owner';
+  const revalidator = useRevalidator();
+  async function revoke(invite) {
+    const res = await api.revokeInvite(entry.id, invite.id).catch(() => null);
+    if (!res?.ok) return setMessage(res?.data.error ?? `Could not withdraw the invitation to ${invite.email}.`);
+    revalidator.revalidate();
+  }
   const next = `/w/${entry.slug}/projects/new`;
 
   const update = (i, patch) => setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
@@ -391,7 +397,10 @@ function OrgTeamManage({ entry, detail }) {
           {message && <p className="ob-alert" role="alert">{message}</p>}
           {(detail.joinRequests.length > 0 || detail.workspace.joinByDomain) && <JoinRequests workspaceId={entry.id} requests={detail.joinRequests} />}
           {saved ? (
-            <div className="ob-note tile--green"><Tile icon="check" tone="green" size="sm" /><span><strong>{saved.saved} invitation{saved.saved === 1 ? '' : 's'} saved.</strong> {saved.delivered ? 'We emailed them.' : 'Invitation emails aren’t switched on yet, so let them know yourself. They can also request to join with their work email.'}</span></div>
+            <div className="ob-intro" style={{ gap: 10 }}>
+              <div className="ob-note tile--green"><Tile icon="check" tone="green" size="sm" /><span><strong>{saved.saved} invitation{saved.saved === 1 ? '' : 's'} sent.</strong> {saved.delivered ? 'Each person gets an email with a link that works once and expires in 7 days.' : 'Email isn’t configured on this server, so nothing was emailed.'}</span></div>
+              {saved.devLinks?.map((l) => <p key={l.email} className="ob-alert ob-alert--info">Local development link for {l.email}: <code style={{ wordBreak: 'break-all' }}>{l.link}</code></p>)}
+            </div>
           ) : (
             <div className="ob-intro" style={{ gap: 10 }}>
               {rows.map((row, i) => (
@@ -433,11 +442,21 @@ function OrgTeamManage({ entry, detail }) {
         </section>
         <aside className="ob-aside">
           <Members members={detail.members} />
+          {detail.invitations.length > 0 && (
+            <div className="ob-card">
+              <h2>Invited · {detail.invitations.length}</h2>
+              <ul className="ob-list">
+                {detail.invitations.map((i) => (
+                  <li key={i.id}><div><strong>{i.email}</strong><span className="ob-muted">{i.role[0].toUpperCase() + i.role.slice(1)} · expires {new Date(i.expiresAt).toLocaleDateString()}</span></div><button type="button" className="btn-text" onClick={() => revoke(i)}>Withdraw</button></li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="ob-card">
             <h2>Other ways in</h2>
             <div className="ob-features" style={{ gap: 14 }}>
               <div style={{ display: 'flex', gap: 12 }}><Tile icon="shield" tone="blue" size="sm" /><span className="ob-muted"><strong style={{ color: 'var(--text)' }}>Colleague matching is {detail.workspace.joinByDomain ? 'on' : 'off'}.</strong> {detail.workspace.joinByDomain ? `People who confirm an @${detail.workspace.domain} email can ask to join. You approve each one.` : 'Turn it on later from a verified company email.'}</span></div>
-              <div style={{ display: 'flex', gap: 12 }}><Tile icon="link" tone="plain" size="sm" /><span className="ob-muted"><strong style={{ color: 'var(--text)' }}>Invite links are off.</strong> For contractors outside your domain, coming later.</span></div>
+              <div style={{ display: 'flex', gap: 12 }}><Tile icon="link" tone="plain" size="sm" /><span className="ob-muted"><strong style={{ color: 'var(--text)' }}>Invitations work for any email.</strong> Use them for contractors and partners outside your domain.</span></div>
             </div>
           </div>
           <div className="ob-note tile--amber"><span>Financing documents are visible only to Owner, Admin and Finance roles, never to Members, even if they work on the project.</span></div>

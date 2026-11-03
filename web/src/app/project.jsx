@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Link, redirect, useLoaderData, useNavigate } from 'react-router';
-import { api } from '../api.js';
+import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'react-router';
+import { api, uploadFile } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireWorkspace } from './ui.jsx';
 
 const STEPS = ['Goal', "How you'll judge it", 'Data'];
@@ -113,9 +113,9 @@ export function ProjectGoal() {
 }
 
 async function projectLoader({ params }) {
-  const { entry } = await requireWorkspace(params.slug);
-  const { project, role } = await api.project(entry.id, params.projectId);
-  return { entry, project, role };
+  const { account, entry } = await requireWorkspace(params.slug);
+  const [detail, { workspace }] = await Promise.all([api.project(entry.id, params.projectId), api.workspace(entry.id)]);
+  return { account, entry, workspace, ...detail };
 }
 export const successLoader = projectLoader;
 export async function dataLoader(args) {
@@ -263,8 +263,8 @@ export function ProjectData() {
           {mode === 'upload' && <>
             <div className="ob-drop">
               <Tile icon="upload" tone="teal" />
-              <strong>Sample upload is coming next</strong>
-              <span>For now, record where the data came from and how it may be used. You'll add a sample when uploads open.</span>
+              <strong>Rights first, then files</strong>
+              <span>Record where the data came from and how it may be used. You upload sample files on the next screen.</span>
             </div>
             <fieldset aria-describedby="provenance-error">
               <legend className="ob-legend">Where did this data come from?</legend>
@@ -444,37 +444,153 @@ export function ProjectModel() {
   );
 }
 
-const MODEL_STATUS = [
-  { key: 'task', label: 'Task and acceptance rule' },
-  { key: 'data', label: 'Model and test plan' },
-  { key: 'eval', label: 'Evaluate against your rule', note: 'Compare with your baseline on held-out examples.' },
-  { key: 'deploy', label: 'Readiness check and deploy', note: 'Only a model that meets your rule can be deployed.' },
-];
 
-const STATUS = [
-  { key: 'task', label: 'Task and acceptance rule' },
-  { key: 'data', label: 'Data and rights record' },
-  { key: 'review', label: 'Rights and quality review', note: 'Opens when sample upload is available.' },
-  { key: 'version', label: 'Approve dataset version 1', note: 'You lock the exact files and rights record training will use.' },
-  { key: 'train', label: 'Train and test', note: 'You approve a cost estimate first.' },
-  { key: 'deploy', label: 'Accept and deploy', note: 'Only a model that meets your rule can be accepted.' },
-];
+const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+
+/** Picks files and sends each one to the ingest service, then records its signed receipt. */
+function Uploader({ entry, project, onUploaded }) {
+  const [items, setItems] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const set = (i, patch) => setItems((all) => all.map((x, j) => (j === i ? { ...x, ...patch } : x)));
+
+  async function upload(files) {
+    const list = [...files];
+    if (!list.length) return;
+    const start = items.length;
+    setItems((all) => [...all, ...list.map((f) => ({ name: f.name, size: f.size, state: 'waiting', progress: 0 }))]);
+    setBusy(true);
+    const grantRes = await api.uploadGrant(entry.id, project.id).catch(() => null);
+    if (!grantRes?.ok) {
+      list.forEach((_, k) => set(start + k, { state: 'failed', error: grantRes?.data.error ?? 'Could not start the upload.' }));
+      return setBusy(false);
+    }
+    for (const [k, file] of list.entries()) {
+      const i = start + k;
+      if (file.size > grantRes.data.maxBytes) { set(i, { state: 'failed', error: `Larger than the ${fmtBytes(grantRes.data.maxBytes)} limit.` }); continue; }
+      set(i, { state: 'uploading' });
+      try {
+        const sent = await uploadFile(grantRes.data, file, (p) => set(i, { progress: p }));
+        const saved = await api.recordUpload(entry.id, project.id, sent.receipt);
+        if (!saved.ok) throw new Error(saved.data.error ?? 'The upload could not be recorded.');
+        set(i, { state: saved.data.upload.duplicateOf ? 'duplicate' : 'done', sha256: sent.sha256, contentType: sent.contentType });
+      } catch (err) {
+        set(i, { state: 'failed', error: err.message });
+      }
+    }
+    setBusy(false);
+    onUploaded();
+  }
+
+  return (
+    <div className="ob-intro" style={{ gap: 12 }}>
+      <label className="ob-drop" htmlFor="sample-files" style={{ cursor: 'pointer' }}
+        onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); if (!busy) upload(e.dataTransfer.files); }}>
+        <Tile icon="upload" tone="teal" />
+        <strong>{busy ? 'Uploading…' : 'Drop sample files here, or choose files'}</strong>
+        <span>Images, audio, video, PDFs, archives, CSV, JSON or Parquet. Each file is checked, hashed and stored privately.</span>
+        <input id="sample-files" type="file" multiple className="visually-hidden" disabled={busy} onChange={(e) => { upload(e.target.files); e.target.value = ''; }} />
+      </label>
+      {items.length > 0 && (
+        <ul className="ob-list" aria-live="polite">
+          {items.map((it, i) => (
+            <li key={i}>
+              <Tile icon={it.state === 'failed' ? 'info' : it.state === 'done' || it.state === 'duplicate' ? 'check' : 'clock'} tone={it.state === 'failed' ? 'orange' : it.state === 'done' ? 'green' : 'plain'} size="sm" />
+              <div>
+                <strong>{it.name}</strong>
+                <span className="ob-muted">
+                  {fmtBytes(it.size)} · {it.state === 'uploading' ? `${Math.round(it.progress * 100)}%` : it.state === 'done' ? `stored · ${it.contentType}` : it.state === 'duplicate' ? 'same content as an earlier file; it won’t be counted twice' : it.state === 'failed' ? it.error : 'waiting'}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function AcademicCard({ entry, profile, onDone }) {
+  const [stage, setStage] = useState('email');
+  const [devCode, setDevCode] = useState(null);
+  const [error, setError] = useState(null);
+  if (profile.academicVerifiedAt) {
+    return <section className="ob-card"><h2>Academic email verified</h2><p className="ob-muted">{profile.academicEmail}. Research-only datasets are available to you.</p></section>;
+  }
+  async function send(event) {
+    event.preventDefault();
+    const res = await api.academicSend(entry.id, new FormData(event.currentTarget).get('email')).catch(() => null);
+    if (!res?.ok) return setError(res?.data.error ?? 'Could not send the code.');
+    setError(null); setDevCode(res.data.devCode ?? null); setStage('code');
+  }
+  async function verify(event) {
+    event.preventDefault();
+    const res = await api.academicVerify(entry.id, new FormData(event.currentTarget).get('code')).catch(() => null);
+    if (!res?.ok) return setError(res?.data.error ?? 'Could not check the code.');
+    onDone();
+  }
+  return (
+    <section className="ob-card">
+      <h2>Verify your academic email</h2>
+      <p className="ob-muted">Unlocks datasets licensed only for non-commercial research. Your sign-in email stays the same.</p>
+      {error && <p className="ob-alert" role="alert">{error}</p>}
+      {stage === 'email' ? (
+        <form className="ob-intro" style={{ gap: 10 }} onSubmit={send}>
+          <div className="ob-field"><label htmlFor="academic-email">University email</label><input id="academic-email" name="email" type="email" placeholder="you@university.edu" /></div>
+          <button className="btn-ghost" type="submit">Send code</button>
+        </form>
+      ) : (
+        <form className="ob-intro" style={{ gap: 10 }} onSubmit={verify}>
+          {devCode && <p className="ob-alert ob-alert--info">Local development: your code is <strong>{devCode}</strong>.</p>}
+          <div className="ob-field"><label htmlFor="academic-code">6-digit code</label><input id="academic-code" name="code" type="text" inputMode="numeric" maxLength={6} className="ob-code" /></div>
+          <button className="btn-app" type="submit">Verify</button>
+        </form>
+      )}
+    </section>
+  );
+}
+
+const STATUS_LABEL = { draft: 'draft', in_review: 'in review', changes_requested: 'changes requested', approved: 'approved', versioned: 'dataset approved' };
 
 export function ProjectHome() {
-  const { entry, project, role } = useLoaderData();
+  const { account, entry, project, role, uploads, latestReview, versions, uploadsEnabled, workspace } = useLoaderData();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const base = `/w/${entry.slug}/projects/${project.id}`;
   const modelPath = project.startingPoint === 'model';
-  const steps = modelPath ? MODEL_STATUS : STATUS;
+  const manager = ['owner', 'admin'].includes(role);
+  const writer = ['owner', 'admin', 'member'].includes(role);
+  const mode = project.dataSource?.mode;
+  const [actionError, setActionError] = useState(null);
+  const [pending, setPending] = useState(false);
+  const [signOutState, setSignOutState] = useState('idle');
+
   const taskDone = Boolean(project.success);
   const dataDone = Boolean(modelPath ? project.model : project.dataSource);
-  const state = { task: taskDone ? 'done' : 'now', data: dataDone ? 'done' : taskDone ? 'now' : 'todo' };
-  const nextStep = !taskDone ? { to: `${base}/success`, title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.' }
-    : !dataDone && modelPath ? { to: `${base}/model`, title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.' }
-    : !dataDone ? { to: `${base}/data`, title: 'Record your data and its rights', body: 'Where it came from and how it may be used.' }
-    : entry.kind === 'organization' && ['owner', 'admin'].includes(role) ? { to: `/w/${entry.slug}/setup/team`, title: modelPath ? 'Invite whoever approves deployment' : 'Invite whoever approves spend', body: 'Their sign-off is needed later. Inviting them now avoids a wait.' }
-    : null;
-  const [signOutState, setSignOutState] = useState('idle');
+  const s = project.status;
+  const reviewed = ['approved', 'versioned'].includes(s);
+  const steps = modelPath ? [
+    { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
+    { label: 'Model and test plan', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
+    { label: 'Evaluate against your rule', st: 'todo', soon: true, note: 'Compare with your baseline on held-out examples.' },
+    { label: 'Readiness check and deploy', st: 'todo', soon: true, note: 'Only a model that meets your rule can be deployed.' },
+  ] : [
+    { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
+    { label: 'Data and rights record', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
+    ...(mode === 'upload' ? [{ label: 'Upload a sample', st: uploads.length ? 'done' : dataDone ? 'now' : 'todo', note: uploads.length ? `${uploads.length} file${uploads.length === 1 ? '' : 's'}` : undefined }] : []),
+    { label: 'Rights and quality review', st: reviewed ? 'done' : ['in_review', 'changes_requested'].includes(s) ? 'now' : 'todo', note: s === 'in_review' ? 'With Valcairn' : s === 'changes_requested' ? 'Changes requested' : 'Valcairn checks rights, consent, labels and duplicates.' },
+    { label: 'Approve dataset version 1', st: s === 'versioned' ? 'done' : s === 'approved' ? 'now' : 'todo', note: s === 'versioned' ? `Version ${versions.at(-1).number} · ${versions.at(-1).files} files` : 'Locks the exact files and rights record training will use.' },
+    { label: 'Train and test', st: 'todo', soon: true, note: 'You approve a cost estimate first.' },
+    { label: 'Accept and deploy', st: 'todo', soon: true, note: 'Only a model that meets your rule can be accepted.' },
+  ];
+
+  async function act(fn, ok) {
+    setPending(true); setActionError(null);
+    const res = await fn().catch(() => null);
+    setPending(false);
+    if (!res?.ok) return setActionError(res?.data.error ?? 'That did not work. Check your connection and try again.');
+    ok?.(res.data);
+    revalidator.revalidate();
+  }
 
   async function signOut() {
     setSignOutState('pending');
@@ -482,6 +598,28 @@ export function ProjectHome() {
     if (!res?.ok) return setSignOutState('failed');
     navigate('/signin');
   }
+
+  let next = null;
+  if (!taskDone) next = { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` };
+  else if (!dataDone) next = modelPath ? { title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.', to: `${base}/model` } : { title: 'Record your data and its rights', body: 'Where it came from and how it may be used.', to: `${base}/data` };
+  else if (!modelPath && ['draft', 'changes_requested'].includes(s)) {
+    const needsFiles = mode === 'upload' && uploads.length === 0;
+    next = {
+      title: needsFiles ? 'Upload a sample' : s === 'changes_requested' ? 'Fix and resubmit' : 'Submit for review',
+      body: needsFiles ? 'A few hundred representative files is enough to check fit and rights.' : mode === 'upload' ? 'Valcairn checks rights, consent, labels and duplicates before anything is used.' : 'Valcairn reviews your request and comes back with options and terms.',
+      custom: (
+        <>
+          {s === 'changes_requested' && latestReview?.notes && <p className="ob-alert"><strong>Reviewer notes:</strong> {latestReview.notes}</p>}
+          {mode === 'upload' && writer && (uploadsEnabled ? <Uploader entry={entry} project={project} onUploaded={() => revalidator.revalidate()} /> : <p className="ob-alert">Uploads are not configured on this server.</p>)}
+          {writer && <button className="btn-app" type="button" disabled={pending || needsFiles} onClick={() => act(() => api.submitReview(entry.id, project.id))}>{pending ? 'Submitting…' : 'Submit for review'}</button>}
+        </>
+      ),
+    };
+  } else if (s === 'in_review') next = { title: 'In review with Valcairn', body: 'You’ll see the decision here. Files can’t change while the review is open.' };
+  else if (s === 'approved') next = manager
+    ? { title: 'Approve dataset version 1', body: 'This freezes the exact files and rights record. Training can only use an approved version.', custom: <button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : 'Approve version 1'}</button> }
+    : { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.' };
+  else if (entry.kind === 'organization' && manager) next = { title: modelPath ? 'Invite whoever approves deployment' : 'Invite whoever approves spend', body: 'Their sign-off is needed later. Inviting them now avoids a wait.', to: `/w/${entry.slug}/setup/team` };
 
   return (
     <div className="ob ob-shell">
@@ -495,10 +633,10 @@ export function ProjectHome() {
         </Link>
         <nav aria-label="Workspace">
           <Link to={base} aria-current="page"><Tile icon="grid" tone="orange" size="sm" />Projects</Link>
-          <a aria-disabled="true"><Tile icon="data" tone="teal" size="sm" />Data</a>
-          <a aria-disabled="true"><Tile icon="layers" tone="blue" size="sm" />Models</a>
-          {entry.kind === 'organization' && <a aria-disabled="true"><Tile icon="bank" tone="amber" size="sm" />Financing</a>}
+          <a aria-disabled="true" title="Not open yet"><Tile icon="layers" tone="blue" size="sm" />Models <span className="ob-badge">Soon</span></a>
+          {entry.kind === 'organization' && <a aria-disabled="true" title="Not open yet"><Tile icon="bank" tone="amber" size="sm" />Financing <span className="ob-badge">Soon</span></a>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`}><Tile icon="people" tone="violet" size="sm" />Team</Link>}
+          {account.isStaff && <Link to="/staff"><Tile icon="shield" tone="green" size="sm" />Review queue</Link>}
         </nav>
         <div className="ob-signout">
           {signOutState === 'failed' && <p className="ob-alert" role="alert">We couldn't sign you out, so you're still signed in. Check your connection and try again.</p>}
@@ -512,39 +650,43 @@ export function ProjectHome() {
           <div className="ob-intro" style={{ gap: 8 }}>
             {dataDone && <span className="ob-ok"><Icon name="check" size={16} stroke={2.4} />Project set up</span>}
             <h1 className="ob-h1">{project.name}</h1>
-            <span className="ob-muted">{project.modalities.join(', ')} · draft</span>
+            <span className="ob-muted">{project.modalities.join(', ')} · {STATUS_LABEL[s] ?? s}</span>
           </div>
-          <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>
+          {writer && ['draft', 'changes_requested'].includes(s) && <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>}
         </div>
+        {actionError && <p className="ob-alert" role="alert">{actionError}</p>}
         <div className="ob-main" style={{ padding: 0, maxWidth: 'none', gap: 20 }}>
           <section className="ob-card" style={{ flex: '999 1 420px' }} aria-labelledby="status-title">
             <h2 id="status-title">Where things stand</h2>
             <ol className="ob-list">
-              {steps.map((s, i) => {
-                const st = state[s.key] ?? 'todo';
-                return (
-                  <li key={s.key}>
-                    <span className={`ob-num${st === 'done' ? ' ob-num--done' : st === 'now' ? ' ob-num--now' : ''}`}>{st === 'done' ? <Icon name="check" size={12} stroke={3} /> : i + 1}</span>
-                    <div><strong>{s.label}</strong><span className="ob-muted">{st === 'done' ? 'Done' : s.note ?? (st === 'now' ? 'Next' : 'After the step above')}</span></div>
-                    {i >= 2 && <span className="ob-badge">Not open yet</span>}
-                  </li>
-                );
-              })}
+              {steps.map((step, i) => (
+                <li key={step.label}>
+                  <span className={`ob-num${step.st === 'done' ? ' ob-num--done' : step.st === 'now' ? ' ob-num--now' : ''}`}>{step.st === 'done' ? <Icon name="check" size={12} stroke={3} /> : i + 1}</span>
+                  <div><strong>{step.label}</strong><span className="ob-muted">{step.note ?? (step.st === 'done' ? 'Done' : step.st === 'now' ? 'Next' : 'After the step above')}</span></div>
+                  {step.soon && <span className="ob-badge">Not open yet</span>}
+                </li>
+              ))}
             </ol>
           </section>
-          <div className="ob-aside" style={{ flex: '1 1 280px' }}>
-            {nextStep && (
+          <div className="ob-aside" style={{ flex: '1 1 320px' }}>
+            {next && (
               <section className="ob-card ob-card--strong">
                 <span className="ob-eyebrow" style={{ textTransform: 'uppercase', letterSpacing: '0.04em', fontSize: 12 }}>Your next step</span>
-                <h2>{nextStep.title}</h2>
-                <p className="ob-muted">{nextStep.body}</p>
-                <Link className="btn-app" to={nextStep.to}>Continue</Link>
+                <h2>{next.title}</h2>
+                <p className="ob-muted">{next.body}</p>
+                {next.custom}
+                {next.to && <Link className="btn-app" to={next.to}>Continue</Link>}
               </section>
             )}
-            <section className="ob-card">
-              <h2>What happens next</h2>
-              <p className="ob-muted">{modelPath ? 'Evaluation runs and deployment' : 'Review, dataset versions and training'} open in upcoming releases. Your answers are saved, so nothing needs re-entering when they do.</p>
-            </section>
+            {entry.kind === 'personal' && workspace.profile.kind !== 'independent' && <AcademicCard entry={entry} profile={workspace.profile} onDone={() => revalidator.revalidate()} />}
+            {uploads.length > 0 && (
+              <section className="ob-card">
+                <h2>Sample files · {uploads.length}</h2>
+                <ul className="ob-list">
+                  {uploads.slice(-8).map((u) => <li key={u.id}><div><strong>{u.filename}</strong><span className="ob-muted">{fmtBytes(u.sizeBytes)} · {u.contentType}{u.duplicateOf ? ' · duplicate' : ''} · sha256 {u.sha256.slice(0, 12)}…</span></div></li>)}
+                </ul>
+              </section>
+            )}
           </div>
         </div>
       </main>

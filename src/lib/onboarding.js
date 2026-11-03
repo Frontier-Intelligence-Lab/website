@@ -10,6 +10,9 @@ const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0
 export const isEmail = (value) => typeof value === 'string' && value.length <= 254 && EMAIL_RE.test(value);
 export const emailDomain = (email) => String(email ?? '').split('@')[1]?.toLowerCase() || null;
 
+// .edu, .edu.xx and .ac.xx domains (e.g. mit.edu, unimelb.edu.au, ox.ac.uk).
+export const isAcademicDomain = (domain) => /(^|\.)(edu|edu\.[a-z]{2}|ac\.[a-z]{2})$/.test(String(domain ?? ''));
+
 export const slugify = (value) => String(value ?? '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
 
 /** "https://www.Acme-Robotics.com/about" -> "acme-robotics.com"; anything that is not a hostname -> null. */
