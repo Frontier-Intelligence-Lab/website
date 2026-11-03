@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'react-router';
 import { api, uploadFile } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireWorkspace } from './ui.jsx';
+import { WorkspaceShell, plural, roleName } from './shell.jsx';
 
 const STEPS = ['Goal', "How you'll judge it", 'Data'];
 const MODALITIES = ['Text', 'Documents', 'Images', 'Video', 'Audio', 'Sensor or time series', 'Robot trajectories'];
@@ -549,51 +550,8 @@ function AcademicCard({ entry, profile, onDone }) {
 }
 
 const STATUS_LABEL = { draft: 'draft', in_review: 'in review', changes_requested: 'changes requested', approved: 'approved', versioned: 'dataset version approved' };
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-const roleName = (role) => role[0].toUpperCase() + role.slice(1);
 
 /** Sidebar and frame shared by the workspace home and project pages. */
-function WorkspaceShell({ account, entry, role, title, current = 'projects', children }) {
-  const navigate = useNavigate();
-  const [signOutState, setSignOutState] = useState('idle');
-  async function signOut() {
-    setSignOutState('pending');
-    const res = await api.signout().catch(() => null);
-    if (!res?.ok) return setSignOutState('failed');
-    navigate('/signin');
-  }
-  return (
-    <div className="ob ob-shell">
-      <title>{`${title} — Valcairn`}</title>
-      <aside className="ob-side">
-        <div className="ob-brand"><span className="dash-mark" aria-hidden="true" /><strong>Valcairn</strong></div>
-        <Link className="ob-org-switch" to="/start" aria-label="Switch or add a workspace">
-          <span className="ob-monogram ob-monogram--sm" aria-hidden="true">{initials(entry.name)}</span>
-          <span style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 14 }}>{entry.name}</strong><span className="ob-muted" style={{ fontSize: 12 }}>{entry.kind === 'personal' ? 'Personal' : roleName(role)}</span></span>
-          <Icon name="updown" size={14} />
-        </Link>
-        <nav aria-label="Workspace">
-          <Link to={`/w/${entry.slug}`} aria-current={current === 'projects' ? 'page' : undefined}><Tile icon="grid" tone="orange" size="sm" />Projects</Link>
-          <a aria-disabled="true" title="Planned, not available yet"><Tile icon="layers" tone="blue" size="sm" />Models <span className="ob-badge">Planned</span></a>
-          {entry.kind === 'organization' && <a aria-disabled="true" title="Planned, not available yet"><Tile icon="bank" tone="amber" size="sm" />Financing <span className="ob-badge">Planned</span></a>}
-          {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`}><Tile icon="people" tone="violet" size="sm" />Team</Link>}
-          {account.isStaff && <Link to="/staff"><Tile icon="shield" tone="green" size="sm" />Review queue</Link>}
-        </nav>
-        <div className="ob-signout">
-          {signOutState === 'failed' && <p className="ob-alert" role="alert">We couldn't sign you out, so you're still signed in. Check your connection and try again.</p>}
-          <button type="button" className="btn-text" disabled={signOutState === 'pending'} onClick={signOut}>
-            {signOutState === 'pending' ? 'Signing out…' : signOutState === 'failed' ? 'Try signing out again' : 'Sign out'}
-          </button>
-        </div>
-      </aside>
-      <main className="ob-body">
-        {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Everything here is generated for demonstration. It is not a real customer, and training, deployment and financing are planned, not running.</p>}
-        {children}
-      </main>
-    </div>
-  );
-}
-
 export async function workspaceHomeLoader({ params }) {
   const { account, entry } = await requireWorkspace(params.slug);
   const { projects } = await api.projects(entry.id);
@@ -719,7 +677,9 @@ export function ProjectHome() {
         <>
           {s === 'changes_requested' && latestReview?.notes && <p className="ob-alert"><strong>Reviewer notes:</strong> {latestReview.notes}</p>}
           {mode === 'upload' && (uploadsEnabled ? <Uploader entry={entry} project={project} onUploaded={() => revalidator.revalidate()} /> : <p className="ob-alert">Uploads are not configured on this server.</p>)}
-          <button className="btn-app" type="button" disabled={pending || needsFiles} onClick={() => act(() => api.submitReview(entry.id, project.id))}>{pending ? 'Submitting…' : 'Submit for review'}</button>
+          {mode === 'upload'
+            ? <Link className="btn-app" to={`${base}/dataset/resolve`} aria-disabled={needsFiles || undefined} onClick={(e) => needsFiles && e.preventDefault()}>Resolve and submit for review</Link>
+            : <button className="btn-app" type="button" disabled={pending || needsFiles} onClick={() => act(() => api.submitReview(entry.id, project.id))}>{pending ? 'Submitting…' : 'Submit for review'}</button>}
         </>
       ),
     };
@@ -736,14 +696,17 @@ export function ProjectHome() {
     : { title: `Dataset version ${latest.number} approved`, body: 'Training and evaluation are planned; nothing runs yet.' };
 
   return (
-    <WorkspaceShell account={account} entry={entry} role={role} title={project.name}>
+    <WorkspaceShell account={account} entry={entry} role={role} title={project.name} project={project} current="project">
       <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
         <div className="ob-intro" style={{ gap: 8 }}>
           <Link className="ob-muted" to={`/w/${entry.slug}`}>← All projects</Link>
           <h1 className="ob-h1">{project.name}</h1>
           <span className="ob-muted">{project.modalities.join(', ')} · {STATUS_LABEL[s] ?? s}{!editable && !unsure ? ' · locked' : ''}</span>
         </div>
-        {writer && editable && !unsure && <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>}
+        <div className="ob-row-actions">
+          {!modelPath && !unsure && <Link className="btn-ghost" to={`${base}/dataset`}><Icon name="data" size={16} />Open dataset</Link>}
+          {writer && editable && !unsure && <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>}
+        </div>
       </div>
       {actionError && <p className="ob-alert" role="alert">{actionError}</p>}
       {!writer && <p className="ob-alert ob-alert--info">You have {roleName(role)} access: you can see this project but not change it.</p>}

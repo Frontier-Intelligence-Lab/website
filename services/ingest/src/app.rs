@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::{StreamExt, TryStreamExt};
-use object_store::{MultipartUpload, ObjectStore, PutPayload, path::Path};
+use object_store::{GetOptions, GetRange, MultipartUpload, ObjectStore, PutPayload, path::Path};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -138,6 +138,14 @@ struct DownloadGrant {
     filename: String,
 }
 
+/// Signed by the web server for members who may view a file: it names the key and the type to serve it as.
+#[derive(Deserialize)]
+struct PreviewGrant {
+    key: String,
+    #[serde(rename = "type")]
+    content_type: String,
+}
+
 #[derive(Serialize)]
 struct Receipt<'a> {
     v: u8,
@@ -164,6 +172,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             HeaderName::from_static("x-filename"),
+            header::RANGE,
+        ])
+        .expose_headers([
+            header::CONTENT_RANGE,
+            header::CONTENT_LENGTH,
+            header::ACCEPT_RANGES,
         ])
         .max_age(Duration::from_secs(600));
     Router::new()
@@ -173,6 +187,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/uploads", post(upload))
         .route("/v1/objects", get(download))
+        .route("/v1/preview", get(preview))
         // Server-to-server, called by the web service with one-minute tokens naming one key.
         .route("/v1/commit", post(commit))
         .route("/v1/delete", post(delete))
@@ -558,4 +573,158 @@ async fn download(State(st): State<Arc<AppState>>, Query(q): Query<DownloadQuery
         h.insert(header::CONTENT_DISPOSITION, v);
     }
     response
+}
+
+/// Types a preview link may be served as. Media are rendered by the browser; text is shown as plain text.
+/// SVG and HTML never get here: ingest refuses them at upload.
+fn previewable(content_type: &str) -> bool {
+    let media = ["image/", "audio/", "video/"]
+        .iter()
+        .any(|p| content_type.starts_with(p))
+        && content_type != "image/svg+xml"
+        && content_type
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/.+-".contains(&b));
+    media || content_type == "text/plain; charset=utf-8"
+}
+
+/// Parses a single `bytes=` range. Multiple ranges are not supported and fall back to the whole object.
+fn parse_range(value: &str) -> Option<GetRange> {
+    let spec = value.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    match (start.trim(), end.trim()) {
+        ("", n) => n.parse().ok().filter(|n| *n > 0).map(GetRange::Suffix),
+        (a, "") => a.parse().ok().map(GetRange::Offset),
+        (a, b) => {
+            let (a, b): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
+            (b >= a).then(|| GetRange::Bounded(a..b + 1))
+        }
+    }
+}
+
+async fn preview(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<DownloadQuery>,
+) -> Response {
+    let Some(grant) = token::verify::<PreviewGrant>(&st.secret, &q.token, "preview", now_s())
+    else {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "This preview link is invalid or has expired.",
+        );
+    };
+    if !previewable(&grant.content_type) || st.parse(&grant.key, false).is_none() {
+        return problem(StatusCode::NOT_FOUND, "Not found.");
+    }
+    let Ok(key) = Path::parse(&grant.key) else {
+        return problem(StatusCode::BAD_REQUEST, "This preview link is not valid.");
+    };
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range);
+    let partial = range.is_some();
+    let result = match st
+        .store
+        .get_opts(
+            &key,
+            GetOptions {
+                range,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(object_store::Error::NotFound { .. }) => {
+            return problem(StatusCode::NOT_FOUND, "Not found.");
+        }
+        Err(err) if partial => {
+            tracing::warn!(%err, "preview range rejected");
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            return response;
+        }
+        Err(err) => {
+            tracing::error!(%err, "preview failed");
+            return unavailable();
+        }
+    };
+    let total = result.meta.size;
+    let served = result.range.clone();
+    let mut response = Body::from_stream(result.into_stream()).into_response();
+    if partial {
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
+    let h = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&grant.content_type) {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    // Rendered inline but inert: no scripts, no plugins, no sniffing into another type.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=600"),
+    );
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from(served.end - served.start),
+    );
+    if partial {
+        let value = format!(
+            "bytes {}-{}/{}",
+            served.start,
+            served.end.saturating_sub(1),
+            total
+        );
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    response
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::{parse_range, previewable};
+    use object_store::GetRange;
+
+    #[test]
+    fn parses_single_byte_ranges() {
+        assert_eq!(parse_range("bytes=0-99"), Some(GetRange::Bounded(0..100)));
+        assert_eq!(parse_range("bytes=100-"), Some(GetRange::Offset(100)));
+        assert_eq!(parse_range("bytes=-500"), Some(GetRange::Suffix(500)));
+        assert_eq!(parse_range("bytes=5-1"), None);
+        assert_eq!(parse_range("bytes=0-1,4-5"), None);
+        assert_eq!(parse_range("items=0-1"), None);
+    }
+
+    #[test]
+    fn only_inert_types_are_previewable() {
+        assert!(previewable("image/png"));
+        assert!(previewable("video/mp4"));
+        assert!(previewable("text/plain; charset=utf-8"));
+        assert!(!previewable("image/svg+xml"));
+        assert!(!previewable("text/html"));
+        assert!(!previewable("application/pdf"));
+        assert!(!previewable("video/mp4\r\nx: y"));
+    }
 }

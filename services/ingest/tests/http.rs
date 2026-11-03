@@ -510,3 +510,113 @@ async fn storage_write_failures_abort_the_upload_and_never_issue_a_receipt() {
         );
     }
 }
+
+#[tokio::test]
+async fn previews_render_inline_with_ranges_only_for_inert_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r, _) = on_disk(dir.path(), 1 << 20);
+    let (status, body) = send(
+        r.clone(),
+        Some(grant(1 << 20, now() + 60)),
+        "box.png",
+        PNG.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let receipt: Value =
+        token::verify(SECRET, body["receipt"].as_str().unwrap(), "receipt", now()).unwrap();
+    let pending = receipt["objectKey"].as_str().unwrap().to_string();
+    let preview = |key: &str, kind: &str, ty: &str| {
+        format!(
+            "/v1/preview?token={}",
+            token::sign(
+                SECRET,
+                &json!({ "v": 1, "kind": kind, "key": key, "type": ty, "exp": now() + 60 })
+            )
+        )
+    };
+    assert_eq!(
+        get(r.clone(), &preview(&pending, "preview", "image/png"))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND,
+        "pending files have no preview"
+    );
+    let (_, committed) = call(r.clone(), "/v1/commit", &key_token("commit", &pending)).await;
+    let key = committed["objectKey"].as_str().unwrap().to_string();
+
+    let res = get(r.clone(), &preview(&key, "preview", "image/png")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(res.headers()[header::CONTENT_DISPOSITION], "inline");
+    assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert!(
+        res.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .contains("sandbox")
+    );
+    assert_eq!(res.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(
+        res.into_body().collect().await.unwrap().to_bytes().as_ref(),
+        PNG
+    );
+
+    let ranged = r
+        .clone()
+        .oneshot(
+            Request::get(preview(&key, "preview", "image/png"))
+                .header(header::RANGE, "bytes=1-3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        ranged.headers()[header::CONTENT_RANGE],
+        format!("bytes 1-3/{}", PNG.len())
+    );
+    assert_eq!(
+        ranged
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        &PNG[1..4]
+    );
+
+    let past_end = r
+        .clone()
+        .oneshot(
+            Request::get(preview(&key, "preview", "image/png"))
+                .header(header::RANGE, "bytes=9999-")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(past_end.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+    // A preview token cannot download, a download token cannot preview, and scriptable types are never served inline.
+    assert_eq!(
+        get(r.clone(), &preview(&key, "download", "image/png"))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(r.clone(), &preview(&key, "preview", "text/html"))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(r, &preview(&key, "preview", "image/svg+xml"))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}

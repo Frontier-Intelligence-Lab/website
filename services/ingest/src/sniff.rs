@@ -6,6 +6,13 @@ pub fn classify(head: &[u8], filename: &str) -> Option<&'static str> {
     if head.starts_with(b"PAR1") {
         return Some("application/vnd.apache.parquet");
     }
+    // Robot recordings: MCAP and ROS 1 bags carry binary records after a short magic header.
+    if head.starts_with(b"\x89MCAP0\r\n") {
+        return Some("application/x-mcap");
+    }
+    if head.starts_with(b"#ROSBAG V2.0\n") {
+        return Some("application/x-rosbag");
+    }
     if let Some(kind) = infer::get(head) {
         let mime = kind.mime_type();
         return ALLOWED_BINARY
@@ -77,6 +84,14 @@ mod tests {
         ];
         assert_eq!(classify(&png, "photo.txt"), Some("image/png"));
         assert_eq!(classify(b"%PDF-1.7\n", "a.pdf"), Some("application/pdf"));
+        assert_eq!(
+            classify(b"\x89MCAP0\r\n\x01\0\0", "run.bin"),
+            Some("application/x-mcap")
+        );
+        assert_eq!(
+            classify(b"#ROSBAG V2.0\n\0\x04", "trial.bag"),
+            Some("application/x-rosbag")
+        );
         assert_eq!(
             classify(b"PAR1\x15\x04", "t.parquet"),
             Some("application/vnd.apache.parquet")

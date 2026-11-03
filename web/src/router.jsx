@@ -54,6 +54,7 @@ function accountRoutes() {
   const org = () => import('./app/org.jsx');
   const personal = () => import('./app/personal.jsx');
   const project = () => import('./app/project.jsx');
+  const dataset = () => import('./app/dataset.jsx');
   const invite = () => import('./app/invite.jsx');
   const staff = () => import('./app/staff.jsx');
   return [
@@ -72,6 +73,12 @@ function accountRoutes() {
     { path: '/w/:slug/projects/:projectId/success', lazy: page(project, 'ProjectSuccess', 'successLoader') },
     { path: '/w/:slug/projects/:projectId/data', lazy: page(project, 'ProjectData', 'dataLoader') },
     { path: '/w/:slug/projects/:projectId/model', lazy: page(project, 'ProjectModel', 'modelLoader') },
+    { path: '/w/:slug/projects/:projectId/dataset', lazy: page(dataset, 'DatasetOverview', 'datasetLoader') },
+    { path: '/w/:slug/projects/:projectId/dataset/annotate', lazy: page(dataset, 'DatasetAnnotate', 'datasetLoader') },
+    { path: '/w/:slug/projects/:projectId/dataset/annotate/:uploadId', lazy: page(dataset, 'DatasetAnnotate', 'datasetLoader') },
+    { path: '/w/:slug/projects/:projectId/dataset/resolve', lazy: page(dataset, 'DatasetResolve', 'datasetLoader') },
+    { path: '/w/:slug/projects/:projectId/dataset/import', lazy: page(dataset, 'DatasetImport', 'datasetLoader') },
+    { path: '/w/:slug/projects/:projectId/dataset/versions', lazy: page(dataset, 'DatasetVersions', 'datasetLoader') },
     { path: '/invite/:token', lazy: page(invite, 'Invite', 'inviteLoader') },
     { path: '/staff', lazy: page(staff, 'StaffQueue', 'queueLoader') },
     { path: '/staff/reviews/:reviewId', lazy: page(staff, 'StaffReview', 'reviewLoader') },

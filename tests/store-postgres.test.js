@@ -326,7 +326,12 @@ withStore('account and dataset APIs complete a persisted review workflow', async
     const base = `/api/workspaces/${ws.id}/projects/${project.id}`;
     await owner.call('POST', base, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'], personalData: 'no' } });
     const receipt = signToken(secret, { v: 1, kind: 'receipt', ws: ws.id, project: project.id, by: owner.id, objectKey: 'api-integration/sample', sha256: 'c'.repeat(64), sizeBytes: 12, contentType: 'text/plain', filename: 'sample.txt', exp: Math.floor(Date.now() / 1000) + 60 });
-    await owner.call('POST', `${base}/uploads`, { receipt });
+    const { upload } = await owner.call('POST', `${base}/uploads`, { receipt });
+    // Labels and their label set go through Postgres too, and land in the reviewed snapshot.
+    const { labelSet } = await owner.call('POST', `${base}/label-set`, { labels: [{ name: 'invoice', scope: 'file', tone: 'blue' }] });
+    await owner.call('POST', `${base}/items/${upload.id}/annotations`, { labelId: labelSet[0].id });
+    const dataset = await owner.call('GET', `${base}/dataset`);
+    assert.deepEqual([dataset.items[0].kind, dataset.items[0].labelCount, dataset.issues.length], ['text', 1, 0]);
     const { review } = await owner.call('POST', `${base}/submit`, {});
     const detail = await staff.call('GET', `/api/staff/reviews/${review.id}`);
     assert.equal(detail.project.name, project.name);
@@ -336,7 +341,10 @@ withStore('account and dataset APIs complete a persisted review workflow', async
     assert.equal(version.number, 1);
     assert.equal(version.files, 1);
     assert.equal((await store.getProject({ workspaceId: ws.id, projectId: project.id })).status, 'versioned');
-    assert.equal((await store.listDatasetVersions({ workspaceId: ws.id, projectId: project.id }))[0].manifest.files[0].sha256, 'c'.repeat(64));
+    const [stored] = await store.listDatasetVersions({ workspaceId: ws.id, projectId: project.id });
+    assert.equal(stored.manifest.files[0].sha256, 'c'.repeat(64));
+    assert.equal(stored.manifest.annotations[0].labelId, labelSet[0].id);
+    assert.equal(stored.manifest.labelSet[0].name, 'invoice');
   } finally { await app.close(); }
 });
 

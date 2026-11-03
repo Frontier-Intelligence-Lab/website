@@ -14,7 +14,7 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 
 - Every method is `async` and returns plain objects with camelCase keys. Timestamps are ISO 8601 strings in UTC. `null` means not found.
 - Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`, `quota_exceeded`, `forbidden`.
-- **Approval integrity.** A project's review-relevant content is editable only while its status is `draft` or `changes_requested`. That content is `name, task, modalities, startingPoint, success, dataSource, model` and its uploads. In `in_review`, `approved` and `versioned`, every write to it (`updateProject` content fields, `createUpload`, `deleteUpload`) throws `invalid_state`. The check and the write must be atomic: one conditional statement, or a check under the project row lock that submission also takes. Postgres additionally enforces this with triggers (`migrations/005_review_integrity.sql`). Lifecycle `status` is never patchable through `updateProject`.
+- **Approval integrity.** A project's review-relevant content is editable only while its status is `draft` or `changes_requested`. That content is `name, task, modalities, startingPoint, success, dataSource, model, labelSet`, its uploads (including each upload's `kind` and `offsetMs`), its annotations and its issue notes. In `in_review`, `approved` and `versioned`, every write to it (`updateProject` content fields, `createUpload`, `deleteUpload`, `updateUpload`, `createAnnotation`, `deleteAnnotation`, `setIssueNote`, `deleteIssueNote`) throws `invalid_state`. The check and the write must be atomic: one conditional statement, or a check under the project row lock that submission also takes. Postgres additionally enforces this with triggers (`migrations/005_review_integrity.sql`, extended in `007_dataset_workspace.sql`). Lifecycle `status` is never patchable through `updateProject`.
 - Password hashes and token hashes never leave the store. The only exception is `getUserAuthByEmail`, which returns the password hash for login.
 - Emails, domains and slugs are compared case-insensitively and stored lower-case.
 - Workspace-scoped reads and writes take `workspaceId` and must filter on it. A project id from workspace A must not be readable or writable through workspace B. The routes also check membership before calling the store.
@@ -54,7 +54,12 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 | `createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, limits })` | upload. `duplicateOf` is the id of an earlier original upload in the same project with the same `sha256`, else null. Optional `limits: { maxFiles, maxBytes }` are checked under the project lock. Throws `not_found`, `duplicate_upload` (same `objectKey`), `invalid_state` (frozen) or `quota_exceeded`. |
 | `deleteUpload({ workspaceId, projectId, uploadId, actorId })` | removed working-set upload. Only while editable. The earliest copy of a removed original becomes the new original. Committed object bytes must be retained: historical review/version snapshots or an in-flight registration may still reference the key. Physical reclamation needs a separate reference-aware policy. |
 | `listUploads({ workspaceId, projectId })` / `getUpload(id)` | uploads (with `objectKey`; routes strip it before responding) |
-| `submitForReview({ workspaceId, projectId, submittedBy })` | review (`status: 'pending'`) with `snapshot: { task, modalities, startingPoint, success, dataSource, model, files: [{ id, sha256, sizeBytes, contentType, filename, objectKey }] }`. Original files only, no duplicates. In one transaction under the project lock: project status `draft` or `changes_requested` becomes `in_review`, else `invalid_state`. |
+| `updateUpload({ workspaceId, projectId, uploadId, patch })` | upload. `patch` may set `kind` (one of `video, audio, image, text, sensor, robot, table, logs, file`, or `null` for the detected type) and `offsetMs` (position on the shared clock, or `null`). `not_found`, `invalid_state` |
+| `listAnnotations({ workspaceId, projectId })` | annotations `{ id, uploadId, labelId, startMs, endMs, createdBy, createdAt }`, oldest first. `startMs`/`endMs` are both null for a whole-file label. |
+| `createAnnotation({ workspaceId, projectId, uploadId, labelId, startMs, endMs, createdBy })` | annotation. The upload must belong to the project (`not_found`). Routes check the label exists and its scope. Deleting an upload deletes its annotations. |
+| `deleteAnnotation({ workspaceId, projectId, annotationId })` | removed annotation · `not_found`, `invalid_state` |
+| `listIssueNotes({ workspaceId, projectId })` / `setIssueNote({ workspaceId, projectId, key, note, createdBy })` / `deleteIssueNote({ workspaceId, projectId, key })` | notes `{ key, note, createdBy, createdAt }` sorted by key / the note (replaces one with the same key) / — · `not_found`. A note keeps an issue from `src/lib/dataset.js` on record so the project can go to review. |
+| `submitForReview({ workspaceId, projectId, submittedBy })` | review (`status: 'pending'`) with `snapshot: { task, modalities, startingPoint, success, dataSource, model, labelSet, files: [{ id, sha256, sizeBytes, contentType, filename, objectKey, kind, offsetMs }], annotations: [{ id, uploadId, labelId, startMs, endMs }], issueNotes: [{ key, note }] }`. Annotations are those on the snapshot's files. Original files only, no duplicates. In one transaction under the project lock: project status `draft` or `changes_requested` becomes `in_review`, else `invalid_state`. |
 | `reopenProject({ workspaceId, projectId, actorId })` | project, now `draft`. From `in_review` it withdraws the pending review (`status: 'withdrawn'`). From `approved` or `versioned` it voids the approval for new versions. The store checks current membership and current state atomically: owner/admin can reopen all three states; member can withdraw only `in_review`; other or missing roles throw `forbidden`. Other states throw `invalid_state`. |
 | `listReviews({ status })` | across all workspaces (staff queue), each with `projectName`, `workspaceName` |
 | `getReview(id)` / `listProjectReviews({ workspaceId, projectId })` | review / reviews oldest first |
@@ -76,13 +81,18 @@ workspace  { id, kind: 'organization'|'personal', name, slug, website, domain, d
              industry, sizeBand, profile: {}, createdBy, createdAt }
 role       'owner'|'admin'|'member'|'finance'|'viewer'
 project    { id, workspaceId, createdBy, name, task, modalities: string[], startingPoint: 'own'|'need'|'model'|'unsure',
-             success: {...}|null, dataSource: {...}|null, model: {...}|null, status: 'draft'|'in_review'|'changes_requested'|'approved'|'versioned', setupStep, createdAt, updatedAt }
+             success: {...}|null, dataSource: {...}|null, model: {...}|null,
+             labelSet: [{ id, name, scope: 'span'|'file', tone }], status: 'draft'|'in_review'|'changes_requested'|'approved'|'versioned', setupStep, createdAt, updatedAt }
 ```
 
 `profile`, `success`, `dataSource` and `model` are JSON objects that the routes validate before they're stored. Store them as `jsonb`.
 
 ## Changelog
 
+- **v5:**
+  - Dataset workspace: `projects.labelSet`, `uploads.kind` and `uploads.offsetMs`, annotations and issue notes, all frozen with the rest of the review content and included in the snapshot.
+  - Postgres: `007_dataset_workspace.sql` (`annotations`, `issue_notes`, new columns, freeze triggers).
+  - Submitting a project whose data is uploaded requires every open issue to be fixed or noted (`issues_open`, routes only).
 - **v5:** Reopen permissions are enforced in the store against current membership/state (`forbidden`); working-set removal and refused receipt registration retain committed object bytes to protect retries and immutable history. No schema migration is required.
 - **v4:**
   - Approval integrity: frozen content, review snapshots, `reopenProject`, versions made only from an approved snapshot (one per approval).

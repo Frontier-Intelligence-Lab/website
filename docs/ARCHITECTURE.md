@@ -23,6 +23,7 @@ Browser ── HTTPS ──► web (Node/Fastify) ── SQL ──► Postgres 
 
 - **Postgres is the source of truth.** Services coordinate through tables and a job queue (`FOR UPDATE SKIP LOCKED`), not through each other's memory. The `web` store contract is `docs/STORE_CONTRACT.md`.
 - **Files never pass through `web`.** Browsers upload straight to `ingest`, using a short-lived grant signed by `web` (HMAC, `INGEST_SHARED_SECRET`). `ingest` returns a receipt signed with the same secret, and `web` records only receipts it can verify. Object keys are derived from the workspace and grant, never chosen by the client.
+- **Previews are inert and short-lived.** For any workspace member, `web` signs a 30-minute `preview` link naming one object and the type to serve it as. `ingest` serves only images, audio, video and plain text inline (`/v1/preview`, with byte ranges for seeking), under `Content-Security-Policy: default-src 'none'; sandbox` and `nosniff`. Downloads (`/v1/objects`) stay attachment-only and are signed only for roles that can edit.
 - **Tenancy is enforced by the service that answers.** `web` checks workspace membership on every route. `ingest` accepts only a grant scoped to one workspace, project and size limit. Workers act on job rows that carry their workspace id.
 - **Fail closed.** A missing secret, database or storage location turns the feature off with a clear message. It never falls back to something unsafe.
 - **No secrets in Git.** Configuration comes from the environment. Each service documents its variables in its own README.

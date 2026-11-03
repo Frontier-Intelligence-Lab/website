@@ -16,6 +16,7 @@ import { isSameOriginRequest } from './lib/origin.js';
 import { createStore } from './store/index.js';
 import { registerAccountRoutes } from './accounts.js';
 import { registerDatasetRoutes } from './datasets.js';
+import { registerWorkspaceDataRoutes } from './workspace-data.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -61,7 +62,9 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
         'default-src': ["'self'"],
         'script-src': ["'self'"],
         'style-src': ["'self'"],
-        'img-src': ["'self'"],
+        // Dataset previews (images, audio, video) load from the ingest service with short-lived signed links.
+        'img-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
+        'media-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'font-src': ["'self'"],
         // Sample uploads go straight to the ingest service, so the browser may also connect to it.
         'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
@@ -145,6 +148,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   const helpers = { sameOrigin, privateHeaders, problem };
   const { guards } = await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers });
   registerDatasetRoutes(app, { config, store: accountStore, helpers, guards, ingestClient });
+  registerWorkspaceDataRoutes(app, { config, store: accountStore, helpers, guards });
 
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,

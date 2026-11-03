@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { StoreError } from './store/index.js';
 import { signToken, verifyToken } from './lib/tokens.js';
 import { createIngestClient } from './lib/ingest-client.js';
+import { computeIssues } from './lib/dataset.js';
 
 const GRANT_TTL_S = 10 * 60;
 const DOWNLOAD_TTL_S = 5 * 60;
@@ -98,6 +99,13 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
     if (!project.dataSource) return problem(reply, 400, 'Record where the data came from first.');
     const uploads = await store.listUploads({ workspaceId: project.workspaceId, projectId: project.id });
     if (project.dataSource.mode === 'upload' && uploads.length === 0) return problem(reply, 400, 'Upload at least one sample file first.');
+    if (project.dataSource.mode === 'upload') {
+      // Every open issue is either fixed or carries a note before staff see the snapshot.
+      const where = { workspaceId: project.workspaceId, projectId: project.id };
+      const [annotations, notes] = await Promise.all([store.listAnnotations(where), store.listIssueNotes(where)]);
+      const open = computeIssues({ project, uploads, annotations, notes }).filter((i) => i.open).length;
+      if (open) return problem(reply, 409, `Resolve ${open} open issue${open === 1 ? '' : 's'} before sending for review: fix ${open === 1 ? 'it' : 'each one'} or note why it stays.`, { code: 'issues_open', open });
+    }
     try {
       const review = await store.submitForReview({ workspaceId: project.workspaceId, projectId: project.id, submittedBy: request.user.id });
       return { review: { id: review.id, status: review.status, files: review.snapshot.files.length } };

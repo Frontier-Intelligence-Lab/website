@@ -5,7 +5,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
-const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
+const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'labelSet'];
 const lower = (value) => String(value).toLowerCase();
 const iso = (value) => value == null ? null : new Date(value).toISOString();
 
@@ -68,7 +68,7 @@ const joinRow = (r) => ({
 const projectRow = (r) => r ? {
   id: r.id, workspaceId: r.workspace_id, createdBy: r.created_by, name: r.name,
   task: r.task, modalities: r.modalities, startingPoint: r.starting_point,
-  success: r.success, dataSource: r.data_source, model: r.model, status: r.status, setupStep: r.setup_step,
+  success: r.success, dataSource: r.data_source, model: r.model, labelSet: r.label_set ?? [], status: r.status, setupStep: r.setup_step,
   createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
 } : null;
 const auditRow = (r) => ({
@@ -80,8 +80,15 @@ const uploadRow = (r) => r ? {
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, uploadedBy: r.uploaded_by,
   objectKey: r.object_key, sha256: r.sha256, sizeBytes: Number(r.size_bytes),
   contentType: r.content_type, filename: r.filename, duplicateOf: r.duplicate_of,
+  kind: r.kind ?? null, offsetMs: r.offset_ms == null ? null : Number(r.offset_ms),
   createdAt: iso(r.created_at),
 } : null;
+const annotationRow = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, uploadId: r.upload_id, labelId: r.label_id,
+  startMs: r.start_ms == null ? null : Number(r.start_ms), endMs: r.end_ms == null ? null : Number(r.end_ms),
+  createdBy: r.created_by, createdAt: iso(r.created_at),
+});
+const noteRow = (r) => ({ key: r.issue_key, note: r.note, createdBy: r.created_by, createdAt: iso(r.created_at) });
 const reviewRow = (r) => r ? {
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, submittedBy: r.submitted_by,
   status: r.status, reviewerId: r.reviewer_id, notes: r.notes, checks: r.checks, snapshot: r.snapshot ?? null,
@@ -349,6 +356,7 @@ export function createPostgresStore(options) {
         success = CASE WHEN $3::jsonb ? 'success' THEN NULLIF($3::jsonb -> 'success', 'null'::jsonb) ELSE success END,
         data_source = CASE WHEN $3::jsonb ? 'dataSource' THEN NULLIF($3::jsonb -> 'dataSource', 'null'::jsonb) ELSE data_source END,
         model = CASE WHEN $3::jsonb ? 'model' THEN NULLIF($3::jsonb -> 'model', 'null'::jsonb) ELSE model END,
+        label_set = CASE WHEN $3::jsonb ? 'labelSet' THEN COALESCE(NULLIF($3::jsonb -> 'labelSet', 'null'::jsonb), '[]'::jsonb) ELSE label_set END,
         setup_step = CASE WHEN $3::jsonb ? 'setupStep' THEN $3::jsonb ->> 'setupStep' ELSE setup_step END,
         updated_at = clock_timestamp()
         WHERE workspace_id = $1 AND id = $2 AND (NOT $4 OR status = ANY($5::text[])) RETURNING *`,
@@ -412,15 +420,82 @@ export function createPostgresStore(options) {
       });
     },
 
+    async updateUpload({ workspaceId, projectId, uploadId, patch }) {
+      if (!isId(uploadId)) throw new StoreError('not_found');
+      const changes = Object.fromEntries(['kind', 'offsetMs'].filter(key => Object.hasOwn(patch, key)).map(key => [key, patch[key]]));
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        const row = (await query(`UPDATE uploads SET
+          kind = CASE WHEN $4::jsonb ? 'kind' THEN $4::jsonb ->> 'kind' ELSE kind END,
+          offset_ms = CASE WHEN $4::jsonb ? 'offsetMs' THEN ($4::jsonb ->> 'offsetMs')::bigint ELSE offset_ms END
+          WHERE workspace_id = $1 AND project_id = $2 AND id = $3 RETURNING *`, [workspaceId, projectId, uploadId, JSON.stringify(changes)], client)).rows[0];
+        if (!row) throw new StoreError('not_found');
+        return uploadRow(row);
+      });
+    },
+    async listAnnotations({ workspaceId, projectId }) {
+      if (!isId(workspaceId) || !isId(projectId)) return [];
+      return (await query('SELECT * FROM annotations WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId])).rows.map(annotationRow);
+    },
+    async createAnnotation({ workspaceId, projectId, uploadId, labelId, startMs = null, endMs = null, createdBy }) {
+      if (!isId(uploadId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        const upload = (await query('SELECT 1 FROM uploads WHERE workspace_id = $1 AND project_id = $2 AND id = $3', [workspaceId, projectId, uploadId], client)).rowCount;
+        if (!upload) throw new StoreError('not_found');
+        const row = (await query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, start_ms, end_ms, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, [workspaceId, projectId, uploadId, labelId, startMs, endMs, createdBy], client)).rows[0];
+        return annotationRow(row);
+      });
+    },
+    async deleteAnnotation({ workspaceId, projectId, annotationId }) {
+      if (!isId(annotationId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        const row = (await query('DELETE FROM annotations WHERE workspace_id = $1 AND project_id = $2 AND id = $3 RETURNING *', [workspaceId, projectId, annotationId], client)).rows[0];
+        if (!row) throw new StoreError('not_found');
+        return annotationRow(row);
+      });
+    },
+    async listIssueNotes({ workspaceId, projectId }) {
+      if (!isId(workspaceId) || !isId(projectId)) return [];
+      return (await query('SELECT * FROM issue_notes WHERE workspace_id = $1 AND project_id = $2 ORDER BY issue_key', [workspaceId, projectId])).rows.map(noteRow);
+    },
+    async setIssueNote({ workspaceId, projectId, key, note, createdBy }) {
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        const row = (await query(`INSERT INTO issue_notes (workspace_id, project_id, issue_key, note, created_by) VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (project_id, issue_key) DO UPDATE SET note = EXCLUDED.note, created_by = EXCLUDED.created_by, created_at = clock_timestamp()
+          RETURNING *`, [workspaceId, projectId, key, note, createdBy], client)).rows[0];
+        return noteRow(row);
+      });
+    },
+    async deleteIssueNote({ workspaceId, projectId, key }) {
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        const row = (await query('DELETE FROM issue_notes WHERE workspace_id = $1 AND project_id = $2 AND issue_key = $3 RETURNING *', [workspaceId, projectId, key], client)).rows[0];
+        if (!row) throw new StoreError('not_found');
+      });
+    },
+
     async submitForReview({ workspaceId, projectId, submittedBy }) {
       return transaction(async (client) => {
         const project = await lockProject(client, workspaceId, projectId);
         if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
         // The reviewer decides on this snapshot, taken under the same lock that uploads and edits wait on.
-        const files = (await query(`SELECT id, sha256, size_bytes, content_type, filename, object_key FROM uploads
+        const files = (await query(`SELECT id, sha256, size_bytes, content_type, filename, object_key, kind, offset_ms FROM uploads
           WHERE workspace_id = $1 AND project_id = $2 AND duplicate_of IS NULL ORDER BY created_at, id`, [workspaceId, projectId], client)).rows
-          .map(f => ({ id: f.id, sha256: f.sha256, sizeBytes: Number(f.size_bytes), contentType: f.content_type, filename: f.filename, objectKey: f.object_key }));
-        const snapshot = { task: project.task, modalities: project.modalities, startingPoint: project.starting_point, success: project.success, dataSource: project.data_source, model: project.model, files };
+          .map(f => ({ id: f.id, sha256: f.sha256, sizeBytes: Number(f.size_bytes), contentType: f.content_type, filename: f.filename, objectKey: f.object_key, kind: f.kind ?? null, offsetMs: f.offset_ms == null ? null : Number(f.offset_ms) }));
+        const ids = files.map(f => f.id);
+        const annotations = (await query('SELECT * FROM annotations WHERE project_id = $1 AND upload_id = ANY($2::uuid[]) ORDER BY created_at, id', [projectId, ids], client)).rows
+          .map(a => ({ id: a.id, uploadId: a.upload_id, labelId: a.label_id, startMs: a.start_ms == null ? null : Number(a.start_ms), endMs: a.end_ms == null ? null : Number(a.end_ms) }));
+        const issueNotes = (await query('SELECT * FROM issue_notes WHERE project_id = $1 ORDER BY issue_key', [projectId], client)).rows.map(n => ({ key: n.issue_key, note: n.note }));
+        const snapshot = { task: project.task, modalities: project.modalities, startingPoint: project.starting_point, success: project.success, dataSource: project.data_source, model: project.model, labelSet: project.label_set ?? [], files, annotations, issueNotes };
         const row = (await query('INSERT INTO reviews (workspace_id, project_id, submitted_by, snapshot) VALUES ($1, $2, $3, $4::jsonb) RETURNING *', [workspaceId, projectId, submittedBy, JSON.stringify(snapshot)], client)).rows[0];
         await query("UPDATE projects SET status = 'in_review', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2", [workspaceId, projectId], client);
         await addAudit(client, { workspaceId, actorId: submittedBy, action: 'review.submitted', targetType: 'project', targetId: projectId, metadata: { reviewId: row.id } });

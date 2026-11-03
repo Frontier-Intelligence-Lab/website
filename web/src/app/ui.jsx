@@ -23,6 +23,12 @@ const PATHS = {
   link: <><path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" /><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" /></>,
   minus: <path d="M5 12h14" />,
   updown: <path d="m7 10 5-5 5 5M7 14l5 5 5-5" />,
+  panel: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>,
+  download: <><path d="M12 4v11" /><path d="m7 10 5 5 5-5" /><path d="M4 19h16" /></>,
+  play: <path d="M7 5v14l11-7z" />,
+  pause: <path d="M8 5v14M16 5v14" />,
+  pen: <><path d="M4 20h4L19 9l-4-4L4 16z" /><path d="m13 7 4 4" /></>,
+  alert: <><path d="M12 4 2.5 20h19z" /><path d="M12 10v4M12 17h.01" /></>,
 };
 
 export function Icon({ name, size = 20, stroke = 1.8 }) {

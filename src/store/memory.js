@@ -3,7 +3,7 @@ import { StoreError } from './errors.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
-const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
+const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'labelSet'];
 
 /**
  * In-process store for development and tests. Same contract as the Postgres store
@@ -21,12 +21,20 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const uploads = [];
   const reviews = [];
   const versions = [];
+  const annotations = [];
+  const issueNotes = [];
   const audit = [];
   const reviewerAccounts = new Map();
   const copy = (value) => (value == null ? null : structuredClone(value));
   const stamp = () => now().toISOString();
   const publicUser = ({ passwordHash, ...user }) => copy(user);
   const publicReviewer = ({ passwordHash, ...account }) => copy(account);
+  const editableProject = (workspaceId, projectId) => {
+    const project = projects.get(projectId);
+    if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+    if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+    return project;
+  };
 
   return {
     kind: 'memory',
@@ -186,7 +194,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
       const project = {
         id: randomUUID(), workspaceId, createdBy, name, task, modalities: [...modalities], startingPoint,
-        success: null, dataSource: null, model: null, status: 'draft', setupStep: 'success', createdAt: stamp(), updatedAt: stamp(),
+        success: null, dataSource: null, model: null, labelSet: [], status: 'draft', setupStep: 'success', createdAt: stamp(), updatedAt: stamp(),
       };
       projects.set(project.id, project);
       audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'project.created', targetType: 'project', targetId: project.id, metadata: {}, createdAt: stamp() });
@@ -197,6 +205,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       if (!project || project.workspaceId !== workspaceId) return null;
       if (CONTENT_FIELDS.some((key) => key in patch) && !EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
       for (const key of [...CONTENT_FIELDS, 'setupStep']) if (key in patch) project[key] = copy(patch[key]);
+      if (project.labelSet == null) project.labelSet = [];
       project.updatedAt = stamp();
       return copy(project);
     },
@@ -217,7 +226,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       if ((limits.maxFiles != null && mine.length + 1 > limits.maxFiles)
         || (limits.maxBytes != null && mine.reduce((n, u) => n + u.sizeBytes, 0) + sizeBytes > limits.maxBytes)) throw new StoreError('quota_exceeded');
       const duplicateOf = mine.find((u) => u.sha256 === sha256 && !u.duplicateOf)?.id ?? null;
-      const upload = { id: randomUUID(), workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, duplicateOf, createdAt: stamp() };
+      const upload = { id: randomUUID(), workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, duplicateOf, kind: null, offsetMs: null, createdAt: stamp() };
       uploads.push(upload);
       return copy(upload);
     },
@@ -234,6 +243,8 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       const i = uploads.findIndex((u) => u.id === uploadId && u.projectId === projectId);
       if (i < 0) throw new StoreError('not_found');
       const [removed] = uploads.splice(i, 1);
+      // Labels belong to the file and go with it.
+      for (let j = annotations.length - 1; j >= 0; j--) if (annotations[j].uploadId === removed.id) annotations.splice(j, 1);
       // The earliest copy of a removed original becomes the new original.
       const copies = uploads.filter((u) => u.duplicateOf === removed.id);
       if (copies.length) {
@@ -242,6 +253,48 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       }
       audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'upload.deleted', targetType: 'upload', targetId: uploadId, metadata: { sha256: removed.sha256 }, createdAt: stamp() });
       return copy(removed);
+    },
+
+    async updateUpload({ workspaceId, projectId, uploadId, patch }) {
+      const project = editableProject(workspaceId, projectId);
+      const upload = uploads.find((u) => u.id === uploadId && u.projectId === project.id);
+      if (!upload) throw new StoreError('not_found');
+      for (const key of ['kind', 'offsetMs']) if (key in patch) upload[key] = patch[key] ?? null;
+      return copy(upload);
+    },
+    async listAnnotations({ workspaceId, projectId }) {
+      return annotations.filter((a) => a.workspaceId === workspaceId && a.projectId === projectId).map(copy);
+    },
+    async createAnnotation({ workspaceId, projectId, uploadId, labelId, startMs = null, endMs = null, createdBy }) {
+      const project = editableProject(workspaceId, projectId);
+      if (!uploads.some((u) => u.id === uploadId && u.projectId === project.id)) throw new StoreError('not_found');
+      const annotation = { id: randomUUID(), workspaceId, projectId, uploadId, labelId, startMs, endMs, createdBy, createdAt: stamp() };
+      annotations.push(annotation);
+      return copy(annotation);
+    },
+    async deleteAnnotation({ workspaceId, projectId, annotationId }) {
+      editableProject(workspaceId, projectId);
+      const i = annotations.findIndex((a) => a.id === annotationId && a.projectId === projectId);
+      if (i < 0) throw new StoreError('not_found');
+      return copy(annotations.splice(i, 1)[0]);
+    },
+    async listIssueNotes({ workspaceId, projectId }) {
+      return issueNotes.filter((n) => n.workspaceId === workspaceId && n.projectId === projectId)
+        .sort((a, b) => (a.key < b.key ? -1 : 1)).map(({ key, note, createdBy, createdAt }) => ({ key, note, createdBy, createdAt }));
+    },
+    async setIssueNote({ workspaceId, projectId, key, note, createdBy }) {
+      editableProject(workspaceId, projectId);
+      const existing = issueNotes.find((n) => n.projectId === projectId && n.key === key);
+      const row = existing ?? { workspaceId, projectId, key };
+      Object.assign(row, { note, createdBy, createdAt: stamp() });
+      if (!existing) issueNotes.push(row);
+      return { key, note, createdBy, createdAt: row.createdAt };
+    },
+    async deleteIssueNote({ workspaceId, projectId, key }) {
+      editableProject(workspaceId, projectId);
+      const i = issueNotes.findIndex((n) => n.projectId === projectId && n.key === key);
+      if (i < 0) throw new StoreError('not_found');
+      issueNotes.splice(i, 1);
     },
 
     async submitForReview({ workspaceId, projectId, submittedBy }) {
@@ -253,8 +306,13 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
         task: project.task, modalities: copy(project.modalities), startingPoint: project.startingPoint,
         success: copy(project.success), dataSource: copy(project.dataSource), model: copy(project.model),
         files: uploads.filter((u) => u.projectId === projectId && !u.duplicateOf)
-          .map(({ id, sha256, sizeBytes, contentType, filename, objectKey }) => ({ id, sha256, sizeBytes, contentType, filename, objectKey })),
+          .map(({ id, sha256, sizeBytes, contentType, filename, objectKey, kind, offsetMs }) => ({ id, sha256, sizeBytes, contentType, filename, objectKey, kind, offsetMs })),
+        labelSet: copy(project.labelSet ?? []),
       };
+      const fileIds = new Set(snapshot.files.map((f) => f.id));
+      snapshot.annotations = annotations.filter((a) => a.projectId === projectId && fileIds.has(a.uploadId))
+        .map(({ id, uploadId, labelId, startMs, endMs }) => ({ id, uploadId, labelId, startMs, endMs }));
+      snapshot.issueNotes = issueNotes.filter((n) => n.projectId === projectId).sort((a, b) => (a.key < b.key ? -1 : 1)).map(({ key, note }) => ({ key, note }));
       const review = { id: randomUUID(), workspaceId, projectId, submittedBy, status: 'pending', reviewerId: null, notes: null, checks: {}, snapshot, decidedAt: null, createdAt: stamp() };
       reviews.push(review);
       project.status = 'in_review';

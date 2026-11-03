@@ -38,6 +38,13 @@ async function person(app, email, name = email.split('@')[0]) {
 // Stands in for services/ingest: signs a receipt the way the Rust service does.
 const receipt = (fields) => signToken(SECRET, { v: 1, kind: 'receipt', objectKey: `ws/${fields.ws}/projects/${fields.project}/pending/${Math.random()}`, sha256: 'b'.repeat(64), sizeBytes: 1200, contentType: 'image/png', filename: 'box.png', exp: Math.floor(Date.now() / 1000) + 60, ...fields });
 
+// Notes every open issue that may be noted, as a person would on the Resolve screen, then submits.
+async function submit(c, base) {
+  const { issues } = (await c.get(`${base}/dataset`)).json();
+  for (const issue of issues.filter((i) => i.open && !i.blocking)) await c.post(`${base}/issues/note`, { key: issue.key, note: 'Known and accepted for this sample.' });
+  return c.post(`${base}/submit`);
+}
+
 async function projectWithData(app, owner) {
   const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
   const { project } = (await owner.post(`/api/workspaces/${ws.id}/projects`, { task: 'Flag damaged boxes on line 2.', modalities: ['Images'], startingPoint: 'own' })).json();
@@ -84,10 +91,10 @@ test('review: submit, independent staff decision, then a frozen dataset version'
   const app = await makeApp({ env: INGEST, ingestClient: fakeIngest() });
   const owner = await person(app, 'o@acme-robotics.com');
   const { ws, project, base } = await projectWithData(app, owner);
-  assert.equal((await owner.post(`${base}/submit`)).statusCode, 400, 'needs a sample first');
+  assert.equal((await submit(owner, base)).statusCode, 400, 'needs a sample first');
   await owner.post(`${base}/uploads`, { receipt: receipt({ ws: ws.id, project: project.id, by: owner.id }) });
-  assert.equal((await owner.post(`${base}/submit`)).statusCode, 200);
-  assert.equal((await owner.post(`${base}/submit`)).statusCode, 409);
+  assert.equal((await submit(owner, base)).statusCode, 200);
+  assert.equal((await submit(owner, base)).statusCode, 409);
   assert.equal((await owner.post(`${base}/upload-grant`)).statusCode, 409, 'uploads close during review');
   assert.equal((await owner.post(`${base}/dataset-versions`)).statusCode, 409, 'no version before approval');
 
@@ -108,7 +115,7 @@ test('review: submit, independent staff decision, then a frozen dataset version'
   assert.equal(afterChanges.project.status, 'changes_requested');
   assert.equal(afterChanges.latestReview.notes, 'Labels missing on 3 files');
 
-  await owner.post(`${base}/submit`);
+  await submit(owner, base);
   const second = (await staff.get('/api/staff/reviews')).json().reviews[0];
   const all = { rights: true, consent: true, labels: true, duplicates: true, format: true };
   assert.equal((await staff.post(`/api/staff/reviews/${second.id}/decision`, { decision: 'approved', checks: all })).statusCode, 200);
@@ -129,7 +136,7 @@ test('staff cannot review their own workspace', async () => {
   const owner = await person(app, 'o@acme-robotics.com');
   const { ws, project, base } = await projectWithData(app, owner);
   await owner.post(`${base}/uploads`, { receipt: receipt({ ws: ws.id, project: project.id, by: owner.id }) });
-  await owner.post(`${base}/submit`);
+  await submit(owner, base);
   const [r] = (await owner.get('/api/staff/reviews')).json().reviews;
   const res = await owner.post(`/api/staff/reviews/${r.id}/decision`, { decision: 'approved', checks: { rights: true, consent: true, labels: true, duplicates: true, format: true } });
   assert.equal(res.statusCode, 403);
@@ -198,7 +205,7 @@ test('approval integrity: no edits, held receipts or deletions after submission;
   assert.equal(ingest.calls.commit.length, 1);
   const held = receipt({ ...mine, sha256: 'f'.repeat(64) });
 
-  assert.equal((await owner.post(`${base}/submit`)).json().review.files, 1);
+  assert.equal((await submit(owner, base)).json().review.files, 1);
   const all = { rights: true, consent: true, labels: true, duplicates: true, format: true };
   const [r] = (await staff.get('/api/staff/reviews')).json().reviews;
   await staff.post(`/api/staff/reviews/${r.id}/decision`, { decision: 'approved', checks: all });
@@ -224,7 +231,7 @@ test('approval integrity: no edits, held receipts or deletions after submission;
   // Changes after reopening go through a fresh review, and the version holds exactly that reviewed content.
   assert.equal((await owner.post(`${base}/uploads`, { receipt: held })).statusCode, 200);
   await owner.post(base, { dataSource: { mode: 'upload', provenance: 'licensed', allowedUses: ['training'], personalData: 'no' } });
-  assert.equal((await owner.post(`${base}/submit`)).json().review.files, 2);
+  assert.equal((await submit(owner, base)).json().review.files, 2);
   const [r2] = (await staff.get('/api/staff/reviews')).json().reviews;
   const detail = (await staff.get(`/api/staff/reviews/${r2.id}`)).json();
   assert.equal(detail.project.dataSource.provenance, 'licensed');
@@ -271,7 +278,7 @@ test('removing an upload after reopening preserves its historical review and ver
     const staff = await person(app, 'reviewer@valcairn.test');
     const { ws, project, base } = await projectWithData(app, owner);
     const { upload } = (await owner.post(`${base}/uploads`, { receipt: receipt({ ws: ws.id, project: project.id, by: owner.id }) })).json();
-    const { review } = (await owner.post(`${base}/submit`)).json();
+    const { review } = (await submit(owner, base)).json();
     const checks = { rights: true, consent: true, labels: true, duplicates: true, format: true };
     assert.equal((await staff.post(`/api/staff/reviews/${review.id}/decision`, { decision: 'approved', checks })).statusCode, 200);
     assert.equal((await owner.post(`${base}/dataset-versions`)).statusCode, 200);
