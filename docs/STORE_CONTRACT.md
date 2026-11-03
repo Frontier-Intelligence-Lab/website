@@ -13,7 +13,8 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 ## Rules for every implementation
 
 - Every method is `async` and returns plain objects with camelCase keys. Timestamps are ISO 8601 strings in UTC. `null` means not found.
-- Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`.
+- Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`, `quota_exceeded`.
+- **Approval integrity.** A project's review-relevant content is editable only while its status is `draft` or `changes_requested`. That content is `name, task, modalities, startingPoint, success, dataSource, model` and its uploads. In `in_review`, `approved` and `versioned`, every write to it (`updateProject` content fields, `createUpload`, `deleteUpload`) throws `invalid_state`. The check and the write must be atomic: one conditional statement, or a check under the project row lock that submission also takes. Postgres additionally enforces this with triggers (`migrations/005_review_integrity.sql`). Lifecycle `status` is never patchable through `updateProject`.
 - Password hashes and token hashes never leave the store. The only exception is `getUserAuthByEmail`, which returns the password hash for login.
 - Emails, domains and slugs are compared case-insensitively and stored lower-case.
 - Workspace-scoped reads and writes take `workspaceId` and must filter on it. A project id from workspace A must not be readable or writable through workspace B. The routes also check membership before calling the store.
@@ -50,14 +51,19 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 | `acceptInvitation({ invitationId, userId })` | `{ workspaceId, role, alreadyMember }`. Marks the invitation accepted and adds the membership in one transaction; an existing membership keeps its role. Throws `not_found`, `already_decided` (accepted or revoked) or `invite_expired`. |
 | `revokeInvitation({ workspaceId, invitationId, actorId })` | — · `not_found` (including another workspace's invitation), `already_decided` |
 | `updateWorkspaceProfile({ workspaceId, profile })` | workspace. Shallow-merges keys into `profile`. |
-| `createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename })` | upload. `duplicateOf` is the id of an earlier upload in the same project with the same `sha256`, else null. Throws `not_found` (project not in workspace) or `duplicate_upload` (same `objectKey`; unique). |
+| `createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, limits })` | upload. `duplicateOf` is the id of an earlier original upload in the same project with the same `sha256`, else null. Optional `limits: { maxFiles, maxBytes }` are checked under the project lock. Throws `not_found`, `duplicate_upload` (same `objectKey`), `invalid_state` (frozen) or `quota_exceeded`. |
+| `deleteUpload({ workspaceId, projectId, uploadId, actorId })` | removed upload (with `objectKey`, so the caller can delete the object). Only while editable. The earliest copy of a removed original becomes the new original. |
 | `listUploads({ workspaceId, projectId })` / `getUpload(id)` | uploads (with `objectKey`; routes strip it before responding) |
-| `submitForReview({ workspaceId, projectId, submittedBy })` | review (`status: 'pending'`). In one transaction: project status `draft` or `changes_requested` becomes `in_review`, else `invalid_state`. |
+| `submitForReview({ workspaceId, projectId, submittedBy })` | review (`status: 'pending'`) with `snapshot: { task, modalities, startingPoint, success, dataSource, model, files: [{ id, sha256, sizeBytes, contentType, filename, objectKey }] }`. Original files only, no duplicates. In one transaction under the project lock: project status `draft` or `changes_requested` becomes `in_review`, else `invalid_state`. |
+| `reopenProject({ workspaceId, projectId, actorId })` | project, now `draft`. From `in_review` it withdraws the pending review (`status: 'withdrawn'`). From `approved` or `versioned` it voids the approval for new versions. Other states throw `invalid_state`. |
 | `listReviews({ status })` | across all workspaces (staff queue), each with `projectName`, `workspaceName` |
 | `getReview(id)` / `listProjectReviews({ workspaceId, projectId })` | review / reviews oldest first |
-| `decideReview({ reviewId, reviewerId, decision, notes, checks })` | review. `decision` is `approved` or `changes_requested`, and the project status becomes the same value in one transaction. Throws `not_found` or `already_decided`. |
-| `createDatasetVersion({ workspaceId, projectId, createdBy, manifest })` | version `{ number }` (1, 2, … per project). Only when the project status is `approved` or `versioned`, else `invalid_state`. Sets status `versioned`. Number assignment must be race-free (unique `(project_id, number)`). |
+| `decideReview({ reviewId, reviewerId, decision, notes, checks })` | review. `decision` is `approved` or `changes_requested`, and the project status becomes the same value in one transaction. Throws `not_found` or `already_decided` (including withdrawn reviews). |
+| `createDatasetVersion({ workspaceId, projectId, createdBy })` | version `{ number, manifest }`. The store builds `manifest = { reviewId, ...snapshot }` from the latest review, which must be `approved`. Never built from the live project. Only when the project status is `approved` (one version per approval), else `invalid_state`. Sets status `versioned`. Numbers are race-free (unique `(project_id, number)`). |
 | `listDatasetVersions({ workspaceId, projectId })` | versions, oldest first |
+| `upsertReviewer({ username, name, role, passwordHash })` | reviewer `{ username, name, role, enabled }`. `passwordHash` is required for a new account; omitted, the existing hash is kept. External demo reviewers only, separate from users and staff. |
+| `getReviewer(username)` / `getReviewerAuth(username)` | reviewer / `{ account, passwordHash }`, or null |
+| `setReviewerEnabled({ username, enabled })` / `listReviewers()` | reviewer · `not_found` / reviewers |
 | `recordAudit({ workspaceId, actorId, action, targetType, targetId, metadata })` | — |
 | `listAudit(workspaceId, { limit })` | newest first |
 | `close()` | releases connections |
@@ -77,6 +83,11 @@ project    { id, workspaceId, createdBy, name, task, modalities: string[], start
 
 ## Changelog
 
+- **v4:**
+  - Approval integrity: frozen content, review snapshots, `reopenProject`, versions made only from an approved snapshot (one per approval).
+  - `deleteUpload` and upload quotas (`quota_exceeded`).
+  - Reviewer accounts (`reviewer_accounts`).
+  - Postgres: `005_review_integrity.sql` (`reviews.snapshot`, `withdrawn` status, freeze triggers) and `006_reviewer_accounts.sql`.
 - **v3:**
   - Accepting and revoking invitations by token.
   - Workspace profile updates (academic verification).

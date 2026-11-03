@@ -106,7 +106,15 @@ export function loadConfig(env = process.env) {
     databaseSsl,
     // Self-serve accounts and onboarding. Off in production unless explicitly enabled.
     accountSignup: truthy(env.ACCOUNT_SIGNUP, !isProd),
-    ingest: ingestPublicUrl && ingestSharedSecret ? { publicUrl: ingestPublicUrl, secret: ingestSharedSecret, maxBytes: Number(env.INGEST_MAX_BYTES ?? 200 * 1024 * 1024) } : null,
+    ingest: ingestPublicUrl && ingestSharedSecret ? {
+      publicUrl: ingestPublicUrl,
+      // Server-to-server address for commit/delete; defaults to the public one.
+      internalUrl: (env.INGEST_INTERNAL_URL || ingestPublicUrl).replace(/\/+$/, ''),
+      secret: ingestSharedSecret,
+      maxBytes: Number(env.INGEST_MAX_BYTES ?? 200 * 1024 * 1024),
+      projectMaxFiles: Number(env.PROJECT_MAX_FILES ?? 2000),
+      projectMaxBytes: Number(env.PROJECT_MAX_BYTES ?? 20 * 1024 ** 3),
+    } : null,
     staffEmails,
   };
 }

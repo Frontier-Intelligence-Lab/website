@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
 
+// Review-relevant content can change only while a project is editable; submitting freezes it.
+const EDITABLE = ['draft', 'changes_requested'];
+const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
+
 /**
  * In-process store for development and tests. Same contract as the Postgres store
  * (see docs/STORE_CONTRACT.md and tests/store-contract.js); data is lost on restart.
@@ -18,9 +22,11 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const reviews = [];
   const versions = [];
   const audit = [];
+  const reviewerAccounts = new Map();
   const copy = (value) => (value == null ? null : structuredClone(value));
   const stamp = () => now().toISOString();
   const publicUser = ({ passwordHash, ...user }) => copy(user);
+  const publicReviewer = ({ passwordHash, ...account }) => copy(account);
 
   return {
     kind: 'memory',
@@ -189,8 +195,8 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     async updateProject({ workspaceId, projectId, patch }) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) return null;
-      const allowed = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'status', 'setupStep'];
-      for (const key of allowed) if (key in patch) project[key] = copy(patch[key]);
+      if (CONTENT_FIELDS.some((key) => key in patch) && !EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+      for (const key of [...CONTENT_FIELDS, 'setupStep']) if (key in patch) project[key] = copy(patch[key]);
       project.updatedAt = stamp();
       return copy(project);
     },
@@ -202,11 +208,15 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       return [...projects.values()].filter((p) => p.workspaceId === workspaceId).map(copy);
     },
 
-    async createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename }) {
+    async createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, limits = {} }) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+      if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
       if (uploads.some((u) => u.objectKey === objectKey)) throw new StoreError('duplicate_upload');
-      const duplicateOf = uploads.find((u) => u.projectId === projectId && u.sha256 === sha256)?.id ?? null;
+      const mine = uploads.filter((u) => u.projectId === projectId);
+      if ((limits.maxFiles != null && mine.length + 1 > limits.maxFiles)
+        || (limits.maxBytes != null && mine.reduce((n, u) => n + u.sizeBytes, 0) + sizeBytes > limits.maxBytes)) throw new StoreError('quota_exceeded');
+      const duplicateOf = mine.find((u) => u.sha256 === sha256 && !u.duplicateOf)?.id ?? null;
       const upload = { id: randomUUID(), workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, duplicateOf, createdAt: stamp() };
       uploads.push(upload);
       return copy(upload);
@@ -217,17 +227,52 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     async getUpload(uploadId) {
       return copy(uploads.find((u) => u.id === uploadId));
     },
+    async deleteUpload({ workspaceId, projectId, uploadId, actorId }) {
+      const project = projects.get(projectId);
+      if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+      if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+      const i = uploads.findIndex((u) => u.id === uploadId && u.projectId === projectId);
+      if (i < 0) throw new StoreError('not_found');
+      const [removed] = uploads.splice(i, 1);
+      // The earliest copy of a removed original becomes the new original.
+      const copies = uploads.filter((u) => u.duplicateOf === removed.id);
+      if (copies.length) {
+        copies[0].duplicateOf = null;
+        for (const c of copies.slice(1)) c.duplicateOf = copies[0].id;
+      }
+      audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'upload.deleted', targetType: 'upload', targetId: uploadId, metadata: { sha256: removed.sha256 }, createdAt: stamp() });
+      return copy(removed);
+    },
 
     async submitForReview({ workspaceId, projectId, submittedBy }) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
-      if (!['draft', 'changes_requested'].includes(project.status)) throw new StoreError('invalid_state');
-      const review = { id: randomUUID(), workspaceId, projectId, submittedBy, status: 'pending', reviewerId: null, notes: null, checks: {}, decidedAt: null, createdAt: stamp() };
+      if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+      // The reviewer decides on this snapshot, and a dataset version is made only from an approved snapshot.
+      const snapshot = {
+        task: project.task, modalities: copy(project.modalities), startingPoint: project.startingPoint,
+        success: copy(project.success), dataSource: copy(project.dataSource), model: copy(project.model),
+        files: uploads.filter((u) => u.projectId === projectId && !u.duplicateOf)
+          .map(({ id, sha256, sizeBytes, contentType, filename, objectKey }) => ({ id, sha256, sizeBytes, contentType, filename, objectKey })),
+      };
+      const review = { id: randomUUID(), workspaceId, projectId, submittedBy, status: 'pending', reviewerId: null, notes: null, checks: {}, snapshot, decidedAt: null, createdAt: stamp() };
       reviews.push(review);
       project.status = 'in_review';
       project.updatedAt = stamp();
       audit.push({ id: audit.length + 1, workspaceId, actorId: submittedBy, action: 'review.submitted', targetType: 'project', targetId: projectId, metadata: { reviewId: review.id }, createdAt: stamp() });
       return copy(review);
+    },
+    async reopenProject({ workspaceId, projectId, actorId }) {
+      const project = projects.get(projectId);
+      if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
+      if (!['in_review', 'approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+      const pending = reviews.find((r) => r.projectId === projectId && r.status === 'pending');
+      if (pending) Object.assign(pending, { status: 'withdrawn', decidedAt: stamp() });
+      const from = project.status;
+      project.status = 'draft';
+      project.updatedAt = stamp();
+      audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'project.reopened', targetType: 'project', targetId: projectId, metadata: { from }, createdAt: stamp() });
+      return copy(project);
     },
     async listReviews({ status = 'pending' } = {}) {
       return reviews.filter((r) => r.status === status).map((r) => {
@@ -245,6 +290,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       const review = reviews.find((r) => r.id === reviewId);
       if (!review) throw new StoreError('not_found');
       if (review.status !== 'pending') throw new StoreError('already_decided');
+      if (!['approved', 'changes_requested'].includes(decision)) throw new StoreError('invalid_state');
       Object.assign(review, { status: decision, reviewerId, notes, checks: copy(checks), decidedAt: stamp() });
       const project = projects.get(review.projectId);
       project.status = decision;
@@ -253,20 +299,50 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       return copy(review);
     },
 
-    async createDatasetVersion({ workspaceId, projectId, createdBy, manifest }) {
+    async createDatasetVersion({ workspaceId, projectId, createdBy }) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
-      if (!['approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+      if (project.status !== 'approved') throw new StoreError('invalid_state');
+      const approved = reviews.findLast((r) => r.projectId === projectId && r.status === 'approved');
+      if (!approved?.snapshot) throw new StoreError('invalid_state');
       const number = versions.filter((v) => v.projectId === projectId).length + 1;
-      const version = { id: randomUUID(), workspaceId, projectId, number, createdBy, manifest: copy(manifest), createdAt: stamp() };
+      const manifest = { reviewId: approved.id, ...copy(approved.snapshot) };
+      const version = { id: randomUUID(), workspaceId, projectId, number, createdBy, manifest, createdAt: stamp() };
       versions.push(version);
       project.status = 'versioned';
       project.updatedAt = stamp();
-      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'dataset_version.created', targetType: 'project', targetId: projectId, metadata: { number }, createdAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'dataset_version.created', targetType: 'project', targetId: projectId, metadata: { number, reviewId: approved.id }, createdAt: stamp() });
       return copy(version);
     },
     async listDatasetVersions({ workspaceId, projectId }) {
       return versions.filter((v) => v.workspaceId === workspaceId && v.projectId === projectId).map(copy);
+    },
+
+    async upsertReviewer({ username, name, role, passwordHash }) {
+      const key = String(username).toLowerCase();
+      const existing = reviewerAccounts.get(key);
+      if (!existing && !passwordHash) throw new StoreError('not_found');
+      const account = { username: key, name, role, passwordHash: passwordHash ?? existing.passwordHash, enabled: existing?.enabled ?? true, createdAt: existing?.createdAt ?? stamp(), updatedAt: stamp() };
+      reviewerAccounts.set(key, account);
+      return publicReviewer(account);
+    },
+    async getReviewer(username) {
+      const a = reviewerAccounts.get(String(username).toLowerCase());
+      return a ? publicReviewer(a) : null;
+    },
+    async getReviewerAuth(username) {
+      const a = reviewerAccounts.get(String(username).toLowerCase());
+      return a ? { account: publicReviewer(a), passwordHash: a.passwordHash } : null;
+    },
+    async setReviewerEnabled({ username, enabled }) {
+      const a = reviewerAccounts.get(String(username).toLowerCase());
+      if (!a) throw new StoreError('not_found');
+      a.enabled = Boolean(enabled);
+      a.updatedAt = stamp();
+      return publicReviewer(a);
+    },
+    async listReviewers() {
+      return [...reviewerAccounts.values()].map(publicReviewer).sort((a, b) => a.username.localeCompare(b.username));
     },
 
     async recordAudit({ workspaceId = null, actorId = null, action, targetType = null, targetId = null, metadata = {} }) {

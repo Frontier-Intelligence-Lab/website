@@ -22,7 +22,21 @@ async fn main() {
             std::process::exit(2);
         });
     tracing::info!(bind = %config.bind, "ingest listening");
-    axum::serve(listener, app::router(Arc::new(config.state)))
+    let state = Arc::new(config.state);
+    let sweeper = state.clone();
+    let (every, ttl) = (config.sweep_every, config.pending_ttl);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            match app::sweep_pending(&sweeper, ttl).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(removed = n, "removed uncommitted uploads"),
+                Err(err) => tracing::warn!(%err, "pending sweep failed"),
+            }
+        }
+    });
+    axum::serve(listener, app::router(state))
         .with_graceful_shutdown(shutdown())
         .await
         .expect("server error");

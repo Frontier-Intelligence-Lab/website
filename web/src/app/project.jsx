@@ -28,12 +28,6 @@ function Shell({ entry, current, children, title, modelPath = false }) {
   );
 }
 
-export async function workspaceHomeLoader({ params }) {
-  const { entry } = await requireWorkspace(params.slug);
-  const { projects } = await api.projects(entry.id);
-  const latest = projects.at(-1);
-  throw redirect(latest ? `/w/${entry.slug}/projects/${latest.id}` : `/w/${entry.slug}/projects/new`);
-}
 
 export async function goalLoader({ params }) {
   const { entry } = await requireWorkspace(params.slug);
@@ -56,7 +50,7 @@ export function ProjectGoal() {
     const task = new FormData(event.currentTarget).get('task');
     const res = await api.createProject(entry.id, { task, modalities, startingPoint: start }).catch(() => null);
     setPending(false);
-    if (res?.ok) return navigate(`/w/${entry.slug}/projects/${res.data.project.id}/success`);
+    if (res?.ok) return navigate(`/w/${entry.slug}/projects/${res.data.project.id}${start === 'unsure' ? '' : '/success'}`);
     setErrors(res?.data.errors ?? { form: res?.data.error ?? 'Could not save. Please try again.' });
   }
 
@@ -105,7 +99,7 @@ export function ProjectGoal() {
               ))}
             </ol>
           </div>
-          {entry.kind === 'organization' && <div className="ob-note tile--amber"><Tile icon="bank" tone="amber" size="sm" /><span><strong>Financing, if you need it.</strong> Start a private application for compute or equipment once the project exists.</span></div>}
+          {entry.kind === 'organization' && <div className="ob-note tile--amber"><Tile icon="bank" tone="amber" size="sm" /><span><strong>Financing is planned.</strong> It will cover compute and equipment once it opens; it isn't available yet.</span></div>}
         </aside>
       </form>
     </Shell>
@@ -114,17 +108,24 @@ export function ProjectGoal() {
 
 async function projectLoader({ params }) {
   const { account, entry } = await requireWorkspace(params.slug);
-  const [detail, { workspace }] = await Promise.all([api.project(entry.id, params.projectId), api.workspace(entry.id)]);
-  return { account, entry, workspace, ...detail };
+  const [detail, { workspace }, config] = await Promise.all([api.project(entry.id, params.projectId), api.workspace(entry.id), api.config()]);
+  return { account, entry, workspace, bookingUrl: config.bookingUrl, ...detail };
 }
-export const successLoader = projectLoader;
-export async function dataLoader(args) {
+// Setup pages edit the project, so they are only for editors of an editable project with a chosen starting point.
+async function editLoader(args) {
   const data = await projectLoader(args);
+  const home = `/w/${data.entry.slug}/projects/${data.project.id}`;
+  if (!data.editable || data.project.startingPoint === 'unsure' || !['owner', 'admin', 'member'].includes(data.role)) throw redirect(home);
+  return data;
+}
+export const successLoader = editLoader;
+export async function dataLoader(args) {
+  const data = await editLoader(args);
   if (data.project.startingPoint === 'model') throw redirect(`/w/${data.entry.slug}/projects/${data.project.id}/model`);
   return data;
 }
 export async function modelLoader(args) {
-  const data = await projectLoader(args);
+  const data = await editLoader(args);
   if (data.project.startingPoint !== 'model') throw redirect(`/w/${data.entry.slug}/projects/${data.project.id}/data`);
   return data;
 }
@@ -459,13 +460,11 @@ function Uploader({ entry, project, onUploaded }) {
     const start = items.length;
     setItems((all) => [...all, ...list.map((f) => ({ name: f.name, size: f.size, state: 'waiting', progress: 0 }))]);
     setBusy(true);
-    const grantRes = await api.uploadGrant(entry.id, project.id).catch(() => null);
-    if (!grantRes?.ok) {
-      list.forEach((_, k) => set(start + k, { state: 'failed', error: grantRes?.data.error ?? 'Could not start the upload.' }));
-      return setBusy(false);
-    }
     for (const [k, file] of list.entries()) {
       const i = start + k;
+      // Each file gets its own single-use grant from the web server.
+      const grantRes = await api.uploadGrant(entry.id, project.id).catch(() => null);
+      if (!grantRes?.ok) { set(i, { state: 'failed', error: grantRes?.data.error ?? 'Could not start the upload.' }); continue; }
       if (file.size > grantRes.data.maxBytes) { set(i, { state: 'failed', error: `Larger than the ${fmtBytes(grantRes.data.maxBytes)} limit.` }); continue; }
       set(i, { state: 'uploading' });
       try {
@@ -549,92 +548,34 @@ function AcademicCard({ entry, profile, onDone }) {
   );
 }
 
-const STATUS_LABEL = { draft: 'draft', in_review: 'in review', changes_requested: 'changes requested', approved: 'approved', versioned: 'dataset approved' };
+const STATUS_LABEL = { draft: 'draft', in_review: 'in review', changes_requested: 'changes requested', approved: 'approved', versioned: 'dataset version approved' };
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const roleName = (role) => role[0].toUpperCase() + role.slice(1);
 
-export function ProjectHome() {
-  const { account, entry, project, role, uploads, latestReview, versions, uploadsEnabled, workspace } = useLoaderData();
+/** Sidebar and frame shared by the workspace home and project pages. */
+function WorkspaceShell({ account, entry, role, title, current = 'projects', children }) {
   const navigate = useNavigate();
-  const revalidator = useRevalidator();
-  const base = `/w/${entry.slug}/projects/${project.id}`;
-  const modelPath = project.startingPoint === 'model';
-  const manager = ['owner', 'admin'].includes(role);
-  const writer = ['owner', 'admin', 'member'].includes(role);
-  const mode = project.dataSource?.mode;
-  const [actionError, setActionError] = useState(null);
-  const [pending, setPending] = useState(false);
   const [signOutState, setSignOutState] = useState('idle');
-
-  const taskDone = Boolean(project.success);
-  const dataDone = Boolean(modelPath ? project.model : project.dataSource);
-  const s = project.status;
-  const reviewed = ['approved', 'versioned'].includes(s);
-  const steps = modelPath ? [
-    { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
-    { label: 'Model and test plan', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
-    { label: 'Evaluate against your rule', st: 'todo', soon: true, note: 'Compare with your baseline on held-out examples.' },
-    { label: 'Readiness check and deploy', st: 'todo', soon: true, note: 'Only a model that meets your rule can be deployed.' },
-  ] : [
-    { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
-    { label: 'Data and rights record', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
-    ...(mode === 'upload' ? [{ label: 'Upload a sample', st: uploads.length ? 'done' : dataDone ? 'now' : 'todo', note: uploads.length ? `${uploads.length} file${uploads.length === 1 ? '' : 's'}` : undefined }] : []),
-    { label: 'Rights and quality review', st: reviewed ? 'done' : ['in_review', 'changes_requested'].includes(s) ? 'now' : 'todo', note: s === 'in_review' ? 'With Valcairn' : s === 'changes_requested' ? 'Changes requested' : 'Valcairn checks rights, consent, labels and duplicates.' },
-    { label: 'Approve dataset version 1', st: s === 'versioned' ? 'done' : s === 'approved' ? 'now' : 'todo', note: s === 'versioned' ? `Version ${versions.at(-1).number} · ${versions.at(-1).files} files` : 'Locks the exact files and rights record training will use.' },
-    { label: 'Train and test', st: 'todo', soon: true, note: 'You approve a cost estimate first.' },
-    { label: 'Accept and deploy', st: 'todo', soon: true, note: 'Only a model that meets your rule can be accepted.' },
-  ];
-
-  async function act(fn, ok) {
-    setPending(true); setActionError(null);
-    const res = await fn().catch(() => null);
-    setPending(false);
-    if (!res?.ok) return setActionError(res?.data.error ?? 'That did not work. Check your connection and try again.');
-    ok?.(res.data);
-    revalidator.revalidate();
-  }
-
   async function signOut() {
     setSignOutState('pending');
     const res = await api.signout().catch(() => null);
     if (!res?.ok) return setSignOutState('failed');
     navigate('/signin');
   }
-
-  let next = null;
-  if (!taskDone) next = { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` };
-  else if (!dataDone) next = modelPath ? { title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.', to: `${base}/model` } : { title: 'Record your data and its rights', body: 'Where it came from and how it may be used.', to: `${base}/data` };
-  else if (!modelPath && ['draft', 'changes_requested'].includes(s)) {
-    const needsFiles = mode === 'upload' && uploads.length === 0;
-    next = {
-      title: needsFiles ? 'Upload a sample' : s === 'changes_requested' ? 'Fix and resubmit' : 'Submit for review',
-      body: needsFiles ? 'A few hundred representative files is enough to check fit and rights.' : mode === 'upload' ? 'Valcairn checks rights, consent, labels and duplicates before anything is used.' : 'Valcairn reviews your request and comes back with options and terms.',
-      custom: (
-        <>
-          {s === 'changes_requested' && latestReview?.notes && <p className="ob-alert"><strong>Reviewer notes:</strong> {latestReview.notes}</p>}
-          {mode === 'upload' && writer && (uploadsEnabled ? <Uploader entry={entry} project={project} onUploaded={() => revalidator.revalidate()} /> : <p className="ob-alert">Uploads are not configured on this server.</p>)}
-          {writer && <button className="btn-app" type="button" disabled={pending || needsFiles} onClick={() => act(() => api.submitReview(entry.id, project.id))}>{pending ? 'Submitting…' : 'Submit for review'}</button>}
-        </>
-      ),
-    };
-  } else if (s === 'in_review') next = { title: 'In review with Valcairn', body: 'You’ll see the decision here. Files can’t change while the review is open.' };
-  else if (s === 'approved') next = manager
-    ? { title: 'Approve dataset version 1', body: 'This freezes the exact files and rights record. Training can only use an approved version.', custom: <button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : 'Approve version 1'}</button> }
-    : { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.' };
-  else if (entry.kind === 'organization' && manager) next = { title: modelPath ? 'Invite whoever approves deployment' : 'Invite whoever approves spend', body: 'Their sign-off is needed later. Inviting them now avoids a wait.', to: `/w/${entry.slug}/setup/team` };
-
   return (
     <div className="ob ob-shell">
-      <title>{`${project.name} — Valcairn`}</title>
+      <title>{`${title} — Valcairn`}</title>
       <aside className="ob-side">
         <div className="ob-brand"><span className="dash-mark" aria-hidden="true" /><strong>Valcairn</strong></div>
         <Link className="ob-org-switch" to="/start" aria-label="Switch or add a workspace">
           <span className="ob-monogram ob-monogram--sm" aria-hidden="true">{initials(entry.name)}</span>
-          <span style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 14 }}>{entry.name}</strong><span className="ob-muted" style={{ fontSize: 12 }}>{entry.kind === 'personal' ? 'Personal' : role[0].toUpperCase() + role.slice(1)}</span></span>
+          <span style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 14 }}>{entry.name}</strong><span className="ob-muted" style={{ fontSize: 12 }}>{entry.kind === 'personal' ? 'Personal' : roleName(role)}</span></span>
           <Icon name="updown" size={14} />
         </Link>
         <nav aria-label="Workspace">
-          <Link to={base} aria-current="page"><Tile icon="grid" tone="orange" size="sm" />Projects</Link>
-          <a aria-disabled="true" title="Not open yet"><Tile icon="layers" tone="blue" size="sm" />Models <span className="ob-badge">Soon</span></a>
-          {entry.kind === 'organization' && <a aria-disabled="true" title="Not open yet"><Tile icon="bank" tone="amber" size="sm" />Financing <span className="ob-badge">Soon</span></a>}
+          <Link to={`/w/${entry.slug}`} aria-current={current === 'projects' ? 'page' : undefined}><Tile icon="grid" tone="orange" size="sm" />Projects</Link>
+          <a aria-disabled="true" title="Planned, not available yet"><Tile icon="layers" tone="blue" size="sm" />Models <span className="ob-badge">Planned</span></a>
+          {entry.kind === 'organization' && <a aria-disabled="true" title="Planned, not available yet"><Tile icon="bank" tone="amber" size="sm" />Financing <span className="ob-badge">Planned</span></a>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`}><Tile icon="people" tone="violet" size="sm" />Team</Link>}
           {account.isStaff && <Link to="/staff"><Tile icon="shield" tone="green" size="sm" />Review queue</Link>}
         </nav>
@@ -646,50 +587,206 @@ export function ProjectHome() {
         </div>
       </aside>
       <main className="ob-body">
-        <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
-          <div className="ob-intro" style={{ gap: 8 }}>
-            {dataDone && <span className="ob-ok"><Icon name="check" size={16} stroke={2.4} />Project set up</span>}
-            <h1 className="ob-h1">{project.name}</h1>
-            <span className="ob-muted">{project.modalities.join(', ')} · {STATUS_LABEL[s] ?? s}</span>
-          </div>
-          {writer && ['draft', 'changes_requested'].includes(s) && <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>}
-        </div>
-        {actionError && <p className="ob-alert" role="alert">{actionError}</p>}
-        <div className="ob-main" style={{ padding: 0, maxWidth: 'none', gap: 20 }}>
-          <section className="ob-card" style={{ flex: '999 1 420px' }} aria-labelledby="status-title">
-            <h2 id="status-title">Where things stand</h2>
-            <ol className="ob-list">
-              {steps.map((step, i) => (
-                <li key={step.label}>
-                  <span className={`ob-num${step.st === 'done' ? ' ob-num--done' : step.st === 'now' ? ' ob-num--now' : ''}`}>{step.st === 'done' ? <Icon name="check" size={12} stroke={3} /> : i + 1}</span>
-                  <div><strong>{step.label}</strong><span className="ob-muted">{step.note ?? (step.st === 'done' ? 'Done' : step.st === 'now' ? 'Next' : 'After the step above')}</span></div>
-                  {step.soon && <span className="ob-badge">Not open yet</span>}
-                </li>
-              ))}
-            </ol>
-          </section>
-          <div className="ob-aside" style={{ flex: '1 1 320px' }}>
-            {next && (
-              <section className="ob-card ob-card--strong">
-                <span className="ob-eyebrow" style={{ textTransform: 'uppercase', letterSpacing: '0.04em', fontSize: 12 }}>Your next step</span>
-                <h2>{next.title}</h2>
-                <p className="ob-muted">{next.body}</p>
-                {next.custom}
-                {next.to && <Link className="btn-app" to={next.to}>Continue</Link>}
-              </section>
-            )}
-            {entry.kind === 'personal' && workspace.profile.kind !== 'independent' && <AcademicCard entry={entry} profile={workspace.profile} onDone={() => revalidator.revalidate()} />}
-            {uploads.length > 0 && (
-              <section className="ob-card">
-                <h2>Sample files · {uploads.length}</h2>
-                <ul className="ob-list">
-                  {uploads.slice(-8).map((u) => <li key={u.id}><div><strong>{u.filename}</strong><span className="ob-muted">{fmtBytes(u.sizeBytes)} · {u.contentType}{u.duplicateOf ? ' · duplicate' : ''} · sha256 {u.sha256.slice(0, 12)}…</span></div></li>)}
-                </ul>
-              </section>
-            )}
-          </div>
-        </div>
+        {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Everything here is generated for demonstration. It is not a real customer, and training, deployment and financing are planned, not running.</p>}
+        {children}
       </main>
     </div>
+  );
+}
+
+export async function workspaceHomeLoader({ params }) {
+  const { account, entry } = await requireWorkspace(params.slug);
+  const { projects } = await api.projects(entry.id);
+  return { account, entry, projects };
+}
+
+/** Lists the workspace's projects. Never redirects, so read-only roles get a stable page even when it is empty. */
+export function WorkspaceHome() {
+  const { account, entry, projects } = useLoaderData();
+  const writer = ['owner', 'admin', 'member'].includes(entry.role);
+  return (
+    <WorkspaceShell account={account} entry={entry} role={entry.role} title={entry.name}>
+      <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
+        <div className="ob-intro" style={{ gap: 8 }}>
+          <h1 className="ob-h1">Projects</h1>
+          <span className="ob-muted">{plural(projects.length, 'project')} in {entry.name}</span>
+        </div>
+        {writer && <Link className="btn-app" to={`/w/${entry.slug}/projects/new`}>New project</Link>}
+      </div>
+      {projects.length === 0 ? (
+        <section className="ob-card" style={{ alignItems: 'flex-start' }}>
+          <Tile icon="grid" tone="orange" size="lg" />
+          <h2>No projects yet</h2>
+          {writer
+            ? <><p className="ob-muted">Start with the task you want a model to do. Setup takes a few minutes and saves as you go.</p><Link className="btn-app" to={`/w/${entry.slug}/projects/new`}>Start your first project</Link></>
+            : <p className="ob-muted">You have {roleName(entry.role)} access, so you can view projects here once someone on the team starts one. Owners, admins and members can create them.</p>}
+        </section>
+      ) : (
+        <ul className="ob-list ob-card">
+          {[...projects].reverse().map((p) => (
+            <li key={p.id}>
+              <Tile icon={p.startingPoint === 'model' ? 'layers' : 'data'} tone={p.startingPoint === 'model' ? 'blue' : 'teal'} size="sm" />
+              <div><strong>{p.name}</strong><span className="ob-muted">{p.modalities.join(', ') || 'No inputs chosen'} · {STATUS_LABEL[p.status] ?? p.status}</span></div>
+              <Link className="btn-ghost" to={`/w/${entry.slug}/projects/${p.id}`}>Open</Link>
+            </li>
+          ))}
+        </ul>
+      )}
+    </WorkspaceShell>
+  );
+}
+
+const START_CHOICES = [['own', 'We have our own data'], ['need', 'We need data'], ['model', 'We already have a model']];
+
+export function ProjectHome() {
+  const { account, entry, project, role, uploads, latestReview, versions, uploadsEnabled, workspace, bookingUrl } = useLoaderData();
+  const navigate = useNavigate();
+  const revalidator = useRevalidator();
+  const base = `/w/${entry.slug}/projects/${project.id}`;
+  const modelPath = project.startingPoint === 'model';
+  const unsure = project.startingPoint === 'unsure';
+  const manager = ['owner', 'admin'].includes(role);
+  const writer = ['owner', 'admin', 'member'].includes(role);
+  const mode = project.dataSource?.mode;
+  const [actionError, setActionError] = useState(null);
+  const [pending, setPending] = useState(false);
+  const [confirmReopen, setConfirmReopen] = useState(false);
+
+  const taskDone = Boolean(project.success);
+  const dataDone = Boolean(modelPath ? project.model : project.dataSource);
+  const s = project.status;
+  const editable = ['draft', 'changes_requested'].includes(s);
+  const reviewed = ['approved', 'versioned'].includes(s);
+  const latest = versions.at(-1);
+  const steps = unsure ? [
+    { label: 'Describe the task', st: 'done' },
+    { label: 'Scoping call with Valcairn', st: 'now', note: '30 minutes to agree the data, approach and how to test it.' },
+    { label: 'Choose how to start', st: 'todo', note: 'Own data, licensed or collected data, or an existing model.' },
+  ] : modelPath ? [
+    { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
+    { label: 'Model and test plan', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
+    { label: 'Evaluate against your rule', st: 'todo', soon: true, note: 'Compare with your baseline on held-out examples.' },
+    { label: 'Readiness check and deploy', st: 'todo', soon: true, note: 'Only a model that meets your rule can be deployed.' },
+  ] : [
+    { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
+    { label: 'Data and rights record', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
+    ...(mode === 'upload' ? [{ label: 'Upload a sample', st: uploads.length ? 'done' : dataDone ? 'now' : 'todo', note: uploads.length ? plural(uploads.length, 'file') : undefined }] : []),
+    { label: 'Rights and quality review', st: reviewed ? 'done' : ['in_review', 'changes_requested'].includes(s) ? 'now' : 'todo', note: s === 'in_review' ? 'With Valcairn' : s === 'changes_requested' ? 'Changes requested' : 'Valcairn checks rights, consent, labels and duplicates.' },
+    { label: `Approve dataset version ${s === 'versioned' ? latest.number : (latest?.number ?? 0) + 1}`, st: s === 'versioned' ? 'done' : s === 'approved' ? 'now' : 'todo', note: s === 'versioned' ? `Version ${latest.number} · ${plural(latest.files, 'file')}` : 'Locks exactly the files and rights record that were reviewed.' },
+    { label: 'Train and test', st: 'todo', soon: true, note: 'Planned. You will approve a cost estimate first.' },
+    { label: 'Accept and deploy', st: 'todo', soon: true, note: 'Planned. Only a model that meets your rule can be accepted.' },
+  ];
+
+  async function act(fn, ok) {
+    setPending(true); setActionError(null);
+    const res = await fn().catch(() => null);
+    setPending(false);
+    if (!res?.ok) return setActionError(res?.data.error ?? 'That did not work. Check your connection and try again.');
+    ok?.(res.data);
+    revalidator.revalidate();
+  }
+  const reopen = () => act(() => api.reopenProject(entry.id, project.id), () => setConfirmReopen(false));
+  const chooseStart = (start) => act(() => api.updateProject(entry.id, project.id, { startingPoint: start }), () => navigate(`${base}/success`));
+  const removeFile = (u) => act(() => api.deleteUpload(entry.id, project.id, u.id));
+
+  const reopenBlock = (
+    confirmReopen ? (
+      <div className="ob-intro" style={{ gap: 10 }}>
+        <p className="ob-alert">Reopening unlocks the project for changes and voids the current approval. You'll need a new Valcairn review before the next dataset version. Existing versions stay as they are.</p>
+        <div className="ob-row-actions"><button className="btn-app" type="button" disabled={pending} onClick={reopen}>Reopen for changes</button><button className="btn-text" type="button" onClick={() => setConfirmReopen(false)}>Cancel</button></div>
+      </div>
+    ) : <button className="btn-text" type="button" onClick={() => setConfirmReopen(true)}>Need changes? Reopen the project</button>
+  );
+
+  let next = null;
+  if (unsure) next = writer ? {
+    title: 'Book your scoping call',
+    body: 'Thirty minutes with our team to pin down the data, the approach and how to test it. You get a written plan afterwards.',
+    custom: <>
+      {bookingUrl ? <a className="btn-app" href={bookingUrl} target="_blank" rel="noreferrer">Book a 30-minute call</a> : <Link className="btn-app" to="/contact">Contact us to book</Link>}
+      <p className="ob-muted">Already know how you want to start?</p>
+      <div className="ob-chips">{START_CHOICES.map(([id, label]) => <button key={id} type="button" className="ob-chip" disabled={pending} onClick={() => chooseStart(id)}>{label}</button>)}</div>
+    </>,
+  } : { title: 'Waiting for a scoping call', body: 'Someone on the team is arranging a call with Valcairn.' };
+  else if (!taskDone) next = writer ? { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` } : null;
+  else if (!dataDone) next = !writer ? null : modelPath ? { title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.', to: `${base}/model` } : { title: 'Record your data and its rights', body: 'Where it came from and how it may be used.', to: `${base}/data` };
+  else if (!modelPath && editable && writer) {
+    const needsFiles = mode === 'upload' && uploads.length === 0;
+    next = {
+      title: needsFiles ? 'Upload a sample' : s === 'changes_requested' ? 'Fix and resubmit' : 'Submit for review',
+      body: needsFiles ? 'A few hundred representative files is enough to check fit and rights.' : mode === 'upload' ? 'Submitting locks the files, rights record and acceptance rule for Valcairn’s review.' : 'Valcairn reviews your request and comes back with options and terms.',
+      custom: (
+        <>
+          {s === 'changes_requested' && latestReview?.notes && <p className="ob-alert"><strong>Reviewer notes:</strong> {latestReview.notes}</p>}
+          {mode === 'upload' && (uploadsEnabled ? <Uploader entry={entry} project={project} onUploaded={() => revalidator.revalidate()} /> : <p className="ob-alert">Uploads are not configured on this server.</p>)}
+          <button className="btn-app" type="button" disabled={pending || needsFiles} onClick={() => act(() => api.submitReview(entry.id, project.id))}>{pending ? 'Submitting…' : 'Submit for review'}</button>
+        </>
+      ),
+    };
+  } else if (s === 'in_review') next = {
+    title: 'In review with Valcairn',
+    body: 'The files, rights record and acceptance rule are locked while the review is open. You’ll see the decision here.',
+    custom: writer && <button className="btn-text" type="button" disabled={pending} onClick={() => act(() => api.reopenProject(entry.id, project.id))}>Withdraw from review to make changes</button>,
+  };
+  else if (s === 'approved') next = manager
+    ? { title: `Approve dataset version ${(latest?.number ?? 0) + 1}`, body: 'This freezes exactly the reviewed files, rights record and acceptance rule. Training will only use an approved version.', custom: <><button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : `Approve version ${(latest?.number ?? 0) + 1}`}</button>{reopenBlock}</> }
+    : { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.' };
+  else if (s === 'versioned') next = manager
+    ? { title: `Dataset version ${latest.number} approved`, body: `${plural(latest.files, 'file')} and their rights record are frozen in this version. Training and evaluation are planned; nothing runs yet.`, custom: <>{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}{reopenBlock}</> }
+    : { title: `Dataset version ${latest.number} approved`, body: 'Training and evaluation are planned; nothing runs yet.' };
+
+  return (
+    <WorkspaceShell account={account} entry={entry} role={role} title={project.name}>
+      <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
+        <div className="ob-intro" style={{ gap: 8 }}>
+          <Link className="ob-muted" to={`/w/${entry.slug}`}>← All projects</Link>
+          <h1 className="ob-h1">{project.name}</h1>
+          <span className="ob-muted">{project.modalities.join(', ')} · {STATUS_LABEL[s] ?? s}{!editable && !unsure ? ' · locked' : ''}</span>
+        </div>
+        {writer && editable && !unsure && <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>}
+      </div>
+      {actionError && <p className="ob-alert" role="alert">{actionError}</p>}
+      {!writer && <p className="ob-alert ob-alert--info">You have {roleName(role)} access: you can see this project but not change it.</p>}
+      <div className="ob-main" style={{ padding: 0, maxWidth: 'none', gap: 20 }}>
+        <section className="ob-card" style={{ flex: '999 1 420px' }} aria-labelledby="status-title">
+          <h2 id="status-title">Where things stand</h2>
+          <ol className="ob-list">
+            {steps.map((step, i) => (
+              <li key={step.label}>
+                <span className={`ob-num${step.st === 'done' ? ' ob-num--done' : step.st === 'now' ? ' ob-num--now' : ''}`}>{step.st === 'done' ? <Icon name="check" size={12} stroke={3} /> : i + 1}</span>
+                <div><strong>{step.label}</strong><span className="ob-muted">{step.note ?? (step.st === 'done' ? 'Done' : step.st === 'now' ? 'Next' : 'After the step above')}</span></div>
+                {step.soon && <span className="ob-badge">Planned</span>}
+              </li>
+            ))}
+          </ol>
+        </section>
+        <div className="ob-aside" style={{ flex: '1 1 320px' }}>
+          {next && (
+            <section className="ob-card ob-card--strong">
+              <span className="ob-eyebrow" style={{ textTransform: 'uppercase', letterSpacing: '0.04em', fontSize: 12 }}>Your next step</span>
+              <h2>{next.title}</h2>
+              <p className="ob-muted">{next.body}</p>
+              {next.custom}
+              {next.to && <Link className="btn-app" to={next.to}>Continue</Link>}
+            </section>
+          )}
+          {entry.kind === 'personal' && workspace.profile.kind !== 'independent' && <AcademicCard entry={entry} profile={workspace.profile} onDone={() => revalidator.revalidate()} />}
+          {uploads.length > 0 && (
+            <section className="ob-card">
+              <h2>Sample files · {uploads.length}</h2>
+              <ul className="ob-list">
+                {uploads.slice(-12).map((u) => (
+                  <li key={u.id}>
+                    <div><strong>{u.filename}</strong><span className="ob-muted">{fmtBytes(u.sizeBytes)} · {u.contentType}{u.duplicateOf ? ' · duplicate, not reviewed twice' : ''} · sha256 {u.sha256.slice(0, 12)}…</span></div>
+                    {writer && editable && <button type="button" className="btn-text" disabled={pending} onClick={() => removeFile(u)} aria-label={`Remove ${u.filename}`}>Remove</button>}
+                  </li>
+                ))}
+              </ul>
+              {uploads.length > 12 && <p className="ob-muted">Showing the latest 12.</p>}
+            </section>
+          )}
+        </div>
+      </div>
+    </WorkspaceShell>
   );
 }

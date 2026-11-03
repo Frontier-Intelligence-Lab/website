@@ -7,4 +7,4 @@ export class StoreError extends Error {
   }
 }
 
-export const STORE_ERRORS = ['email_taken', 'slug_taken', 'personal_exists', 'not_found', 'already_decided', 'already_member', 'invite_expired', 'duplicate_upload', 'invalid_state'];
+export const STORE_ERRORS = ['email_taken', 'slug_taken', 'personal_exists', 'not_found', 'already_decided', 'already_member', 'invite_expired', 'duplicate_upload', 'invalid_state', 'quota_exceeded'];

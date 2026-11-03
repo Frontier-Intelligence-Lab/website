@@ -147,8 +147,9 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal((await store.listUploads({ workspaceId: other.id, projectId: p.id })).length, 0);
     assert.equal((await store.getUpload(u1.id)).objectKey, 'k1');
 
-    await assert.rejects(store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id, manifest: {} }), { code: 'invalid_state' });
+    await assert.rejects(store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id }), { code: 'invalid_state' });
     const review = await store.submitForReview({ workspaceId: ws.id, projectId: p.id, submittedBy: owner.id });
+    assert.deepEqual(review.snapshot.files.map((f) => f.id), [u1.id], 'duplicates are not part of the reviewed set');
     assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).status, 'in_review');
     await assert.rejects(store.submitForReview({ workspaceId: ws.id, projectId: p.id, submittedBy: owner.id }), { code: 'invalid_state' });
     const queue = await store.listReviews({ status: 'pending' });
@@ -162,12 +163,100 @@ export function runStoreContract(test, makeStore, label) {
     await store.decideReview({ reviewId: second.id, reviewerId: staff.id, decision: 'approved', checks: { rights: true, labels: true } });
     assert.equal((await store.listProjectReviews({ workspaceId: ws.id, projectId: p.id })).length, 2);
 
-    const v1 = await store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id, manifest: { files: [u1.sha256] } });
+    const v1 = await store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id });
     assert.equal(v1.number, 1);
+    assert.equal(v1.manifest.reviewId, second.id);
+    assert.deepEqual(v1.manifest.files.map((f) => f.sha256), [u1.sha256]);
+    assert.equal(v1.manifest.task, 'Spot damaged boxes');
     assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).status, 'versioned');
-    assert.equal((await store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id, manifest: {} })).number, 2);
-    await assert.rejects(store.createDatasetVersion({ workspaceId: other.id, projectId: p.id, createdBy: owner.id, manifest: {} }), { code: 'not_found' });
-    assert.deepEqual((await store.listDatasetVersions({ workspaceId: ws.id, projectId: p.id })).map((v) => v.number), [1, 2]);
+    await assert.rejects(store.createDatasetVersion({ workspaceId: ws.id, projectId: p.id, createdBy: owner.id }), { code: 'invalid_state' }, 'one version per approval');
+    await assert.rejects(store.createDatasetVersion({ workspaceId: other.id, projectId: p.id, createdBy: owner.id }), { code: 'not_found' });
+    assert.deepEqual((await store.listDatasetVersions({ workspaceId: ws.id, projectId: p.id })).map((v) => v.number), [1]);
+  });
+
+  withStore('reviewed content is frozen until the project is reopened, and reopening voids the approval', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const staff = await store.createUser({ email: 'r@valcairn.test', name: 'R', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'P', task: 'Spot damaged boxes', modalities: ['Images'], startingPoint: 'own' });
+    const where = { workspaceId: ws.id, projectId: p.id };
+    const file = (n) => ({ ...where, uploadedBy: owner.id, objectKey: `k${n}`, sha256: String(n).repeat(64).slice(0, 64), sizeBytes: 10, contentType: 'image/png', filename: `${n}.png` });
+    await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'ours' } } });
+    await store.createUpload(file(1));
+
+    const frozen = async (label) => {
+      await assert.rejects(store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'licensed' } } }), { code: 'invalid_state' }, `${label}: rights`);
+      await assert.rejects(store.updateProject({ ...where, patch: { success: { target: '1%' } } }), { code: 'invalid_state' }, `${label}: rule`);
+      await assert.rejects(store.updateProject({ ...where, patch: { task: 'Something else' } }), { code: 'invalid_state' }, `${label}: task`);
+      await assert.rejects(store.createUpload(file(label.length + 2)), { code: 'invalid_state' }, `${label}: held receipt`);
+      const [u] = await store.listUploads(where);
+      await assert.rejects(store.deleteUpload({ ...where, uploadId: u.id, actorId: owner.id }), { code: 'invalid_state' }, `${label}: delete`);
+    };
+
+    const r1 = await store.submitForReview({ ...where, submittedBy: owner.id });
+    await frozen('in review');
+    // Lifecycle status cannot be patched directly.
+    assert.equal((await store.updateProject({ ...where, patch: { status: 'approved', setupStep: 'done' } })).status, 'in_review');
+
+    await store.reopenProject({ ...where, actorId: owner.id });
+    assert.equal((await store.getReview(r1.id)).status, 'withdrawn');
+    await store.createUpload(file(3));
+    const r2 = await store.submitForReview({ ...where, submittedBy: owner.id });
+    assert.equal(r2.snapshot.files.length, 2);
+    await store.decideReview({ reviewId: r2.id, reviewerId: staff.id, decision: 'approved', checks: {} });
+    await frozen('approved');
+
+    await store.reopenProject({ ...where, actorId: owner.id });
+    await assert.rejects(store.createDatasetVersion({ ...where, createdBy: owner.id }), { code: 'invalid_state' }, 'reopening voids the approval');
+    await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'licensed' } } });
+    const r3 = await store.submitForReview({ ...where, submittedBy: owner.id });
+    await store.decideReview({ reviewId: r3.id, reviewerId: staff.id, decision: 'approved', checks: {} });
+    const v = await store.createDatasetVersion({ ...where, createdBy: owner.id });
+    assert.equal(v.manifest.reviewId, r3.id);
+    assert.equal(v.manifest.dataSource.provenance, 'licensed');
+    await frozen('versioned');
+    await assert.rejects(store.reopenProject({ workspaceId: ws.id, projectId: 'nope', actorId: owner.id }), { code: 'not_found' });
+    await store.reopenProject({ ...where, actorId: owner.id });
+    await assert.rejects(store.reopenProject({ ...where, actorId: owner.id }), { code: 'invalid_state' }, 'a draft is already open');
+  });
+
+  withStore('uploads respect project quotas; deleting an original promotes its earliest copy', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'P', task: 'Spot damaged boxes', modalities: ['Images'], startingPoint: 'own' });
+    const where = { workspaceId: ws.id, projectId: p.id };
+    const add = (key, sha, size = 10, limits) => store.createUpload({ ...where, uploadedBy: owner.id, objectKey: key, sha256: sha.repeat(64), sizeBytes: size, contentType: 'image/png', filename: `${key}.png`, limits });
+    const a = await add('a', 'a');
+    const b = await add('b', 'a');
+    const c = await add('c', 'a');
+    assert.equal(b.duplicateOf, a.id);
+    await assert.rejects(add('d', 'd', 10, { maxFiles: 3 }), { code: 'quota_exceeded' });
+    await assert.rejects(add('d', 'd', 21, { maxBytes: 50 }), { code: 'quota_exceeded' });
+    await add('d', 'd', 20, { maxFiles: 4, maxBytes: 50 });
+
+    const removed = await store.deleteUpload({ ...where, uploadId: a.id, actorId: owner.id });
+    assert.equal(removed.objectKey, 'a');
+    const left = Object.fromEntries((await store.listUploads(where)).map((u) => [u.objectKey, u.duplicateOf]));
+    assert.deepEqual(left, { b: null, c: b.id, d: null });
+    await assert.rejects(store.deleteUpload({ ...where, uploadId: a.id, actorId: owner.id }), { code: 'not_found' });
+  });
+
+  withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {
+    await store.upsertReviewer({ username: 'YCInsider', name: 'YC reviewer', role: 'viewer', passwordHash: 'scrypt$a' });
+    await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'admin', passwordHash: 'scrypt$b' });
+    assert.equal(await store.getUserAuthByEmail('ycinsider'), null);
+    const auth = await store.getReviewerAuth('ycinsider');
+    assert.deepEqual([auth.account.username, auth.account.role, auth.account.enabled, auth.passwordHash], ['ycinsider', 'viewer', true, 'scrypt$a']);
+    assert.equal((await store.getReviewer('ycinsider')).passwordHash, undefined);
+    // Updating without a new hash keeps the existing one.
+    await store.upsertReviewer({ username: 'ycinsider', name: 'YC', role: 'admin' });
+    assert.equal((await store.getReviewerAuth('ycinsider')).passwordHash, 'scrypt$a');
+    assert.equal((await store.getReviewer('ycinsider')).role, 'admin');
+    assert.equal((await store.setReviewerEnabled({ username: 'ycinsider', enabled: false })).enabled, false);
+    await assert.rejects(store.setReviewerEnabled({ username: 'ghost', enabled: true }), { code: 'not_found' });
+    await assert.rejects(store.upsertReviewer({ username: 'ghost', name: 'G', role: 'viewer' }), { code: 'not_found' }, 'a new reviewer needs a hash');
+    assert.deepEqual((await store.listReviewers()).map((r) => r.username), ['admin', 'ycinsider']);
+    assert.equal(await store.getReviewer('nobody'), null);
   });
 
   withStore('projects are only reachable through their own workspace', async (store) => {

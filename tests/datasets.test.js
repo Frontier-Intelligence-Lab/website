@@ -6,6 +6,16 @@ import { makeApp, json, postHeaders } from './helpers.js';
 const SECRET = 'ingest-secret-for-tests-32-characters!';
 const INGEST = { INGEST_PUBLIC_URL: 'http://localhost:4100', INGEST_SHARED_SECRET: SECRET, STAFF_EMAILS: 'reviewer@valcairn.test' };
 
+// Stands in for services/ingest's server-to-server endpoints: commit moves pending/... to its final key.
+function fakeIngest() {
+  const calls = { commit: [], remove: [] };
+  return {
+    calls,
+    commit: async (key) => { calls.commit.push(key); return key.replace('/pending/', '/uploads/'); },
+    remove: async (key) => { calls.remove.push(key); },
+  };
+}
+
 function client(app) {
   let cookies = {};
   const call = async (method, url, body) => {
@@ -26,7 +36,7 @@ async function person(app, email, name = email.split('@')[0]) {
 }
 
 // Stands in for services/ingest: signs a receipt the way the Rust service does.
-const receipt = (fields) => signToken(SECRET, { v: 1, kind: 'receipt', objectKey: `ws/${fields.ws}/projects/${fields.project}/uploads/${Math.random()}`, sha256: 'b'.repeat(64), sizeBytes: 1200, contentType: 'image/png', filename: 'box.png', exp: Math.floor(Date.now() / 1000) + 60, ...fields });
+const receipt = (fields) => signToken(SECRET, { v: 1, kind: 'receipt', objectKey: `ws/${fields.ws}/projects/${fields.project}/pending/${Math.random()}`, sha256: 'b'.repeat(64), sizeBytes: 1200, contentType: 'image/png', filename: 'box.png', exp: Math.floor(Date.now() / 1000) + 60, ...fields });
 
 async function projectWithData(app, owner) {
   const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
@@ -45,7 +55,7 @@ test('uploads are off without ingest configuration', async () => {
 });
 
 test('only receipts signed for this project and person are recorded; CSP allows the ingest origin', async () => {
-  const app = await makeApp({ env: INGEST });
+  const app = await makeApp({ env: INGEST, ingestClient: fakeIngest() });
   const owner = await person(app, 'o@acme-robotics.com');
   const { ws, project, base } = await projectWithData(app, owner);
   const grant = (await owner.post(`${base}/upload-grant`)).json();
@@ -71,7 +81,7 @@ test('only receipts signed for this project and person are recorded; CSP allows 
 });
 
 test('review: submit, independent staff decision, then a frozen dataset version', async () => {
-  const app = await makeApp({ env: INGEST });
+  const app = await makeApp({ env: INGEST, ingestClient: fakeIngest() });
   const owner = await person(app, 'o@acme-robotics.com');
   const { ws, project, base } = await projectWithData(app, owner);
   assert.equal((await owner.post(`${base}/submit`)).statusCode, 400, 'needs a sample first');
@@ -115,7 +125,7 @@ test('review: submit, independent staff decision, then a frozen dataset version'
 });
 
 test('staff cannot review their own workspace', async () => {
-  const app = await makeApp({ env: { ...INGEST, STAFF_EMAILS: 'o@acme-robotics.com' } });
+  const app = await makeApp({ env: { ...INGEST, STAFF_EMAILS: 'o@acme-robotics.com' }, ingestClient: fakeIngest() });
   const owner = await person(app, 'o@acme-robotics.com');
   const { ws, project, base } = await projectWithData(app, owner);
   await owner.post(`${base}/uploads`, { receipt: receipt({ ws: ws.id, project: project.id, by: owner.id }) });
@@ -174,5 +184,105 @@ test('academic verification is for personal workspaces and academic domains only
 
   const org = (await student.post('/api/workspaces', { name: 'Jo Labs' })).json().workspace;
   assert.equal((await student.post(`/api/workspaces/${org.id}/academic/send`, { email: 'jo@uni.ac.uk' })).statusCode, 400);
+  await app.close();
+});
+
+test('approval integrity: no edits, held receipts or deletions after submission; reopening voids approval', async () => {
+  const ingest = fakeIngest();
+  const app = await makeApp({ env: INGEST, ingestClient: ingest });
+  const owner = await person(app, 'o@acme-robotics.com');
+  const staff = await person(app, 'reviewer@valcairn.test');
+  const { ws, project, base } = await projectWithData(app, owner);
+  const mine = { ws: ws.id, project: project.id, by: owner.id };
+  const first = (await owner.post(`${base}/uploads`, { receipt: receipt(mine) })).json().upload;
+  assert.equal(ingest.calls.commit.length, 1);
+  const held = receipt({ ...mine, sha256: 'f'.repeat(64) });
+
+  assert.equal((await owner.post(`${base}/submit`)).json().review.files, 1);
+  const all = { rights: true, consent: true, labels: true, duplicates: true, format: true };
+  const [r] = (await staff.get('/api/staff/reviews')).json().reviews;
+  await staff.post(`/api/staff/reviews/${r.id}/decision`, { decision: 'approved', checks: all });
+
+  // Every write path is refused while approved: rights, acceptance rule, held receipt, file deletion.
+  const rights = await owner.post(base, { dataSource: { mode: 'upload', provenance: 'licensed', allowedUses: ['training'], personalData: 'no' } });
+  assert.equal(rights.statusCode, 409);
+  assert.equal(rights.json().code, 'project_locked');
+  assert.equal((await owner.post(base, { success: { measure: 'recall', target: '1%' } })).statusCode, 409);
+  assert.equal((await owner.post(`${base}/uploads`, { receipt: held })).statusCode, 409);
+  assert.equal((await owner.post(`${base}/uploads/${first.id}/delete`)).statusCode, 409);
+  assert.equal((await owner.post(`${base}/upload-grant`)).statusCode, 409);
+  assert.equal((await owner.get(base)).json().uploads.length, 1);
+
+  // A member cannot void an approval; an owner can, and the old approval no longer makes a version.
+  const member = await person(app, 'm@acme-robotics.com');
+  const token = (await owner.post(`/api/workspaces/${ws.id}/invitations`, { invites: [{ email: 'm@acme-robotics.com', role: 'member' }] })).json().devLinks[0].link.split('/invite/')[1];
+  await member.post(`/api/invitations/${token}/accept`);
+  assert.equal((await member.post(`${base}/reopen`)).statusCode, 403);
+  assert.equal((await owner.post(`${base}/reopen`)).statusCode, 200);
+  assert.equal((await owner.post(`${base}/dataset-versions`)).statusCode, 409);
+
+  // Changes after reopening go through a fresh review, and the version holds exactly that reviewed content.
+  assert.equal((await owner.post(`${base}/uploads`, { receipt: held })).statusCode, 200);
+  await owner.post(base, { dataSource: { mode: 'upload', provenance: 'licensed', allowedUses: ['training'], personalData: 'no' } });
+  assert.equal((await owner.post(`${base}/submit`)).json().review.files, 2);
+  const [r2] = (await staff.get('/api/staff/reviews')).json().reviews;
+  const detail = (await staff.get(`/api/staff/reviews/${r2.id}`)).json();
+  assert.equal(detail.project.dataSource.provenance, 'licensed');
+  assert.equal(detail.uploads.length, 2);
+  await staff.post(`/api/staff/reviews/${r2.id}/decision`, { decision: 'approved', checks: all });
+  const v = (await owner.post(`${base}/dataset-versions`)).json().version;
+  assert.equal(v.number, 1);
+  assert.equal(v.files, 2);
+  assert.equal((await owner.post(`${base}/dataset-versions`)).statusCode, 409, 'one version per approval');
+  await app.close();
+});
+
+test('commit failures and refused records leave nothing recorded and clean up stored objects', async () => {
+  const ingest = fakeIngest();
+  const app = await makeApp({ env: { ...INGEST, PROJECT_MAX_FILES: '1' }, ingestClient: ingest });
+  const owner = await person(app, 'o@acme-robotics.com');
+  const { ws, project, base } = await projectWithData(app, owner);
+  const mine = { ws: ws.id, project: project.id, by: owner.id };
+  const real = ingest.commit;
+  ingest.commit = async () => { throw Object.assign(new Error('down'), { code: 'ingest_unavailable' }); };
+  assert.equal((await owner.post(`${base}/uploads`, { receipt: receipt(mine) })).statusCode, 503);
+  assert.equal((await owner.get(base)).json().uploads.length, 0);
+  ingest.commit = real;
+  assert.equal((await owner.post(`${base}/uploads`, { receipt: receipt(mine) })).statusCode, 200);
+  assert.equal((await owner.post(`${base}/upload-grant`)).json().code, 'quota_exceeded');
+  const over = await owner.post(`${base}/uploads`, { receipt: receipt(mine) });
+  assert.equal(over.json().code, 'quota_exceeded');
+  assert.equal(ingest.calls.remove.length, 1, 'the refused object is deleted');
+  const [u] = (await owner.get(base)).json().uploads;
+  assert.equal((await owner.post(`${base}/uploads/${u.id}/delete`)).statusCode, 200);
+  assert.equal(ingest.calls.remove.length, 2);
+  await app.close();
+});
+
+test('academic codes are bound to the personal workspace they were requested for', async () => {
+  const app = await makeApp();
+  const student = await person(app, 'jo@gmail.com');
+  const personal = (await student.post('/api/workspaces/personal', { kind: 'student' })).json().workspace;
+  const org = (await student.post('/api/workspaces', { name: 'Jo Labs' })).json().workspace;
+  const sent = (await student.post(`/api/workspaces/${personal.id}/academic/send`, { email: 'jo@uni.edu' })).json();
+  const onOrg = await student.post(`/api/workspaces/${org.id}/academic/verify`, { code: sent.devCode });
+  assert.equal(onOrg.statusCode, 400);
+  assert.equal((await student.get(`/api/workspaces/${org.id}`)).json().workspace.profile.academicEmail, undefined);
+  // The refused attempt did not consume the code: it still works where it was requested.
+  assert.equal((await student.post(`/api/workspaces/${personal.id}/academic/verify`, { code: sent.devCode })).statusCode, 200);
+  await app.close();
+});
+
+test('an unsure project chooses its starting point once, then continues normally', async () => {
+  const app = await makeApp();
+  const owner = await person(app, 'o@acme-robotics.com');
+  const ws = (await owner.post('/api/workspaces', { name: 'Acme' })).json().workspace;
+  const { project } = (await owner.post(`/api/workspaces/${ws.id}/projects`, { task: 'Not sure what we need yet, help us scope it.', modalities: ['Text'], startingPoint: 'unsure' })).json();
+  const url = `/api/workspaces/${ws.id}/projects/${project.id}`;
+  assert.equal((await owner.post(url, { success: { measure: 'recall' } })).statusCode, 400, 'scope first');
+  assert.equal((await owner.post(`${url}/submit`)).statusCode, 400);
+  assert.equal((await owner.post(url, { startingPoint: 'need' })).json().project.startingPoint, 'need');
+  assert.equal((await owner.post(url, { startingPoint: 'own' })).statusCode, 400, 'only once');
+  assert.equal((await owner.post(url, { success: { measure: 'recall' } })).statusCode, 200);
   await app.close();
 });

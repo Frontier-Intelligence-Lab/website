@@ -73,9 +73,11 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   const post = (extra = []) => ({ preHandler: [base, sameOrigin, ...extra] });
   const get = (extra = []) => ({ preHandler: [base, ...extra] });
 
-  async function sendCode(user, purpose = 'signup', email = user.email) {
+  // `scope` binds a code to one target (e.g. a workspace), so it cannot be redeemed anywhere else.
+  const codeHash = (code, scope = '') => pepper(scope ? `${scope}:${code}` : code);
+  async function sendCode(user, purpose = 'signup', email = user.email, scope = '') {
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-    await store.createEmailCode({ userId: user.id, email, purpose, codeHash: pepper(code), expiresAt: new Date(Date.now() + CODE_TTL_MS) });
+    await store.createEmailCode({ userId: user.id, email, purpose, codeHash: codeHash(code, scope), expiresAt: new Date(Date.now() + CODE_TTL_MS) });
     if (mailer.configured) {
       await mailer.send({ to: email, subject: `Your Valcairn code: ${code}`, body: `Your Valcairn confirmation code is ${code}. It expires in 15 minutes.\n\nIf you didn't ask for it, ignore this email.` });
       return {};
@@ -93,7 +95,7 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     return {
       user,
       isStaff: Boolean(user.emailVerifiedAt) && config.staffEmails.includes(user.email),
-      workspaces: memberships.map(({ workspace: w, role }) => ({ id: w.id, kind: w.kind, name: w.name, slug: w.slug, role })),
+      workspaces: memberships.map(({ workspace: w, role }) => ({ id: w.id, kind: w.kind, name: w.name, slug: w.slug, role, synthetic: Boolean(w.profile?.synthetic) })),
       joinRequests: requests.filter((r) => r.status === 'pending').map((r) => ({ id: r.id, workspaceId: r.workspaceId, workspaceName: r.workspaceName, status: r.status })),
     };
   }
@@ -330,7 +332,7 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     if (workspace.kind !== 'personal') return problem(reply, 400, 'Academic verification is for personal workspaces.');
     const email = text(request.body?.email, 254).toLowerCase();
     if (!isEmail(email) || !isAcademicDomain(emailDomain(email))) return problem(reply, 400, 'Use your university or institute email address.', { errors: { email: 'Use an address at a university or research institute.' } });
-    const sent = await sendCode(request.user, 'academic', email);
+    const sent = await sendCode(request.user, 'academic', email, `academic:${workspace.id}`);
     if (!sent) return problem(reply, 503, 'Email delivery is not configured.');
     return { ok: true, ...sent };
   });
@@ -338,7 +340,10 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   app.post('/api/workspaces/:workspaceId/academic/verify', { ...post([signedIn, verified, member('manageMembers')]), config: limit(rateLimits.verify ?? 20) }, async (request, reply) => {
     const code = text(request.body?.code, 12).replace(/\s/g, '');
     if (!/^\d{6}$/.test(code)) return problem(reply, 400, 'Enter the 6-digit code from your email.');
-    const result = await store.consumeEmailCode({ userId: request.user.id, purpose: 'academic', codeHash: pepper(code) });
+    // Check eligibility before touching the code, so an ineligible attempt cannot burn or redeem it.
+    const target = await store.getWorkspace(request.params.workspaceId);
+    if (target.kind !== 'personal') return problem(reply, 400, 'Academic verification is for personal workspaces.');
+    const result = await store.consumeEmailCode({ userId: request.user.id, purpose: 'academic', codeHash: codeHash(code, `academic:${target.id}`) });
     if (!result.ok) return problem(reply, 400, result.reason === 'expired' ? 'That code has expired. Send a new one.' : 'That code is not right.', { reason: result.reason });
     const workspace = await store.updateWorkspaceProfile({ workspaceId: request.params.workspaceId, profile: { academicEmail: result.email, academicVerifiedAt: new Date().toISOString() } });
     await store.recordAudit({ workspaceId: workspace.id, actorId: request.user.id, action: 'academic.verified', targetType: 'workspace', targetId: workspace.id });
@@ -375,6 +380,7 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
       latestReview: reviews.at(-1) ? { status: reviews.at(-1).status, notes: reviews.at(-1).notes, checks: reviews.at(-1).checks, decidedAt: reviews.at(-1).decidedAt } : null,
       versions: versions.map((v) => ({ id: v.id, number: v.number, createdAt: v.createdAt, files: v.manifest.files?.length ?? 0 })),
       uploadsEnabled: Boolean(config.ingest),
+      editable: ['draft', 'changes_requested'].includes(project.status),
     };
   });
 
@@ -383,7 +389,14 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     if (!current) return problem(reply, 404, 'Not found.');
     const { patch, errors } = validateProjectPatch(request.body, current);
     if (errors) return problem(reply, 400, errors.form ?? 'Please check the highlighted fields.', { errors });
-    const project = await store.updateProject({ workspaceId: request.params.workspaceId, projectId: request.params.projectId, patch });
+    let project;
+    try {
+      project = await store.updateProject({ workspaceId: request.params.workspaceId, projectId: request.params.projectId, patch });
+    } catch (err) {
+      // The store refuses content changes once a project is submitted; the check and the write are one statement.
+      if (err instanceof StoreError && err.code === 'invalid_state') return problem(reply, 409, 'This project is locked while it is in review or approved. Withdraw or reopen it to make changes.', { code: 'project_locked' });
+      return fail(reply, err);
+    }
     if (!project) return problem(reply, 404, 'Not found.');
     await store.recordAudit({ workspaceId: project.workspaceId, actorId: request.user.id, action: 'project.updated', targetType: 'project', targetId: project.id, metadata: { fields: Object.keys(patch) } });
     return { project };

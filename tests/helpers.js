@@ -13,9 +13,9 @@ export async function reviewerFixture() {
   return { username: 'reviewer', name: 'Test Reviewer', passwordHash, password: 'correct horse battery' };
 }
 
-export async function makeApp({ env = {}, contactTransport, mailTransport, store, rateLimits } = {}) {
+export async function makeApp({ env = {}, contactTransport, mailTransport, ingestClient, store, sessionStore, rateLimits } = {}) {
   const config = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'x'.repeat(40), ...env });
-  const app = await buildApp({ config, contactTransport, mailTransport, store, rateLimits, distDir: FIXTURE_DIST });
+  const app = await buildApp({ config, contactTransport, mailTransport, ingestClient, store, sessionStore, rateLimits, distDir: FIXTURE_DIST });
   await app.ready();
   return app;
 }

@@ -1,6 +1,6 @@
 # Valcairn website
 
-Site for Valcairn by Frontier Intelligence Labs: homepage, contact page, reviewer sign-in and a protected workspace dashboard. The UI is a React 19 single-page app (React Router 8, built with Vite 8). A Fastify 5 server serves the build and a small JSON API for contact delivery and reviewer sessions. Every page has light and dark themes.
+Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, contact page, reviewer sign-in, a protected demo dashboard, and customer onboarding (accounts, organizations, projects, sample uploads, staff review and dataset versions). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/RELEASE.md](docs/RELEASE.md) and [docs/DEMO.md](docs/DEMO.md). The UI is a React 19 single-page app (React Router 8, built with Vite 8). A Fastify 5 server serves the build and a small JSON API for contact delivery and reviewer sessions. Every page has light and dark themes.
 
 ![Node](https://img.shields.io/badge/node-%3E%3D22.22-informational) ![React](https://img.shields.io/badge/react-19.3-informational) ![Tests](https://img.shields.io/badge/tests-node%20--test-informational) ![License](https://img.shields.io/badge/license-none%20checked%20in-lightgrey)
 
@@ -10,7 +10,11 @@ Site for Valcairn by Frontier Intelligence Labs: homepage, contact page, reviewe
 | --- | --- |
 | `/` homepage (Obsidian design in dark, ivory variant in light) | Implemented in React; not yet deployed. |
 | `/contact` form with server validation, booking link, SMTP delivery | Implemented in React against `POST /api/contact`. The previous server-rendered version is live and delivered a test message on November 2, 2026 UTC; the React version has not been deployed. |
-| `/demo` reviewer sign-in (server-side sessions, scrypt hashes) | Implemented. Sign-in stays disabled until reviewer accounts are configured; none exist yet. |
+| `/demo` reviewer sign-in (server-side sessions, scrypt hashes) | Implemented. With Postgres, accounts live in `reviewer_accounts` (YC `ycinsider`, Speedrun `sr008-reviewer`, `admin`), managed with `scripts/reviewers.js`; role and enabled status are re-checked on every request. Without a database, `REVIEWERS_FILE` is used. |
+| Onboarding: accounts, organizations, personal workspaces, invitations, join requests, roles | Implemented and tested against Postgres. Not yet deployed. |
+| Projects: goal, acceptance rule, rights record, existing-model intake, scoping call | Implemented. |
+| Sample uploads (Rust `services/ingest`), staff review, dataset versions | Implemented. Submitted content is frozen; versions contain exactly the approved snapshot. |
+| Provider onboarding, training, evaluation, deployment, financing | **Planned.** Shown as planned in the app; nothing executes. |
 | `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
 | Light / dark mode | Follows the system setting; a toggle stores the visitor's choice in `localStorage`. |
 | Deployment | Nothing deploys from this repository yet. frontierintelligencelab.com still runs an earlier server-rendered build as a Docker container; this React version needs a new release (see [Deployment](#deployment)). |
@@ -210,6 +214,8 @@ With `TEST_DATABASE_URL` unset, the Postgres suite skips cleanly and `npm run ch
 - `001_init.sql`: users, email-verification codes, workspaces, memberships, invitations, join requests, projects and audit events.
 - `002_sessions.sql`: expiring sessions, reserved for the separate Fastify session-store integration.
 - `003_project_model.sql`: nullable object-shaped model intake metadata.
+- `005_review_integrity.sql`: review snapshots, the `withdrawn` review status, and triggers that refuse content or file changes on submitted projects.
+- `006_reviewer_accounts.sql`: external demo reviewer accounts, separate from customer users.
 - `004_onboarding_v3.sql`: uploads, staff reviews and numbered dataset versions, plus the v3 project statuses. Legacy `submitted` projects return to `draft` because the old status did not record a staff review. Other project data is retained.
 
 Relative to the starting schema, the migrations explicitly constrain lower-case email/domain/slug storage, nonnegative code attempts, object-shaped JSON, valid project statuses, and verified domains having a domain value. They add relationship/expiry indexes and foreign keys. `audit_events.target_id` is text because audit targets are generic identifiers. PostgreSQL 17 provides `gen_random_uuid()` directly, so no extension is needed. No provider, listing or financing tables are added.
@@ -218,9 +224,9 @@ The v3 tables use composite foreign keys to keep each upload, review and version
 
 An upgrade rehearsal from migrations 001/002 preserved a legacy project while converting `submitted` to `draft` and adding `model: null`. After v3 writes, rollback requires a reviewed data conversion or backup restore; restoring the old status constraint alone will reject the new states.
 
-The session adapter is not wired into `src/app.js` by this change. Its factory is `createPgSessionStore({ connectionString, ssl, logger, ttlMs, pruneIntervalMs })`; defaults are eight hours for the fallback TTL and 15 minutes for pruning. It supplies callback-compatible `get`, `set`, `destroy` and `compareAndSet` methods (the installed `@fastify/session` also requires compare-and-set), plus `pruneExpired()` and `close()`. Omitting callbacks returns promises.
+With `DATABASE_URL` set, `src/app.js` uses this adapter for `@fastify/session` and closes it on shutdown, so sessions survive restarts. The factory is `createPgSessionStore({ connectionString, ssl, logger, ttlMs, pruneIntervalMs })`; defaults are eight hours for the fallback TTL and 15 minutes for pruning. It supplies callback-compatible `get`, `set`, `destroy` and `compareAndSet` methods (the installed `@fastify/session` also requires compare-and-set), plus `pruneExpired()` and `close()`. Omitting callbacks returns promises.
 
-For the later Fastify integration, construct it once, pass `store: sessionStore` to the existing `@fastify/session` options, and close it with the app:
+The integration in `src/app.js` follows this shape:
 
 ```js
 import { createPgSessionStore } from './store/pg-session-store.js';
@@ -246,9 +252,9 @@ Proposed production layout (requires approval before any server changes; never r
 - A bootstrap administrator creates the database and two non-superuser logins. `valcairn_migrator` owns the application schema/objects and can run DDL there, but cannot create databases or roles. `valcairn_app` is not an owner and has only schema usage, data-table read/write privileges and required sequence usage. Do not grant the application write access to `schema_migrations`. Set matching default privileges for future migrations. Use a separate read-only backup identity.
 - Configure PostgreSQL TLS with a certificate valid for its internal hostname, mount the CA into the application, and use `DATABASE_SSL=verify-full`. Supply the application URL through the existing protected runtime secret file or scoped Coolify secret; supply the migration URL only to a one-off migration job. Never put either production URL in command history, source, screenshots or logs.
 - Proposed backup job: daily at **02:00 UTC**, create a consistent custom-format dump, encrypt it, retain 7 daily/4 weekly/3 monthly copies, and send a verified copy to a private off-host object-storage bucket. A proposed local staging directory is `/home/ayush/valcairn/backups/postgres`; local-only backups are insufficient. Alert on failed jobs, missing uploads and stale backup age. Run a monthly restore drill into a separate database and verify migrations, representative records, workspace isolation and login. Agree on the recovery-point/recovery-time targets before relying on this policy.
-- Roll out only after an approved backup and migration rehearsal. Keep the existing reviewer allowlist, session secret and `SIGNIN_LOG_FILE` mounts unchanged. Session-store wiring is a separate reviewed step; this branch does not change it.
+- Roll out only after an approved backup and migration rehearsal. Keep the session secret and `SIGNIN_LOG_FILE` mount unchanged. Import the existing reviewer hashes into `reviewer_accounts` before switching, as described in [docs/RELEASE.md](docs/RELEASE.md).
 
-The current web Docker image does not contain `scripts/migrate.js` or `migrations/`. Run the migration job from a release artifact that includes them and `pg`; do not assume `npm run db:migrate` will work inside the current web image. Updating that image/job is a separate deployment change.
+Migrations run from a separate image target: `docker build --target migrate -t valcairn-migrate .`. It contains `scripts/migrate.js`, `scripts/reviewers.js`, `migrations/` and `pg`. The web image does not run migrations. See [docs/RELEASE.md](docs/RELEASE.md).
 
 #### Object storage and ingest routing proposal
 
@@ -257,7 +263,7 @@ The current web Docker image does not contain `scripts/migrate.js` or `migration
 - Route a dedicated HTTPS origin, proposed `https://ingest.frontierintelligencelab.com`, through Traefik to the ingest container on a private network. Set `INGEST_PUBLIC_URL` on web to that origin, `INGEST_ALLOWED_ORIGINS` on ingest to the exact website origin, and `INGEST_BIND=0.0.0.0:4100` inside its container; do not publish port 4100 on the host. The current web config accepts an origin only, so same-origin path routing would require a separate config/URL handling change.
 - Inject the same strong `INGEST_SHARED_SECRET` into web and ingest through scoped runtime secrets. Supply `INGEST_STORAGE=s3://<private-bucket>/valcairn/` and provider credentials only to ingest. Keep existing signed-grant/receipt checks; do not expose the shared secret in public config, build arguments, logs or browser code.
 - Keep object retention long enough to restore every retained database backup, and test restore by resolving a restored dataset manifest to its stored files and verifying hashes. A database dump alone does not back up file bytes. Define orphan-upload cleanup, quotas, malware scanning and secret rotation before production; these are not implemented by this database patch.
-- Release remains blocked until approval is bound to immutable reviewed content: the current onboarding API can edit rights or record a held upload receipt after approval. The route and store contract must agree on atomic status/revision guards before treating a version as staff-approved.
+- Approval is bound to immutable reviewed content (contract v4). Submitted projects refuse edits, held receipts and deletions atomically in both stores and by Postgres triggers. Versions are built from the approved review snapshot. Orphaned uploads are swept by ingest, and grants are single-use with project quotas. Malware scanning and secret rotation remain open.
 
 #### Restore rehearsal actually performed locally
 

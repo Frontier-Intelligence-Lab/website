@@ -33,7 +33,7 @@ export function Start() {
             <span className="ob-door-head"><Tile icon="building" tone="blue" size="lg" />{work && <span className="ob-badge tile--blue">Suggested for your email</span>}</span>
             <span className="ob-door-title">For my company or team</span>
             <p>Create an organization. Colleagues share projects, data and models, each with their own role.</p>
-            <span className="ob-door-foot">Commercial licenses, spend approvals and financing need an organization.</span>
+            <span className="ob-door-foot">Shared projects, team roles and (planned) financing need an organization.</span>
           </Link>
           <Link to="/setup/personal" className={`ob-door${work ? '' : ' ob-door--suggested'}`}>
             <span className="ob-door-head"><Tile icon="study" tone="violet" size="lg" />{!work && <span className="ob-badge tile--violet">Suggested for your email</span>}</span>
@@ -278,11 +278,12 @@ export async function teamLoader({ params }) {
   return { entry, detail: await api.workspace(entry.id) };
 }
 
+// Matches the server's checks in src/accounts.js (CAN) and src/datasets.js. Access is workspace-wide.
 const ROLE_ROWS = [
-  ['Admin', 'blue', 'Everything', 'Everything', 'Yes', 'Yes'],
-  ['Member', 'orange', 'Their projects', 'Their projects', 'Request only', 'No'],
-  ['Finance', 'amber', 'View', 'No', 'Yes', 'Yes'],
-  ['Viewer', 'plain', 'View', 'No', 'No', 'No'],
+  ['Admin', 'blue', 'Yes', 'Yes', 'Yes', 'Yes'],
+  ['Member', 'orange', 'Yes', 'Yes', 'No', 'No'],
+  ['Finance', 'amber', 'Yes', 'No', 'No', 'No'],
+  ['Viewer', 'plain', 'Yes', 'No', 'No', 'No'],
 ];
 
 function JoinRequests({ workspaceId, requests }) {
@@ -421,7 +422,7 @@ function OrgTeamManage({ entry, detail }) {
             <h2 id="roles-title" style={{ padding: '14px 18px' }}>What each role can do</h2>
             <div className="ob-table-wrap">
               <table>
-                <thead><tr><th scope="col">Role</th><th scope="col">Projects and models</th><th scope="col">Private data</th><th scope="col">Approve spend</th><th scope="col">Financing</th></tr></thead>
+                <thead><tr><th scope="col">Role</th><th scope="col">See all projects and files</th><th scope="col">Edit, upload, submit</th><th scope="col">Invite and approve people</th><th scope="col">Approve dataset versions</th></tr></thead>
                 <tbody>
                   {ROLE_ROWS.map(([role, tone, ...cells]) => (
                     <tr key={role}><th scope="row"><span className={`ob-badge tile--${tone}`}>{role}</span></th>{cells.map((c, i) => <td key={i} className={c === 'No' ? 'no' : undefined}>{c}</td>)}</tr>
@@ -459,7 +460,7 @@ function OrgTeamManage({ entry, detail }) {
               <div style={{ display: 'flex', gap: 12 }}><Tile icon="link" tone="plain" size="sm" /><span className="ob-muted"><strong style={{ color: 'var(--text)' }}>Invitations work for any email.</strong> Use them for contractors and partners outside your domain.</span></div>
             </div>
           </div>
-          <div className="ob-note tile--amber"><span>Financing documents are visible only to Owner, Admin and Finance roles, never to Members, even if they work on the project.</span></div>
+          <div className="ob-note tile--amber"><span>Financing is planned, not available yet. The Finance role exists so finance colleagues can follow projects read-only today and get financing access when it opens.</span></div>
         </aside>
       </form>
     </SetupShell>

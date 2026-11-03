@@ -9,6 +9,9 @@ use crate::app::AppState;
 pub struct Config {
     pub bind: String,
     pub state: AppState,
+    /// How often to sweep, and how old an uncommitted (pending) upload must be to be removed.
+    pub sweep_every: Duration,
+    pub pending_ttl: Duration,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -54,16 +57,27 @@ pub fn from_env() -> Result<Config, String> {
         })
         .transpose()?
         .unwrap_or(60);
+    let seconds = |key: &str, default: u64| -> Result<Duration, String> {
+        env(key)
+            .map(|v| {
+                v.parse::<u64>()
+                    .map_err(|_| format!("{key} must be a number of seconds"))
+            })
+            .transpose()
+            .map(|v| Duration::from_secs(v.unwrap_or(default)))
+    };
     Ok(Config {
         bind: env("INGEST_BIND").unwrap_or_else(|| "127.0.0.1:4100".into()),
-        state: AppState {
+        state: AppState::new(
             store,
             prefix,
-            secret: secret.into_bytes(),
+            secret.into_bytes(),
             max_bytes,
-            idle: Duration::from_secs(idle),
+            Duration::from_secs(idle),
             allowed_origins,
-        },
+        ),
+        sweep_every: seconds("INGEST_SWEEP_SECONDS", 3600)?,
+        pending_ttl: seconds("INGEST_PENDING_TTL_SECONDS", 24 * 3600)?,
     })
 }
 

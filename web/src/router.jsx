@@ -65,7 +65,7 @@ function accountRoutes() {
     { path: '/setup/organization', lazy: page(org, 'OrgCreate', 'orgCreateLoader') },
     { path: '/setup/match', lazy: page(org, 'OrgMatch', 'matchLoader') },
     { path: '/setup/personal', lazy: page(personal, 'Personal', 'personalLoader') },
-    { path: '/w/:slug', lazy: page(project, 'ProjectHome', 'workspaceHomeLoader') },
+    { path: '/w/:slug', lazy: page(project, 'WorkspaceHome', 'workspaceHomeLoader') },
     { path: '/w/:slug/setup/team', lazy: page(org, 'OrgTeam', 'teamLoader') },
     { path: '/w/:slug/projects/new', lazy: page(project, 'ProjectGoal', 'goalLoader') },
     { path: '/w/:slug/projects/:projectId', lazy: page(project, 'ProjectHome', 'projectHomeLoader') },

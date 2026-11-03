@@ -3,6 +3,9 @@ import { StoreError } from './errors.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
+// Review-relevant content can change only while a project is editable; submitting freezes it.
+const EDITABLE = ['draft', 'changes_requested'];
+const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
 const lower = (value) => String(value).toLowerCase();
 const iso = (value) => value == null ? null : new Date(value).toISOString();
 
@@ -34,6 +37,8 @@ function databaseError(error) {
     if (code) return new StoreError(code);
   }
   if (error.code === '23503') return new StoreError('not_found');
+  // Raised by the freeze triggers in migrations/005_review_integrity.sql.
+  if (error.code === 'P0001' && error.message === 'project_frozen') return new StoreError('invalid_state');
   // PostgreSQL details can contain complete rows, including hashes or private data.
   const safe = new Error('Postgres operation failed');
   if (typeof error.code === 'string') safe.code = error.code;
@@ -79,8 +84,12 @@ const uploadRow = (r) => r ? {
 } : null;
 const reviewRow = (r) => r ? {
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, submittedBy: r.submitted_by,
-  status: r.status, reviewerId: r.reviewer_id, notes: r.notes, checks: r.checks,
+  status: r.status, reviewerId: r.reviewer_id, notes: r.notes, checks: r.checks, snapshot: r.snapshot ?? null,
   decidedAt: iso(r.decided_at), createdAt: iso(r.created_at),
+} : null;
+const reviewerRow = (r) => r ? {
+  username: r.username, name: r.name, role: r.role, enabled: r.enabled,
+  createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
 } : null;
 const versionRow = (r) => ({
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, number: r.number,
@@ -329,8 +338,9 @@ export function createPostgresStore(options) {
     },
     async updateProject({ workspaceId, projectId, patch }) {
       if (!isId(workspaceId) || !isId(projectId)) return null;
-      const allowed = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'status', 'setupStep'];
+      const allowed = [...CONTENT_FIELDS, 'setupStep'];
       const changes = Object.fromEntries(allowed.filter(key => Object.hasOwn(patch, key)).map(key => [key, patch[key]]));
+      const touchesContent = CONTENT_FIELDS.some(key => Object.hasOwn(changes, key));
       const result = await query(`UPDATE projects SET
         name = CASE WHEN $3::jsonb ? 'name' THEN $3::jsonb ->> 'name' ELSE name END,
         task = CASE WHEN $3::jsonb ? 'task' THEN $3::jsonb ->> 'task' ELSE task END,
@@ -339,11 +349,15 @@ export function createPostgresStore(options) {
         success = CASE WHEN $3::jsonb ? 'success' THEN NULLIF($3::jsonb -> 'success', 'null'::jsonb) ELSE success END,
         data_source = CASE WHEN $3::jsonb ? 'dataSource' THEN NULLIF($3::jsonb -> 'dataSource', 'null'::jsonb) ELSE data_source END,
         model = CASE WHEN $3::jsonb ? 'model' THEN NULLIF($3::jsonb -> 'model', 'null'::jsonb) ELSE model END,
-        status = CASE WHEN $3::jsonb ? 'status' THEN $3::jsonb ->> 'status' ELSE status END,
         setup_step = CASE WHEN $3::jsonb ? 'setupStep' THEN $3::jsonb ->> 'setupStep' ELSE setup_step END,
         updated_at = clock_timestamp()
-        WHERE workspace_id = $1 AND id = $2 RETURNING *`, [workspaceId, projectId, JSON.stringify(changes)]);
-      return projectRow(result.rows[0]);
+        WHERE workspace_id = $1 AND id = $2 AND (NOT $4 OR status = ANY($5::text[])) RETURNING *`,
+      [workspaceId, projectId, JSON.stringify(changes), touchesContent, EDITABLE]);
+      if (result.rowCount) return projectRow(result.rows[0]);
+      // Distinguish a frozen project from one that does not exist here.
+      const exists = (await query('SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2', [workspaceId, projectId])).rowCount;
+      if (exists) throw new StoreError('invalid_state');
+      return null;
     },
     async getProject({ workspaceId, projectId }) {
       if (!isId(workspaceId) || !isId(projectId)) return null;
@@ -354,10 +368,15 @@ export function createPostgresStore(options) {
       return (await query('SELECT * FROM projects WHERE workspace_id = $1 ORDER BY created_at, id', [workspaceId])).rows.map(projectRow);
     },
 
-    async createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename }) {
+    async createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, limits = {} }) {
       return transaction(async (client) => {
-        // Serialize duplicate detection within this project, including parallel receipts.
-        await lockProject(client, workspaceId, projectId);
+        // Serialize duplicate detection, quotas and the editable check with submission, including parallel receipts.
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        if (limits.maxFiles != null || limits.maxBytes != null) {
+          const used = (await query('SELECT count(*)::int AS files, COALESCE(sum(size_bytes), 0)::bigint AS bytes FROM uploads WHERE workspace_id = $1 AND project_id = $2', [workspaceId, projectId], client)).rows[0];
+          if ((limits.maxFiles != null && used.files + 1 > limits.maxFiles) || (limits.maxBytes != null && Number(used.bytes) + sizeBytes > limits.maxBytes)) throw new StoreError('quota_exceeded');
+        }
         const duplicate = (await query('SELECT id FROM uploads WHERE project_id = $1 AND sha256 = $2 AND duplicate_of IS NULL ORDER BY created_at, id LIMIT 1', [projectId, sha256], client)).rows[0];
         const row = (await query(`INSERT INTO uploads
           (workspace_id, project_id, uploaded_by, object_key, sha256, size_bytes, content_type, filename, duplicate_of)
@@ -374,15 +393,48 @@ export function createPostgresStore(options) {
       if (!isId(uploadId)) return null;
       return uploadRow((await query('SELECT * FROM uploads WHERE id = $1', [uploadId])).rows[0]);
     },
+    async deleteUpload({ workspaceId, projectId, uploadId, actorId }) {
+      if (!isId(uploadId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        const removed = (await query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE', [workspaceId, projectId, uploadId], client)).rows[0];
+        if (!removed) throw new StoreError('not_found');
+        // The earliest copy of a removed original becomes the new original; repoint before deleting (FK).
+        const copies = (await query('SELECT id FROM uploads WHERE project_id = $1 AND duplicate_of = $2 ORDER BY created_at, id', [projectId, uploadId], client)).rows;
+        if (copies.length) {
+          await query('UPDATE uploads SET duplicate_of = NULL WHERE id = $1', [copies[0].id], client);
+          await query('UPDATE uploads SET duplicate_of = $1 WHERE project_id = $2 AND duplicate_of = $3', [copies[0].id, projectId, uploadId], client);
+        }
+        await query('DELETE FROM uploads WHERE id = $1', [uploadId], client);
+        await addAudit(client, { workspaceId, actorId, action: 'upload.deleted', targetType: 'upload', targetId: uploadId, metadata: { sha256: removed.sha256 } });
+        return uploadRow(removed);
+      });
+    },
 
     async submitForReview({ workspaceId, projectId, submittedBy }) {
       return transaction(async (client) => {
         const project = await lockProject(client, workspaceId, projectId);
-        if (!['draft', 'changes_requested'].includes(project.status)) throw new StoreError('invalid_state');
-        const row = (await query('INSERT INTO reviews (workspace_id, project_id, submitted_by) VALUES ($1, $2, $3) RETURNING *', [workspaceId, projectId, submittedBy], client)).rows[0];
+        if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+        // The reviewer decides on this snapshot, taken under the same lock that uploads and edits wait on.
+        const files = (await query(`SELECT id, sha256, size_bytes, content_type, filename, object_key FROM uploads
+          WHERE workspace_id = $1 AND project_id = $2 AND duplicate_of IS NULL ORDER BY created_at, id`, [workspaceId, projectId], client)).rows
+          .map(f => ({ id: f.id, sha256: f.sha256, sizeBytes: Number(f.size_bytes), contentType: f.content_type, filename: f.filename, objectKey: f.object_key }));
+        const snapshot = { task: project.task, modalities: project.modalities, startingPoint: project.starting_point, success: project.success, dataSource: project.data_source, model: project.model, files };
+        const row = (await query('INSERT INTO reviews (workspace_id, project_id, submitted_by, snapshot) VALUES ($1, $2, $3, $4::jsonb) RETURNING *', [workspaceId, projectId, submittedBy, JSON.stringify(snapshot)], client)).rows[0];
         await query("UPDATE projects SET status = 'in_review', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2", [workspaceId, projectId], client);
         await addAudit(client, { workspaceId, actorId: submittedBy, action: 'review.submitted', targetType: 'project', targetId: projectId, metadata: { reviewId: row.id } });
         return reviewRow(row);
+      });
+    },
+    async reopenProject({ workspaceId, projectId, actorId }) {
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!['in_review', 'approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+        await query("UPDATE reviews SET status = 'withdrawn', decided_at = clock_timestamp() WHERE project_id = $1 AND status = 'pending'", [projectId], client);
+        const row = (await query("UPDATE projects SET status = 'draft', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 RETURNING *", [workspaceId, projectId], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId, action: 'project.reopened', targetType: 'project', targetId: projectId, metadata: { from: project.status } });
+        return projectRow(row);
       });
     },
     async listReviews({ status = 'pending' } = {}) {
@@ -418,22 +470,52 @@ export function createPostgresStore(options) {
       });
     },
 
-    async createDatasetVersion({ workspaceId, projectId, createdBy, manifest }) {
+    async createDatasetVersion({ workspaceId, projectId, createdBy }) {
       return transaction(async (client) => {
         const project = await lockProject(client, workspaceId, projectId);
-        if (!['approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+        if (project.status !== 'approved') throw new StoreError('invalid_state');
+        // Exactly the reviewed content: the approved snapshot of the latest review, never the live project.
+        const approved = (await query('SELECT id, status, snapshot FROM reviews WHERE project_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1', [projectId], client)).rows[0];
+        if (approved?.status !== 'approved' || !approved.snapshot) throw new StoreError('invalid_state');
+        const manifest = { reviewId: approved.id, ...approved.snapshot };
         const row = (await query(`INSERT INTO dataset_versions (workspace_id, project_id, number, created_by, manifest)
           SELECT $1, $2, COALESCE(MAX(number), 0) + 1, $3, $4::jsonb
           FROM dataset_versions WHERE project_id = $2 RETURNING *`,
         [workspaceId, projectId, createdBy, JSON.stringify(manifest)], client)).rows[0];
         await query("UPDATE projects SET status = 'versioned', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2", [workspaceId, projectId], client);
-        await addAudit(client, { workspaceId, actorId: createdBy, action: 'dataset_version.created', targetType: 'project', targetId: projectId, metadata: { number: row.number } });
+        await addAudit(client, { workspaceId, actorId: createdBy, action: 'dataset_version.created', targetType: 'project', targetId: projectId, metadata: { number: row.number, reviewId: approved.id } });
         return versionRow(row);
       });
     },
     async listDatasetVersions({ workspaceId, projectId }) {
       if (!isId(workspaceId) || !isId(projectId)) return [];
       return (await query('SELECT * FROM dataset_versions WHERE workspace_id = $1 AND project_id = $2 ORDER BY number', [workspaceId, projectId])).rows.map(versionRow);
+    },
+
+    async upsertReviewer({ username, name, role, passwordHash }) {
+      const key = lower(username);
+      const row = passwordHash
+        ? (await query(`INSERT INTO reviewer_accounts (username, name, role, password_hash) VALUES ($1, $2, $3, $4)
+            ON CONFLICT (username) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, password_hash = EXCLUDED.password_hash, updated_at = clock_timestamp()
+            RETURNING *`, [key, name, role, passwordHash])).rows[0]
+        : (await query('UPDATE reviewer_accounts SET name = $2, role = $3, updated_at = clock_timestamp() WHERE username = $1 RETURNING *', [key, name, role])).rows[0];
+      if (!row) throw new StoreError('not_found');
+      return reviewerRow(row);
+    },
+    async getReviewer(username) {
+      return reviewerRow((await query('SELECT * FROM reviewer_accounts WHERE username = $1', [lower(username)])).rows[0]);
+    },
+    async getReviewerAuth(username) {
+      const row = (await query('SELECT * FROM reviewer_accounts WHERE username = $1', [lower(username)])).rows[0];
+      return row ? { account: reviewerRow(row), passwordHash: row.password_hash } : null;
+    },
+    async setReviewerEnabled({ username, enabled }) {
+      const row = (await query('UPDATE reviewer_accounts SET enabled = $2, updated_at = clock_timestamp() WHERE username = $1 RETURNING *', [lower(username), Boolean(enabled)])).rows[0];
+      if (!row) throw new StoreError('not_found');
+      return reviewerRow(row);
+    },
+    async listReviewers() {
+      return (await query('SELECT * FROM reviewer_accounts ORDER BY username')).rows.map(reviewerRow);
     },
 
     async recordAudit(event) { await addAudit(pool, event); },

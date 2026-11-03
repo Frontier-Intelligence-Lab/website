@@ -116,6 +116,13 @@ function validateModel(raw) {
 export function validateProjectPatch(raw, project) {
   const body = raw && typeof raw === 'object' ? raw : {};
   const modelPath = project?.startingPoint === 'model';
+  // After a scoping call, an "unsure" project picks its real starting point; nothing else may change it.
+  if (body.startingPoint) {
+    if (project?.startingPoint !== 'unsure') return { errors: { form: 'The starting point is set when the project is created.' } };
+    const next = oneOf(body.startingPoint, ['own', 'need', 'model']);
+    return next ? { patch: { startingPoint: next, setupStep: 'success' } } : { errors: { startingPoint: 'Choose where you are starting from.' } };
+  }
+  if (project?.startingPoint === 'unsure') return { errors: { form: 'Choose a starting point after your scoping call first.' } };
   if (body.success) return { patch: { success: validateSuccess(body.success), setupStep: modelPath ? 'model' : 'data' } };
   if (body.model) {
     if (!modelPath) return { errors: { form: 'This project does not start from an existing model.' } };

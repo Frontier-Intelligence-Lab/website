@@ -31,7 +31,7 @@ function AuthLayout({ children }) {
         <ul className="ob-features">
           <li><Tile icon="data" tone="orange" /><div><strong>Data with its rights attached</strong><span className="ob-muted">Your own, licensed or newly collected.</span></div></li>
           <li><Tile icon="layers" tone="blue" /><div><strong>Models tested on your task</strong><span className="ob-muted">Against a bar you set before training.</span></div></li>
-          <li><Tile icon="bank" tone="amber" /><div><strong>Financing for growth</strong><span className="ob-muted">For compute, equipment and rollouts.</span></div></li>
+          <li><Tile icon="bank" tone="amber" /><div><strong>Financing for growth (planned)</strong><span className="ob-muted">For compute, equipment and rollouts. Not available yet.</span></div></li>
         </ul>
       </section>
       <main className="ob-split-main">{children}</main>
