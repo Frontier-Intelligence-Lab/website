@@ -1,6 +1,6 @@
 # Valcairn website
 
-Site for Valcairn by Frontier Intelligence Labs: homepage, contact page, reviewer sign-in and a protected workspace dashboard. The UI is a React 19 single-page app (React Router 8, built with Vite 8). A Fastify 5 server serves the build and a small JSON API for contact delivery and reviewer sessions. Every page has light and dark themes.
+Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, contact page, reviewer sign-in, a protected demo dashboard, and customer onboarding (accounts, organizations, projects, sample uploads, staff review and dataset versions). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/RELEASE.md](docs/RELEASE.md) and [docs/DEMO.md](docs/DEMO.md). The UI is a React 19 single-page app (React Router 8, built with Vite 8). A Fastify 5 server serves the build and a small JSON API for contact delivery and reviewer sessions. Every page has light and dark themes.
 
 ![Node](https://img.shields.io/badge/node-%3E%3D22.22-informational) ![React](https://img.shields.io/badge/react-19.3-informational) ![Tests](https://img.shields.io/badge/tests-node%20--test-informational) ![License](https://img.shields.io/badge/license-none%20checked%20in-lightgrey)
 
@@ -10,7 +10,11 @@ Site for Valcairn by Frontier Intelligence Labs: homepage, contact page, reviewe
 | --- | --- |
 | `/` homepage (Obsidian design in dark, ivory variant in light) | Implemented in React; not yet deployed. |
 | `/contact` form with server validation, booking link, SMTP delivery | Implemented in React against `POST /api/contact`. The previous server-rendered version is live and delivered a test message on November 2, 2026 UTC; the React version has not been deployed. |
-| `/demo` reviewer sign-in (server-side sessions, scrypt hashes) | Implemented. Sign-in stays disabled until reviewer accounts are configured; none exist yet. |
+| `/demo` reviewer sign-in (server-side sessions, scrypt hashes) | Implemented. With Postgres, accounts live in `reviewer_accounts` (YC `ycinsider`, Speedrun `sr008-reviewer`, `admin`), managed with `scripts/reviewers.js`; role and enabled status are re-checked on every request. Without a database, `REVIEWERS_FILE` is used. |
+| Onboarding: accounts, organizations, personal workspaces, invitations, join requests, roles | Implemented and tested against Postgres. Not yet deployed. |
+| Projects: goal, acceptance rule, rights record, existing-model intake, scoping call | Implemented. |
+| Sample uploads (Rust `services/ingest`), staff review, dataset versions | Implemented. Submitted content is frozen; versions contain exactly the approved snapshot. |
+| Provider onboarding, training, evaluation, deployment, financing | **Planned.** Shown as planned in the app; nothing executes. |
 | `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
 | Light / dark mode | Follows the system setting; a toggle stores the visitor's choice in `localStorage`. |
 | Deployment | Nothing deploys from this repository yet. frontierintelligencelab.com still runs an earlier server-rendered build as a Docker container; this React version needs a new release (see [Deployment](#deployment)). |
@@ -155,3 +159,120 @@ This is a long-running Node server (sessions, SMTP, rate limits), not a static o
 ## License
 
 No application license file is currently checked in. The bundled Inter font includes its OFL license (`web/public/fonts/LICENSE-Inter-OFL.txt`). This is a private project workspace.
+
+## Database
+
+The optional Postgres store implements [the storage contract](docs/STORE_CONTRACT.md). With `DATABASE_URL` unset, development and tests use the existing in-memory store. Production without a database keeps the new account routes unavailable. Existing reviewer credentials and the sign-in JSONL log are separate and are not migrated by these scripts.
+
+### Local Postgres 17
+
+Start the local database from this repository root:
+
+```sh
+docker compose -f docker-compose.postgres.yml up -d --wait
+docker compose -f docker-compose.postgres.yml exec postgres createdb -U valcairn valcairn_test
+```
+
+The second command creates the test-only database once. The service binds **only `127.0.0.1:5432`**, stores data in the named `valcairn_postgres_data` volume, and uses intentionally public local-only credentials. Never reuse these credentials or this initialization superuser in production. `docker compose ... down` retains the volume; adding `-v` deletes its contents.
+
+For the application, put these values in an ignored local `.env`:
+
+```dotenv
+DATABASE_URL=postgresql://valcairn:valcairn_local_only@127.0.0.1:5432/valcairn
+DATABASE_SSL=disable
+```
+
+Then run `npm run db:migrate` before starting the app. The npm script reads `.env`. Migrations are not run automatically by the web server.
+
+`DATABASE_SSL` accepts `disable` (local plain TCP), `require` (encrypted connection without certificate verification) or `verify-full` (encrypted connection with certificate/hostname verification). Production defaults to `require` and refuses `disable`. Prefer `verify-full` in production with a certificate valid for the configured database hostname; provide a private CA through Node's trusted-CA configuration, such as an appropriately mounted `NODE_EXTRA_CA_CERTS` file. Keep TLS settings in `DATABASE_SSL` rather than contradictory SSL options in the connection URL.
+
+### Store tests
+
+The database tests use **only `TEST_DATABASE_URL`** for connections. They apply migrations to the dedicated test database and reset the store tables between tests. This intentionally deletes test records: use the separate local `valcairn_test` database, never a production database or one containing real data. The safety guard rejects an application-database target, requires a test-named database with an explicit host and port, and refuses query parameters that could override the destination. Unset `DATABASE_URL` for isolated tests; if it is present, it is only inspected for the safety comparison and must also be unambiguous. Its test role needs migration and table-reset privileges; the application role in production does not. Keep this test file serial; parallel CI jobs need separate test databases.
+
+On macOS/Linux:
+
+```sh
+env -u DATABASE_URL TEST_DATABASE_URL='postgresql://valcairn:valcairn_local_only@127.0.0.1:5432/valcairn_test' node --test tests/store-postgres.test.js
+```
+
+On PowerShell:
+
+```powershell
+$env:TEST_DATABASE_URL = 'postgresql://valcairn:valcairn_local_only@127.0.0.1:5432/valcairn_test'
+$env:DATABASE_URL = $null
+node --test tests/store-postgres.test.js
+Remove-Item Env:TEST_DATABASE_URL
+```
+
+With `TEST_DATABASE_URL` unset, the Postgres suite skips cleanly and `npm run check` still runs without a database.
+
+### Migrations and schema
+
+`scripts/migrate.js` applies numbered SQL files in order, records their SHA-256 checksums in `schema_migrations`, and commits each file and its ledger entry atomically. It serializes concurrent runners with a database/schema advisory lock. Applied files must remain unchanged; append a new numbered migration instead. The exported `applyMigrations({ pool })` also accepts an existing `pg.Pool`, which lets the tests select an isolated schema without modifying the SQL files.
+
+- `001_init.sql`: users, email-verification codes, workspaces, memberships, invitations, join requests, projects and audit events.
+- `002_sessions.sql`: expiring sessions, reserved for the separate Fastify session-store integration.
+- `003_project_model.sql`: nullable object-shaped model intake metadata.
+- `005_review_integrity.sql`: review snapshots, the `withdrawn` review status, and triggers that refuse content or file changes on submitted projects.
+- `006_reviewer_accounts.sql`: external demo reviewer accounts, separate from customer users.
+- `004_onboarding_v3.sql`: uploads, staff reviews and numbered dataset versions, plus the v3 project statuses. Legacy `submitted` projects return to `draft` because the old status did not record a staff review. Other project data is retained.
+
+Relative to the starting schema, the migrations explicitly constrain lower-case email/domain/slug storage, nonnegative code attempts, object-shaped JSON, valid project statuses, and verified domains having a domain value. They add relationship/expiry indexes and foreign keys. `audit_events.target_id` is text because audit targets are generic identifiers. PostgreSQL 17 provides `gen_random_uuid()` directly, so no extension is needed. No provider, listing or financing tables are added.
+
+The v3 tables use composite foreign keys to keep each upload, review and version in its project's workspace. Duplicate uploads reference an original in that same project; SHA-256 strings are lowercase hex and file sizes are nonnegative safe JavaScript integers. A partial unique index permits one pending review per project. Dataset numbers are unique per project and assigned while its row is locked. Invitation acceptance/revocation, review transitions and version creation include their audit entries in the same transaction. The nine shared contract tests and additional Postgres concurrency/rollback tests cover these operations.
+
+An upgrade rehearsal from migrations 001/002 preserved a legacy project while converting `submitted` to `draft` and adding `model: null`. After v3 writes, rollback requires a reviewed data conversion or backup restore; restoring the old status constraint alone will reject the new states.
+
+With `DATABASE_URL` set, `src/app.js` uses this adapter for `@fastify/session` and closes it on shutdown, so sessions survive restarts. The factory is `createPgSessionStore({ connectionString, ssl, logger, ttlMs, pruneIntervalMs })`; defaults are eight hours for the fallback TTL and 15 minutes for pruning. It supplies callback-compatible `get`, `set`, `destroy` and `compareAndSet` methods (the installed `@fastify/session` also requires compare-and-set), plus `pruneExpired()` and `close()`. Omitting callbacks returns promises.
+
+The integration in `src/app.js` follows this shape:
+
+```js
+import { createPgSessionStore } from './store/pg-session-store.js';
+
+const sessionStore = createPgSessionStore({
+  connectionString: config.databaseUrl,
+  ssl: config.databaseSsl,
+  logger: app.log,
+  ttlMs: config.sessionTtlMs,
+});
+// Keep the existing secret/cookie options; add store: sessionStore there.
+app.addHook('onClose', async () => sessionStore.close());
+```
+
+Keep this integration separate from the application-data store and retain the existing production session secret.
+
+### Production deployment proposal — not executed
+
+Proposed production layout (requires approval before any server changes; never reuse the local Compose credentials or superuser):
+
+- Prefer a **Coolify-managed Postgres 17 service**, with a dedicated internal database network shared only with `frontier-landing`. The app also keeps its existing `coolify` proxy network. Publish no database ports and create no Traefik route for it. If Coolify cannot provide the required TLS/role/backup controls, use an explicitly managed Postgres container with the same private-network boundary.
+- Proposed persistent bind location: `/home/ayush/valcairn/postgres-data` to `/var/lib/postgresql/data`, owned by the database container's runtime UID. This is a proposed new path, not an existing provisioned volume. Keep it separate from the current reviewer files and sign-in log.
+- A bootstrap administrator creates the database and two non-superuser logins. `valcairn_migrator` owns the application schema/objects and can run DDL there, but cannot create databases or roles. `valcairn_app` is not an owner and has only schema usage, data-table read/write privileges and required sequence usage. Do not grant the application write access to `schema_migrations`. Set matching default privileges for future migrations. Use a separate read-only backup identity.
+- Configure PostgreSQL TLS with a certificate valid for its internal hostname, mount the CA into the application, and use `DATABASE_SSL=verify-full`. Supply the application URL through the existing protected runtime secret file or scoped Coolify secret; supply the migration URL only to a one-off migration job. Never put either production URL in command history, source, screenshots or logs.
+- Proposed backup job: daily at **02:00 UTC**, create a consistent custom-format dump, encrypt it, retain 7 daily/4 weekly/3 monthly copies, and send a verified copy to a private off-host object-storage bucket. A proposed local staging directory is `/home/ayush/valcairn/backups/postgres`; local-only backups are insufficient. Alert on failed jobs, missing uploads and stale backup age. Run a monthly restore drill into a separate database and verify migrations, representative records, workspace isolation and login. Agree on the recovery-point/recovery-time targets before relying on this policy.
+- Roll out only after an approved backup and migration rehearsal. Keep the session secret and `SIGNIN_LOG_FILE` mount unchanged. Import the existing reviewer hashes into `reviewer_accounts` before switching, as described in [docs/RELEASE.md](docs/RELEASE.md).
+
+Migrations run from a separate image target: `docker build --target migrate -t valcairn-migrate .`. It contains `scripts/migrate.js`, `scripts/reviewers.js`, `migrations/` and `pg`. The web image does not run migrations. See [docs/RELEASE.md](docs/RELEASE.md).
+
+#### Object storage and ingest routing proposal
+
+- Prefer a private managed S3 bucket with a dedicated `valcairn/` prefix, Block Public Access enabled, encryption, and object versioning. This avoids putting the only copy of uploaded data on the same VPS as Postgres. MinIO on the VPS remains an option, but requires a separate persistent volume and off-host replication/backup. The existing Rust `object_store` integration supports S3-compatible endpoints.
+- Give only the ingest service the storage identity: object read/write/delete and necessary multipart operations scoped to its prefix, with bucket listing limited by `s3:prefix`. No bucket administration, public ACLs or account-wide listing. Keep backup/version-deletion privileges separate. Web receives signed receipts and does not need an object-store key. If a provider only supports bucket-level credential scopes, dedicate an entire bucket to this app rather than treating an unenforced prefix as an access boundary.
+- Route a dedicated HTTPS origin, proposed `https://ingest.frontierintelligencelab.com`, through Traefik to the ingest container on a private network. Set `INGEST_PUBLIC_URL` on web to that origin, `INGEST_ALLOWED_ORIGINS` on ingest to the exact website origin, and `INGEST_BIND=0.0.0.0:4100` inside its container; do not publish port 4100 on the host. The current web config accepts an origin only, so same-origin path routing would require a separate config/URL handling change.
+- Inject the same strong `INGEST_SHARED_SECRET` into web and ingest through scoped runtime secrets. Supply `INGEST_STORAGE=s3://<private-bucket>/valcairn/` and provider credentials only to ingest. Keep existing signed-grant/receipt checks; do not expose the shared secret in public config, build arguments, logs or browser code.
+- Keep object retention long enough to restore every retained database backup, and test restore by resolving a restored dataset manifest to its stored files and verifying hashes. A database dump alone does not back up file bytes. Define orphan-upload cleanup, quotas, malware scanning and secret rotation before production; these are not implemented by this database patch.
+- Approval is bound to immutable reviewed content. Submitted projects refuse edits, held receipts and deletions atomically in both stores and by Postgres triggers. Versions are built from the approved review snapshot. Uncommitted pending uploads are swept by ingest; committed objects are retained even when registration is refused or a working-set entry is removed, so retries and historical reviews/versions cannot lose their bytes. Project quotas count current working-set records, not retained storage. Reference-aware garbage collection or a physical-storage limit is required before public self-serve usage. Malware scanning and secret rotation remain open.
+
+#### Restore rehearsal actually performed locally
+
+Postgres **17.8** was tested locally using the commands below. The v3 rehearsal recovered all four migration-ledger entries and one synthetic upload, review and dataset version into an isolated database. This is evidence for the restore procedure, not a production backup claim. Choose a fresh restore database name on subsequent runs.
+
+```sh
+docker compose -f docker-compose.postgres.yml exec -T postgres pg_dump -U valcairn -d valcairn_v3_upgrade_test --format=custom --file=/tmp/valcairn-v3-restore.dump
+docker compose -f docker-compose.postgres.yml exec -T postgres createdb -U valcairn valcairn_v3_restore_test
+docker compose -f docker-compose.postgres.yml exec -T postgres pg_restore -U valcairn --exit-on-error --no-owner --dbname=valcairn_v3_restore_test /tmp/valcairn-v3-restore.dump
+```
+
+Pending production decisions: private object/backup provider and region, retention obligations and budget; recovery targets; TLS certificate/CA ownership; ingest hostname; and approval of the database service, private network, roles and persistent path. No production database, bucket, container, DNS record, Coolify setting or secret was changed by this work.

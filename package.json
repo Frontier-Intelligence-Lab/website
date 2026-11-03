@@ -14,7 +14,8 @@
     "build": "vite build",
     "test": "node --test \"tests/**/*.test.js\"",
     "check": "vite build && node --check src/server.js && npm test",
-    "reviewer:hash": "node scripts/hash-password.js"
+    "reviewer:hash": "node scripts/hash-password.js",
+    "db:migrate": "node --env-file-if-exists=.env scripts/migrate.js"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.5",
@@ -23,7 +24,8 @@
     "@fastify/session": "^11.1.6",
     "@fastify/static": "^10.1.8",
     "fastify": "^5.12.7",
-    "nodemailer": "^10.3.1"
+    "nodemailer": "^10.3.1",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.2.1",

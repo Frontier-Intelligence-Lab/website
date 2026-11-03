@@ -32,7 +32,7 @@ test('public config exposes the booking link, address and delivery state', async
   assert.equal(res.statusCode, 200);
   assert.deepEqual(
     { ...res.json(), limits: undefined },
-    { bookingUrl: 'https://cal.com/ayushozha/15-min-getting-to-know', contactEmail: 'contact@frontierintelligencelab.com', contactConfigured: false, signInConfigured: false, limits: undefined },
+    { bookingUrl: 'https://cal.com/ayushozha/15-min-getting-to-know', contactEmail: 'contact@frontierintelligencelab.com', contactConfigured: false, signInConfigured: false, accountsAvailable: true, signupOpen: true, limits: undefined },
   );
   assert.equal(res.json().limits.message, 4000);
   assert.equal((await app.inject({ method: 'GET', url: '/contact' })).statusCode, 200);

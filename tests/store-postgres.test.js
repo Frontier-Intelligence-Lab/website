@@ -1,0 +1,605 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, unlink, rmdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import Fastify from 'fastify';
+import cookie from '@fastify/cookie';
+import session from '@fastify/session';
+import { createPostgresPool, createPostgresStore } from '../src/store/postgres.js';
+import { createPgSessionStore } from '../src/store/pg-session-store.js';
+import { applyMigrations } from '../scripts/migrate.js';
+import { runStoreContract } from './store-contract.js';
+import { makeApp, json, postHeaders } from './helpers.js';
+import { signToken } from '../src/lib/tokens.js';
+
+// These tests reset ONLY the explicitly supplied, dedicated test database.
+// No application connection string is ever used to establish a connection.
+const connectionString = process.env.TEST_DATABASE_URL;
+const options = { connectionString, ssl: 'disable' };
+const dbIdentity = (value) => {
+  const url = new URL(value);
+  // pg accepts destination overrides in URL query parameters. Refuse ambiguous
+  // targets before any connection or destructive reset, including the app URL.
+  if (!url.hostname || !url.port || url.search) throw new Error('Database safety checks require explicit-host and port URLs without query parameters; unset DATABASE_URL when running isolated tests');
+  const hostname = decodeURIComponent(url.hostname).toLowerCase();
+  const host = ['localhost', '127.0.0.1', '[::1]'].includes(hostname) ? 'loopback' : hostname;
+  return `${host}:${url.port}${decodeURI(url.pathname)}`;
+};
+function validateTestDatabase(testUrl, applicationUrl) {
+  const identity = dbIdentity(testUrl);
+  const database = decodeURI(new URL(testUrl).pathname.slice(1));
+  if (!/(^|[_-])test($|[_-])/i.test(database)) throw new Error('TEST_DATABASE_URL must name a dedicated test database (for example valcairn_test)');
+  if (applicationUrl && identity === dbIdentity(applicationUrl)) {
+    throw new Error('TEST_DATABASE_URL must not target the application DATABASE_URL database');
+  }
+}
+if (connectionString) validateTestDatabase(connectionString, process.env.DATABASE_URL);
+
+async function makeStore() {
+  const pool = createPostgresPool(options);
+  try {
+    await applyMigrations({ pool });
+    await pool.query('TRUNCATE TABLE reviewer_accounts, sessions, audit_events, dataset_versions, reviews, uploads, projects, join_requests, invitations, memberships, email_codes, workspaces, users RESTART IDENTITY CASCADE');
+  } finally { await pool.end(); }
+  return createPostgresStore(options);
+}
+
+// Node's top-level tests are serial: every makeStore starts with empty tables.
+runStoreContract(connectionString ? test : test.skip, makeStore, 'postgres store');
+const withStore = (name, fn) => test(`postgres store: ${name}`, { skip: !connectionString, concurrency: false }, async () => {
+  const store = await makeStore();
+  const pool = createPostgresPool(options);
+  try { await fn(store, pool); } finally { await store.close(); await pool.end(); }
+});
+const user = (store, email = 'owner@example.test') => store.createUser({ email, name: 'Owner', passwordHash: 'test-hash' });
+const workspace = (store, ownerId, extra = {}) => store.createWorkspace({ kind: 'organization', name: 'Example', slug: 'example', ownerId, ...extra });
+
+withStore('parallel email-code consumers have exactly one winner', async (store) => {
+  const { id: userId } = await user(store);
+  await store.createEmailCode({ userId, email: 'owner@example.test', purpose: 'signup', codeHash: 'right', expiresAt: new Date(Date.now() + 60_000) });
+  const results = await Promise.all(Array.from({ length: 8 }, () => store.consumeEmailCode({ userId, purpose: 'signup', codeHash: 'right' })));
+  assert.equal(results.filter(r => r.ok).length, 1);
+  assert.equal(results.filter(r => r.reason === 'invalid').length, 7);
+});
+
+withStore('parallel wrong codes cannot bypass the attempt limit', async (store) => {
+  const { id: userId } = await user(store);
+  await store.createEmailCode({ userId, email: 'owner@example.test', purpose: 'academic', codeHash: 'right', expiresAt: new Date(Date.now() + 60_000) });
+  await Promise.all(Array.from({ length: 8 }, () => store.consumeEmailCode({ userId, purpose: 'academic', codeHash: 'wrong' })));
+  assert.deepEqual(await store.consumeEmailCode({ userId, purpose: 'academic', codeHash: 'right' }), { ok: false, reason: 'too_many_attempts' });
+});
+
+withStore('personal workspace uniqueness survives parallel requests', async (store) => {
+  const owner = await user(store);
+  const results = await Promise.allSettled(['personal-a', 'personal-b'].map(slug => workspace(store, owner.id, { kind: 'personal', slug })));
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'personal_exists');
+  assert.equal((await store.listWorkspacesForUser(owner.id)).length, 1);
+});
+
+withStore('concurrent invitation replacement keeps one pending invite', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  await Promise.all(['first', 'second'].map(tokenHash => store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: 'INVITEE@example.test', role: 'member', tokenHash, expiresAt: new Date(Date.now() + 60_000) }] })));
+  const invites = await store.listInvitations(ws.id);
+  assert.equal(invites.length, 1);
+  assert.equal(invites[0].email, 'invitee@example.test');
+  assert.equal('tokenHash' in invites[0], false);
+});
+
+withStore('failed invitation batches roll back revocations and audit rows', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const invite = { email: 'invitee@example.test', role: 'member', tokenHash: 'original', expiresAt: new Date(Date.now() + 60_000) };
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [invite] });
+  const before = await store.listInvitations(ws.id);
+  const auditBefore = await store.listAudit(ws.id);
+  await assert.rejects(store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [
+    { ...invite, tokenHash: 'duplicate' }, { ...invite, email: 'second@example.test', tokenHash: 'duplicate' },
+  ] }), { code: '23505' });
+  assert.deepEqual(await store.listInvitations(ws.id), before);
+  assert.deepEqual(await store.listAudit(ws.id), auditBefore);
+});
+
+withStore('workspace and owner roll back when audit insertion fails', async (store, pool) => {
+  const owner = await user(store);
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_creation CHECK (action <> 'workspace.created')");
+  try {
+    await assert.rejects(workspace(store, owner.id), { code: '23514' });
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM workspaces')).rows[0].count, 0);
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM memberships')).rows[0].count, 0);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_creation'); }
+});
+
+withStore('parallel join requests and decisions preserve a single outcome', async (store) => {
+  const owner = await user(store);
+  const joiner = await user(store, 'joiner@example.test');
+  const ws = await workspace(store, owner.id);
+  const requests = await Promise.all(Array.from({ length: 6 }, () => store.createJoinRequest({ workspaceId: ws.id, userId: joiner.id })));
+  assert.equal(new Set(requests.map(r => r.id)).size, 1);
+  const results = await Promise.allSettled([true, false].map(approve => store.decideJoinRequest({ workspaceId: ws.id, requestId: requests[0].id, deciderId: owner.id, approve })));
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'already_decided');
+  const outcome = results.find(r => r.status === 'fulfilled').value;
+  assert.equal(Boolean(await store.getMembership(ws.id, joiner.id)), outcome.status === 'approved');
+});
+
+withStore('normalization, safe shapes, first verification and nullable patches', async (store) => {
+  const owner = await user(store, 'UPPER@example.test');
+  const verified = await store.setEmailVerified(owner.id);
+  assert.equal((await store.setEmailVerified(owner.id)).emailVerifiedAt, verified.emailVerifiedAt);
+  const ws = await workspace(store, owner.id, { slug: 'UPPER-SLUG', domain: 'EXAMPLE.TEST' });
+  assert.equal(ws.slug, 'upper-slug');
+  assert.equal(await store.isSlugAvailable('UPPER-SLUG'), false);
+  assert.match(ws.createdAt, /Z$/);
+  assert.equal('personalOwnerId' in ws, false);
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Test', task: 'Classify', startingPoint: 'own' });
+  await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: { target: 1 }, dataSource: { kind: 'upload' } } });
+  const reset = await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: null, dataSource: null, modalities: [] } });
+  assert.equal(reset.success, null);
+  assert.equal(reset.dataSource, null);
+  assert.deepEqual(reset.modalities, []);
+  assert.equal(await store.getUserById('not-a-uuid'), null);
+  assert.equal(await store.getWorkspace('not-a-uuid'), null);
+});
+
+withStore('parallel invitation acceptance has one winner and preserves existing roles', async (store) => {
+  const owner = await user(store);
+  const guest = await user(store, 'guest@example.test');
+  const ws = await workspace(store, owner.id);
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: guest.email, role: 'finance', tokenHash: 'parallel-invite', expiresAt: new Date(Date.now() + 60_000) }] });
+  const invite = await store.getInvitationByTokenHash('parallel-invite');
+  const attempts = await Promise.allSettled(Array.from({ length: 6 }, () => store.acceptInvitation({ invitationId: invite.id, userId: guest.id })));
+  assert.equal(attempts.filter(r => r.status === 'fulfilled').length, 1);
+  assert.ok(attempts.filter(r => r.status === 'rejected').every(r => r.reason.code === 'already_decided'));
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: guest.email, role: 'viewer', tokenHash: 'role-preserved', expiresAt: new Date(Date.now() + 60_000) }] });
+  const again = await store.getInvitationByTokenHash('role-preserved');
+  assert.deepEqual(await store.acceptInvitation({ invitationId: again.id, userId: guest.id }), { workspaceId: ws.id, role: 'finance', alreadyMember: true });
+  assert.deepEqual(await store.getMembership(ws.id, guest.id), { role: 'finance' });
+  assert.equal('tokenHash' in again, false);
+});
+
+withStore('invitation acceptance and revocation roll back with their audit event', async (store, pool) => {
+  const owner = await user(store);
+  const guest = await user(store, 'guest@example.test');
+  const ws = await workspace(store, owner.id);
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: guest.email, role: 'member', tokenHash: 'atomic-invite', expiresAt: new Date(Date.now() + 60_000) }] });
+  const invite = await store.getInvitationByTokenHash('atomic-invite');
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_invitation CHECK (action NOT IN ('invitation.accepted', 'invitation.revoked'))");
+  try {
+    await assert.rejects(store.acceptInvitation({ invitationId: invite.id, userId: guest.id }), { code: '23514' });
+    assert.equal((await store.getInvitationByTokenHash('atomic-invite')).acceptedAt, null);
+    assert.equal(await store.getMembership(ws.id, guest.id), null);
+    await assert.rejects(store.revokeInvitation({ workspaceId: ws.id, invitationId: invite.id, actorId: owner.id }), { code: '23514' });
+    assert.equal((await store.getInvitationByTokenHash('atomic-invite')).revokedAt, null);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_invitation'); }
+});
+
+withStore('concurrent profile updates preserve independent keys and merge shallowly', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id, { profile: { keep: 'yes', nested: { old: true } } });
+  await Promise.all([
+    store.updateWorkspaceProfile({ workspaceId: ws.id, profile: { academicEmail: 'student@uni.edu' } }),
+    store.updateWorkspaceProfile({ workspaceId: ws.id, profile: { academicVerifiedAt: '2026-11-03T00:00:00.000Z', nested: { new: true } } }),
+  ]);
+  assert.deepEqual((await store.getWorkspace(ws.id)).profile, { keep: 'yes', academicEmail: 'student@uni.edu', academicVerifiedAt: '2026-11-03T00:00:00.000Z', nested: { new: true } });
+});
+
+const dataProject = async (store, suffix = '') => {
+  const owner = await user(store, `owner${suffix}@example.test`);
+  const ws = await workspace(store, owner.id, suffix ? { slug: `example-${suffix}` } : {});
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Dataset', task: 'Classify', startingPoint: 'own' });
+  return { owner, ws, project, scope: { workspaceId: ws.id, projectId: project.id } };
+};
+
+withStore('parallel uploads mark duplicate content and reject reused object keys', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  const fields = { ...scope, uploadedBy: owner.id, sha256: 'b'.repeat(64), sizeBytes: 2048, contentType: 'text/plain', filename: 'sample.txt' };
+  const uploads = await Promise.all(Array.from({ length: 8 }, (_, i) => store.createUpload({ ...fields, objectKey: `objects/${i}` })));
+  assert.equal(uploads.filter(u => u.duplicateOf === null).length, 1);
+  const ids = new Set(uploads.map(u => u.id));
+  assert.ok(uploads.every(u => u.duplicateOf === null || ids.has(u.duplicateOf)));
+  assert.ok(uploads.every(u => u.sizeBytes === 2048 && /Z$/.test(u.createdAt)));
+  await assert.rejects(store.createUpload({ ...fields, objectKey: 'objects/0' }), { code: 'duplicate_upload' });
+  assert.equal((await store.listUploads(scope)).length, 8);
+  const other = await workspace(store, owner.id, { slug: 'other' });
+  assert.equal((await store.listUploads({ ...scope, workspaceId: other.id })).length, 0);
+  await assert.rejects(pool.query('UPDATE uploads SET workspace_id = $1 WHERE id = $2', [other.id, uploads[0].id]), { code: '23503' });
+});
+
+withStore('parallel review submissions and decisions preserve one outcome', async (store) => {
+  const { owner, scope } = await dataProject(store);
+  const attempts = await Promise.allSettled(Array.from({ length: 6 }, () => store.submitForReview({ ...scope, submittedBy: owner.id })));
+  assert.equal(attempts.filter(r => r.status === 'fulfilled').length, 1);
+  assert.ok(attempts.filter(r => r.status === 'rejected').every(r => r.reason.code === 'invalid_state'));
+  const review = attempts.find(r => r.status === 'fulfilled').value;
+  const decisions = await Promise.allSettled(['approved', 'changes_requested'].map(decision => store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision, checks: { rights: true } })));
+  assert.equal(decisions.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(decisions.find(r => r.status === 'rejected').reason.code, 'already_decided');
+  const decided = decisions.find(r => r.status === 'fulfilled').value;
+  assert.equal((await store.getProject(scope)).status, decided.status);
+  assert.equal((await store.getReview(review.id)).status, decided.status);
+  assert.equal((await store.listProjectReviews(scope)).length, 1);
+});
+
+withStore('failed review operations roll back the review and project together', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_review CHECK (action NOT LIKE 'review.%')");
+  try {
+    await assert.rejects(store.submitForReview({ ...scope, submittedBy: owner.id }), { code: '23514' });
+    assert.equal((await store.getProject(scope)).status, 'draft');
+    assert.deepEqual(await store.listProjectReviews(scope), []);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_review'); }
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_decision CHECK (action <> 'review.approved')");
+  try {
+    await assert.rejects(store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' }), { code: '23514' });
+    assert.equal((await store.getProject(scope)).status, 'in_review');
+    assert.equal((await store.getReview(review.id)).status, 'pending');
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_decision'); }
+});
+
+withStore('dataset versions receive consecutive numbers under concurrency and roll back on failure', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' });
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_version CHECK (action <> 'dataset_version.created')");
+  try {
+    await assert.rejects(store.createDatasetVersion({ ...scope, createdBy: owner.id }), { code: '23514' });
+    assert.equal((await store.getProject(scope)).status, 'approved');
+    assert.deepEqual(await store.listDatasetVersions(scope), []);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_version'); }
+  // One approval yields exactly one version, however many requests race for it.
+  const results = await Promise.allSettled(Array.from({ length: 8 }, () => store.createDatasetVersion({ ...scope, createdBy: owner.id })));
+  const won = results.filter(r => r.status === 'fulfilled');
+  assert.equal(won.length, 1);
+  assert.ok(results.filter(r => r.status === 'rejected').every(r => r.reason.code === 'invalid_state'));
+  assert.equal(won[0].value.manifest.reviewId, review.id);
+  assert.deepEqual((await store.listDatasetVersions(scope)).map(v => v.number), [1]);
+  assert.equal((await store.getProject(scope)).status, 'versioned');
+});
+
+withStore('a held receipt racing submission is either in the reviewed snapshot or refused, never added after', async (store) => {
+  for (let round = 0; round < 6; round++) {
+    const { owner, scope } = await dataProject(store, `race${round}`);
+    const upload = store.createUpload({ ...scope, uploadedBy: owner.id, objectKey: `race-${round}`, sha256: 'c'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'late.png' });
+    const submit = store.submitForReview({ ...scope, submittedBy: owner.id });
+    const [u, r] = await Promise.allSettled([upload, submit]);
+    assert.equal(r.status, 'fulfilled');
+    const inSnapshot = r.value.snapshot.files.some(f => f.objectKey === `race-${round}`);
+    if (u.status === 'fulfilled') assert.ok(inSnapshot, 'a recorded upload must be in the snapshot');
+    else { assert.equal(u.reason.code, 'invalid_state'); assert.ok(!inSnapshot); }
+  }
+});
+
+withStore('reopening races versioning: either the version is made from the approved snapshot or the approval is void', async (store) => {
+  const { owner, scope } = await dataProject(store);
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' });
+  const [v, reopened] = await Promise.allSettled([store.createDatasetVersion({ ...scope, createdBy: owner.id }), store.reopenProject({ ...scope, actorId: owner.id })]);
+  assert.equal(reopened.status, 'fulfilled', 'reopen works from approved or versioned');
+  if (v.status === 'fulfilled') assert.deepEqual(v.value.manifest.files, review.snapshot.files);
+  else assert.equal(v.reason.code, 'invalid_state');
+  assert.equal((await store.getProject(scope)).status, 'draft');
+  await assert.rejects(store.createDatasetVersion({ ...scope, createdBy: owner.id }), { code: 'invalid_state' });
+});
+
+withStore('freeze triggers refuse direct SQL edits and file changes on frozen projects', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  await store.createUpload({ ...scope, uploadedBy: owner.id, objectKey: 'kept', sha256: 'd'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'kept.png' });
+  await store.submitForReview({ ...scope, submittedBy: owner.id });
+  await assert.rejects(pool.query(`UPDATE projects SET data_source = '{"mode":"license"}'::jsonb WHERE id = $1`, [scope.projectId]), /project_frozen/);
+  await assert.rejects(pool.query('DELETE FROM uploads WHERE project_id = $1', [scope.projectId]), /project_frozen/);
+  await assert.rejects(pool.query(`INSERT INTO uploads (workspace_id, project_id, uploaded_by, object_key, sha256, size_bytes, content_type, filename)
+    VALUES ($1, $2, $3, 'sneaky', $4, 1, 'image/png', 'x.png')`, [scope.workspaceId, scope.projectId, owner.id, 'e'.repeat(64)]), /project_frozen/);
+  // Lifecycle status changes and cascading deletes still work.
+  await pool.query("UPDATE projects SET setup_step = 'done' WHERE id = $1", [scope.projectId]);
+  await pool.query('DELETE FROM projects WHERE id = $1', [scope.projectId]);
+});
+
+withStore('account and dataset APIs complete a persisted review workflow', async (store) => {
+  const secret = 'local-api-integration-secret-at-least-32-characters';
+  // The outer fixture owns the pool; Fastify gets a non-owning store for this test.
+  // Commit/delete calls to services/ingest are stubbed; the Rust service has its own tests.
+  const app = await makeApp({ store: { ...store, close: async () => {} }, ingestClient: { commit: async (key) => key, remove: async () => {} }, env: {
+    INGEST_PUBLIC_URL: 'http://localhost:4100', INGEST_SHARED_SECRET: secret, STAFF_EMAILS: 'staff@example.test',
+  } });
+  const person = async (email) => {
+    let cookies = {};
+    const call = async (method, url, body) => {
+      const result = await app.inject({ method, url, cookies, headers: method === 'GET' ? {} : postHeaders, payload: body === undefined ? undefined : json(body) });
+      const cookie = result.cookies.find(c => c.name === 'valcairn.sid');
+      if (cookie) cookies = { 'valcairn.sid': cookie.value };
+      assert.equal(result.statusCode, 200, `${method} ${url}: ${result.body}`);
+      return result.json();
+    };
+    const created = await call('POST', '/api/account/signup', { email, name: email.split('@')[0], password: 'local-fixture-password' });
+    await call('POST', '/api/account/verify', { code: created.devCode });
+    return { call, id: created.user.id };
+  };
+  try {
+    const owner = await person('owner@acme-example.com');
+    const staff = await person('staff@example.test');
+    const { workspace: ws } = await owner.call('POST', '/api/workspaces', { name: 'Integration Workspace' });
+    const { project } = await owner.call('POST', `/api/workspaces/${ws.id}/projects`, { task: 'Classify sample documents', modalities: ['Documents'], startingPoint: 'own' });
+    const base = `/api/workspaces/${ws.id}/projects/${project.id}`;
+    await owner.call('POST', base, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'], personalData: 'no' } });
+    const receipt = signToken(secret, { v: 1, kind: 'receipt', ws: ws.id, project: project.id, by: owner.id, objectKey: 'api-integration/sample', sha256: 'c'.repeat(64), sizeBytes: 12, contentType: 'text/plain', filename: 'sample.txt', exp: Math.floor(Date.now() / 1000) + 60 });
+    await owner.call('POST', `${base}/uploads`, { receipt });
+    const { review } = await owner.call('POST', `${base}/submit`, {});
+    const detail = await staff.call('GET', `/api/staff/reviews/${review.id}`);
+    assert.equal(detail.project.name, project.name);
+    assert.equal(detail.uploads.length, 1);
+    await staff.call('POST', `/api/staff/reviews/${review.id}/decision`, { decision: 'approved', checks: { rights: true, consent: true, labels: true, duplicates: true, format: true } });
+    const { version } = await owner.call('POST', `${base}/dataset-versions`, {});
+    assert.equal(version.number, 1);
+    assert.equal(version.files, 1);
+    assert.equal((await store.getProject({ workspaceId: ws.id, projectId: project.id })).status, 'versioned');
+    assert.equal((await store.listDatasetVersions({ workspaceId: ws.id, projectId: project.id }))[0].manifest.files[0].sha256, 'c'.repeat(64));
+  } finally { await app.close(); }
+});
+
+withStore('receipt replays at quota or during submission never delete registered object bytes', async (store) => {
+  const { hashPassword } = await import('../src/lib/passwords.js');
+  const password = 'local-receipt-regression-password';
+  const owner = await store.createUser({ email: 'receipt@replay.test', name: 'Owner', passwordHash: await hashPassword(password, { cost: 2 ** 12 }) });
+  await store.setEmailVerified(owner.id);
+  const ws = await workspace(store, owner.id);
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Receipt replay', task: 'Classify', startingPoint: 'own' });
+  const scope = { workspaceId: ws.id, projectId: project.id };
+  const key = 'ws/receipt/project/uploads/original';
+  const objects = new Set([key]);
+  let submitDuringCommit = false;
+  const secret = 'local-receipt-test-secret-at-least-32-characters';
+  const app = await makeApp({ store: { ...store, close: async () => {} }, env: {
+    INGEST_PUBLIC_URL: 'http://localhost:4100', INGEST_SHARED_SECRET: secret, PROJECT_MAX_FILES: '1',
+  }, ingestClient: {
+    async commit() {
+      if (submitDuringCommit) {
+        submitDuringCommit = false;
+        await store.submitForReview({ ...scope, submittedBy: owner.id });
+      }
+      return key;
+    },
+    async remove(objectKey) { objects.delete(objectKey); },
+  } });
+  try {
+    const login = await app.inject({ method: 'POST', url: '/api/account/signin', headers: postHeaders, payload: json({ email: owner.email, password }) });
+    assert.equal(login.statusCode, 200);
+    const cookies = { 'valcairn.sid': login.cookies.find(c => c.name === 'valcairn.sid').value };
+    const receipt = signToken(secret, { kind: 'receipt', ws: ws.id, project: project.id, by: owner.id, objectKey: 'pending/original', sha256: 'a'.repeat(64), sizeBytes: 12, contentType: 'text/plain', filename: 'sample.txt', exp: Math.floor(Date.now() / 1000) + 60 });
+    const postReceipt = () => app.inject({ method: 'POST', url: `/api/workspaces/${ws.id}/projects/${project.id}/uploads`, headers: postHeaders, cookies, payload: json({ receipt }) });
+    assert.equal((await postReceipt()).statusCode, 200);
+    const replay = await postReceipt();
+    assert.equal(replay.statusCode, 409);
+    assert.equal(replay.json().code, 'quota_exceeded');
+    assert.equal(objects.has(key), true);
+    submitDuringCommit = true;
+    assert.equal((await postReceipt()).statusCode, 409);
+    assert.equal(objects.has(key), true);
+    assert.equal((await store.listUploads(scope)).length, 1);
+    assert.equal((await store.listProjectReviews(scope))[0].snapshot.files[0].objectKey, key);
+  } finally { await app.close(); }
+});
+
+withStore('a member cannot reopen approval after a stale route permission check', async (store) => {
+  const { hashPassword } = await import('../src/lib/passwords.js');
+  const password = 'local-reopen-regression-password';
+  const owner = await user(store);
+  const member = await store.createUser({ email: 'member@reopen.test', name: 'Member', passwordHash: await hashPassword(password, { cost: 2 ** 12 }) });
+  await store.setEmailVerified(member.id);
+  const ws = await workspace(store, owner.id);
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: member.email, role: 'member', tokenHash: 'reopen-race', expiresAt: new Date(Date.now() + 60_000) }] });
+  await store.acceptInvitation({ invitationId: (await store.getInvitationByTokenHash('reopen-race')).id, userId: member.id });
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Reopen race', task: 'Classify', startingPoint: 'own' });
+  const scope = { workspaceId: ws.id, projectId: project.id };
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  let approveAfterRead = false;
+  const app = await makeApp({ store: { ...store, close: async () => {}, async getProject(where) {
+    const read = await store.getProject(where);
+    if (approveAfterRead && read?.status === 'in_review') {
+      approveAfterRead = false;
+      await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' });
+    }
+    return read;
+  } } });
+  try {
+    const login = await app.inject({ method: 'POST', url: '/api/account/signin', headers: postHeaders, payload: json({ email: member.email, password }) });
+    assert.equal(login.statusCode, 200);
+    approveAfterRead = true;
+    const result = await app.inject({ method: 'POST', url: `/api/workspaces/${ws.id}/projects/${project.id}/reopen`, headers: postHeaders, cookies: { 'valcairn.sid': login.cookies.find(c => c.name === 'valcairn.sid').value }, payload: '{}' });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.json().code, 'forbidden');
+    assert.equal((await store.getProject(scope)).status, 'approved');
+    assert.equal((await store.getReview(review.id)).status, 'approved');
+    assert.equal((await store.listAudit(ws.id)).some(event => event.action === 'project.reopened'), false);
+    await store.reopenProject({ ...scope, actorId: owner.id });
+    await store.submitForReview({ ...scope, submittedBy: owner.id });
+    assert.equal((await store.reopenProject({ ...scope, actorId: member.id })).status, 'draft');
+  } finally { await app.close(); }
+});
+
+withStore('migrations are repeatable, detect edits and roll back a failed file', async (_store, pool) => {
+  assert.deepEqual(await applyMigrations({ pool }), []);
+  const directory = await mkdtemp(join(tmpdir(), 'valcairn-migrations-'));
+  const edited = join(directory, '001_init.sql');
+  const failing = join(directory, '999_fail.sql');
+  try {
+    await writeFile(edited, 'SELECT 1;');
+    await assert.rejects(applyMigrations({ pool, directory }), /has changed/);
+    await unlink(edited);
+    await writeFile(failing, 'CREATE TABLE migration_atomic_probe (id integer); SELECT missing_migration_function();');
+    await assert.rejects(applyMigrations({ pool, directory }));
+    assert.equal((await pool.query("SELECT to_regclass('migration_atomic_probe') AS name")).rows[0].name, null);
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM schema_migrations WHERE filename = $1', ['999_fail.sql'])).rows[0].count, 0);
+  } finally {
+    await unlink(edited).catch(() => {});
+    await unlink(failing).catch(() => {});
+    await rmdir(directory);
+  }
+});
+
+const call = (store, method, ...args) => new Promise((resolve, reject) => {
+  store[method](...args, (error, result) => error ? reject(error) : resolve(result));
+});
+
+test('postgres connection policy cannot be downgraded by URL SSL parameters', async () => {
+  for (const [mode, expected] of [['disable', false], ['require', { rejectUnauthorized: false }], ['verify-full', { rejectUnauthorized: true }]]) {
+    const pool = createPostgresPool({ connectionString: 'postgresql://local@127.0.0.1/test?sslmode=disable&options=-csearch_path%3Dpublic', ssl: mode });
+    try {
+      assert.deepEqual(pool.options.ssl, expected);
+      const url = new URL(pool.options.connectionString);
+      assert.equal(url.searchParams.has('sslmode'), false);
+      assert.equal(url.searchParams.get('options'), '-csearch_path=public');
+    } finally { await pool.end(); }
+  }
+  assert.throws(() => createPostgresPool({ connectionString: 'not-a-url' }), /Invalid Postgres connection string/);
+  assert.throws(() => createPostgresPool({ connectionString: 'postgresql://localhost/test', ssl: 'allow' }), /Invalid Postgres SSL mode/);
+});
+
+test('test database safety rejects destination overrides and application aliases', () => {
+  const local = 'postgresql://local@127.0.0.1:5432/valcairn_test';
+  assert.doesNotThrow(() => validateTestDatabase(local));
+  for (const query of ['host=production.internal', 'port=5544', 'dbname=production', 'options=-csearch_path%3Dpublic']) {
+    assert.throws(() => validateTestDatabase(`${local}?${query}`), /without query parameters/);
+    assert.throws(() => validateTestDatabase(local, `${local}?${query}`), /without query parameters/);
+  }
+  assert.throws(() => validateTestDatabase(local, 'postgresql://other@localhost:5432/valcairn_test'), /must not target/);
+  assert.throws(() => validateTestDatabase(local, 'postgresql://other@LOCALHOST:5432/valcairn_test'), /must not target/);
+  assert.throws(() => validateTestDatabase(local, 'postgresql://other@%6cocalhost:5432/valcairn_test'), /must not target/);
+  assert.throws(() => validateTestDatabase(local.replace('valcairn_test', 'valcairn%5Ftest'), local), /must not target/);
+  assert.throws(() => validateTestDatabase(local, local.replace('valcairn_test', 'valcairn%5Ftest')), /must not target/);
+  assert.throws(() => validateTestDatabase('postgresql://local@localhost/valcairn_test'), /explicit-host and port/);
+  assert.throws(() => validateTestDatabase('postgresql:///valcairn_test'), /explicit-host/);
+  assert.throws(() => validateTestDatabase('postgresql://local@localhost:5432/production'), /dedicated test/);
+});
+
+withStore('SQL-like input stays data and conflict errors do not expose rows', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const name = "x'); DROP TABLE users; --";
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name, task: 'test', startingPoint: 'own' });
+  assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).name, name);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM users')).rows[0].count, 1);
+  await assert.rejects(store.createUser({ email: 'OWNER@EXAMPLE.TEST', name: 'duplicate', passwordHash: 'must-not-leak' }), error => {
+    assert.equal(error.code, 'email_taken');
+    assert.equal(error.detail, undefined);
+    assert.equal(error.message.includes('must-not-leak'), false);
+    return true;
+  });
+});
+
+withStore('session data persists across pools, expires and prunes', async (_store, pool) => {
+  const first = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  const second = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  try {
+    const data = { user: { id: 'test-user' }, cookie: { expires: new Date(Date.now() + 60_000) } };
+    await call(first, 'set', 'persisted', data);
+    await first.close();
+    assert.equal((await call(second, 'get', 'persisted')).user.id, 'test-user');
+    await call(second, 'set', 'expired', { cookie: { expires: new Date(Date.now() - 1_000) } });
+    assert.equal(await call(second, 'get', 'expired'), null);
+    assert.equal(await second.pruneExpired(), 1);
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM sessions WHERE sid = $1', ['expired'])).rows[0].count, 0);
+    await call(second, 'destroy', 'persisted');
+    assert.equal(await call(second, 'get', 'persisted'), null);
+  } finally { await second.close(); }
+});
+
+withStore('session compare-and-set rejects stale generations and destroyed sessions', async () => {
+  const store = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  try {
+    const data = { cookie: { maxAge: 60_000 }, __fastifySessionMetadata: { generation: 'first' } };
+    await call(store, 'set', 'session', data);
+    await call(store, 'compareAndSet', 'session', 'first', { ...data, __fastifySessionMetadata: { generation: 'second' } });
+    await assert.rejects(call(store, 'compareAndSet', 'session', 'first', data), { code: 'ENOENT' });
+    await call(store, 'destroy', 'session');
+    await assert.rejects(call(store, 'compareAndSet', 'session', 'second', data), { code: 'ENOENT' });
+  } finally { await store.close(); }
+});
+
+withStore('session store works with the installed Fastify plugin', async () => {
+  const store = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  const app = Fastify();
+  try {
+    await app.register(cookie);
+    await app.register(session, { secret: 'a-test-secret-with-at-least-32-characters', store, cookie: { secure: false, maxAge: 60_000 } });
+    app.get('/count', async request => { request.session.set('count', (request.session.get('count') ?? 0) + 1); return { count: request.session.get('count') }; });
+    app.post('/rotate', async request => { await request.session.regenerate(); return { ok: true }; });
+    app.post('/logout', async request => { await request.session.destroy(); return { ok: true }; });
+    const first = await app.inject('/count');
+    assert.equal(first.statusCode, 200);
+    const cookieHeader = first.headers['set-cookie'].split(';')[0];
+    const second = await app.inject({ url: '/count', headers: { cookie: cookieHeader } });
+    assert.deepEqual(second.json(), { count: 2 });
+    const rotated = await app.inject({ method: 'POST', url: '/rotate', headers: { cookie: cookieHeader } });
+    assert.equal(rotated.statusCode, 200);
+    const rotatedCookie = rotated.headers['set-cookie'].split(';')[0];
+    assert.equal((await app.inject({ method: 'POST', url: '/logout', headers: { cookie: rotatedCookie } })).statusCode, 200);
+  } finally { await app.close(); await store.close(); }
+});
+
+withStore('reviewers sign in from Postgres; disabling or demoting applies to existing sessions; YC cannot read the admin log', async (store) => {
+  const { hashPassword } = await import('../src/lib/passwords.js');
+  const hash = (pw) => hashPassword(pw, { cost: 2 ** 12 });
+  await store.upsertReviewer({ username: 'ycinsider', name: 'YC reviewer', role: 'viewer', passwordHash: await hash('yc-password-12345') });
+  await store.upsertReviewer({ username: 'sr008-reviewer', name: 'Speedrun reviewer', role: 'viewer', passwordHash: await hash('sr-password-12345') });
+  await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'admin', passwordHash: await hash('admin-password-123') });
+  const app = await makeApp({ store: { ...store, close: async () => {} } });
+  const login = (username, password) => app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ username, password }) });
+  const cookieOf = (res) => ({ 'valcairn.sid': res.cookies.find((c) => c.name === 'valcairn.sid').value });
+  try {
+    assert.equal((await app.inject({ method: 'GET', url: '/api/config' })).json().signInConfigured, true);
+    const yc = await login('YCInsider', 'yc-password-12345');
+    const sr = await login('sr008-reviewer', 'sr-password-12345');
+    const admin = await login('admin', 'admin-password-123');
+    assert.deepEqual([yc.statusCode, sr.statusCode, admin.statusCode], [200, 200, 200]);
+    assert.equal((await login('ycinsider', 'wrong-password-x')).statusCode, 401);
+    // Customer accounts are separate: a reviewer name is not a customer login and vice versa.
+    assert.equal((await app.inject({ method: 'POST', url: '/api/account/signin', headers: postHeaders, payload: json({ email: 'ycinsider', password: 'yc-password-12345' }) })).statusCode, 401);
+
+    const signins = (res) => app.inject({ method: 'GET', url: '/api/admin/signins', cookies: cookieOf(res) });
+    assert.equal((await signins(yc)).statusCode, 403);
+    assert.equal((await signins(sr)).statusCode, 403);
+    assert.equal((await signins(admin)).statusCode, 200);
+    assert.equal((await app.inject({ method: 'GET', url: '/demo/review', cookies: cookieOf(sr) })).statusCode, 200);
+    // Reviewers have no workspace memberships, so no customer data.
+    assert.equal((await app.inject({ method: 'GET', url: '/api/account', cookies: cookieOf(yc) })).json().user, null);
+
+    // Demote admin: the existing session loses the log at once. Disable Speedrun: its session ends.
+    await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'viewer' });
+    assert.equal((await signins(admin)).statusCode, 403);
+    await store.setReviewerEnabled({ username: 'sr008-reviewer', enabled: false });
+    assert.equal((await app.inject({ method: 'GET', url: '/demo/review', cookies: cookieOf(sr) })).statusCode, 303);
+    assert.equal((await app.inject({ method: 'GET', url: '/api/session', cookies: cookieOf(sr) })).json().reviewer, null);
+    assert.equal((await login('sr008-reviewer', 'sr-password-12345')).statusCode, 401);
+    assert.equal((await app.inject({ method: 'GET', url: '/demo/review', cookies: cookieOf(yc) })).statusCode, 200, 'YC unaffected');
+  } finally { await app.close(); }
+});
+
+withStore('sessions, accounts and onboarding progress survive a server restart with Postgres sessions', async (store) => {
+  const sessionStore = () => createPgSessionStore({ ...options, ttlMs: 60_000, pruneIntervalMs: 0 });
+  const start = () => makeApp({ store: { ...store, close: async () => {} }, sessionStore: sessionStore() });
+  let app = await start();
+  const post = (url, body, cookies) => app.inject({ method: 'POST', url, headers: postHeaders, cookies, payload: json(body) });
+  const signup = await post('/api/account/signup', { name: 'Ada', email: 'ada@acme-robotics.com', password: 'long-enough-password' });
+  const cookies = { 'valcairn.sid': signup.cookies.find((c) => c.name === 'valcairn.sid').value };
+  await post('/api/account/verify', { code: signup.json().devCode }, cookies);
+  const ws = (await post('/api/workspaces', { name: 'Acme Robotics' }, cookies)).json().workspace;
+  const project = (await post(`/api/workspaces/${ws.id}/projects`, { task: 'Flag damaged boxes on line 2.', modalities: ['Images'], startingPoint: 'own' }, cookies)).json().project;
+  await post(`/api/workspaces/${ws.id}/projects/${project.id}`, { success: { measure: 'recall', target: '95%' } }, cookies);
+  await app.close();
+
+  app = await start();
+  try {
+    const account = (await app.inject({ method: 'GET', url: '/api/account', cookies })).json();
+    assert.equal(account.user.email, 'ada@acme-robotics.com', 'still signed in after restart');
+    const saved = (await app.inject({ method: 'GET', url: `/api/workspaces/${ws.id}/projects/${project.id}`, cookies })).json().project;
+    assert.equal(saved.success.target, '95%');
+    assert.equal(saved.setupStep, 'data');
+    // Sign-out removes the stored session, so the old cookie stops working.
+    await app.inject({ method: 'POST', url: '/api/account/signout', headers: postHeaders, cookies, payload: '{}' });
+    assert.equal((await app.inject({ method: 'GET', url: '/api/account', cookies })).json().user, null);
+  } finally { await app.close(); }
+});

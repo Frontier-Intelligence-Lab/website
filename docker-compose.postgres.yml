@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: valcairn
+      POSTGRES_PASSWORD: valcairn_local_only
+      POSTGRES_DB: valcairn
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - valcairn_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valcairn -d valcairn"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  valcairn_postgres_data:

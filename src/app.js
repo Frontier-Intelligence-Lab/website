@@ -8,9 +8,14 @@ import fastifyStatic from '@fastify/static';
 import fastifyHelmet from '@fastify/helmet';
 import fastifyRateLimit from '@fastify/rate-limit';
 import { LIMITS, createDelivery, validateContact } from './lib/contact.js';
-import { authenticateReviewer, normalizeUsername } from './lib/reviewers.js';
+import { normalizeUsername } from './lib/reviewers.js';
+import { createReviewerSource } from './lib/reviewer-source.js';
+import { createPgSessionStore } from './store/pg-session-store.js';
 import { createSigninLog } from './lib/signins.js';
 import { isSameOriginRequest } from './lib/origin.js';
+import { createStore } from './store/index.js';
+import { registerAccountRoutes } from './accounts.js';
+import { registerDatasetRoutes } from './datasets.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -19,7 +24,10 @@ export const ROOT_FILES = ['favicon.svg', 'fonts/LICENSE-Inter-OFL.txt'];
 const BUILD_DIRS = /^\/(assets|private)\//;
 const SAFE_SUBPATH = /^(?!.*\.\.)[\w./-]+$/;
 
-export async function buildApp({ config, logger = false, contactTransport, rateLimits = {}, distDir = DEFAULT_DIST }) {
+// Onboarding pages; the React app renders them and the API enforces sign-in and membership.
+const ACCOUNT_PAGES = ['/signup', '/signin', '/verify', '/start', '/setup/*', '/w/*', '/invite/*', '/staff', '/staff/*'];
+
+export async function buildApp({ config, logger = false, contactTransport, mailTransport, ingestClient, store, sessionStore, rateLimits = {}, distDir = DEFAULT_DIST }) {
   let indexHtml;
   try {
     indexHtml = readFileSync(path.join(distDir, 'index.html'), 'utf8');
@@ -30,6 +38,15 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
   const app = Fastify({ logger, trustProxy: config.trustProxy, bodyLimit: 32 * 1024 });
   const delivery = createDelivery(config.smtp, contactTransport);
   const signins = await createSigninLog(config.signinLogFile, app.log);
+  const accountStore = store === undefined ? await createStore(config, app.log) : store;
+  if (accountStore) app.addHook('onClose', () => accountStore.close());
+  // With a database, sessions survive restarts and can be shared by several instances.
+  const sessions = sessionStore ?? (config.databaseUrl
+    ? createPgSessionStore({ connectionString: config.databaseUrl, ssl: config.databaseSsl, logger: app.log, ttlMs: config.sessionTtlMs })
+    : undefined);
+  if (sessions?.close) app.addHook('onClose', () => sessions.close());
+  const reviewers = createReviewerSource({ store: accountStore, fileReviewers: config.reviewers });
+  if (reviewers.source === 'postgres' && config.reviewers.length) app.log.warn('REVIEWERS_FILE/REVIEWERS_JSON is ignored: reviewer accounts are read from Postgres');
   // Keeps a private, no-store header set by the route; public pages revalidate so new builds are picked up.
   const page = (reply, status = 200) => {
     if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-cache');
@@ -46,7 +63,8 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
         'style-src': ["'self'"],
         'img-src': ["'self'"],
         'font-src': ["'self'"],
-        'connect-src': ["'self'"],
+        // Sample uploads go straight to the ingest service, so the browser may also connect to it.
+        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'form-action': ["'self'"],
         'base-uri': ["'self'"],
         'frame-ancestors': ["'none'"],
@@ -64,13 +82,28 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
     cookieName: 'valcairn.sid',
     saveUninitialized: false,
     cookie: { path: '/', httpOnly: true, secure: config.cookieSecure, sameSite: 'lax', maxAge: config.sessionTtlMs },
+    ...(sessions ? { store: sessions } : {}),
   });
 
   // CSRF guard for every state-changing route.
   const sameOrigin = async (request, reply) => {
     if (!isSameOriginRequest(request, config.publicOrigin)) return problem(reply, 403, 'This request did not come from this site.');
   };
-  const reviewerOf = (request) => request.session.get('reviewer') ?? null;
+  // The signed-in reviewer, re-checked against the account on every request: a disabled account is signed out
+  // and a changed role applies immediately. Memoized per request.
+  const reviewerOf = async (request) => {
+    if (request.reviewerChecked) return request.reviewer;
+    request.reviewerChecked = true;
+    const stored = request.session.get('reviewer') ?? null;
+    if (!stored) return (request.reviewer = null);
+    const current = await reviewers.current(stored);
+    if (!current) {
+      request.session.set('reviewer', undefined);
+      return (request.reviewer = null);
+    }
+    if (current.role !== stored.role || current.name !== stored.name) request.session.set('reviewer', current);
+    return (request.reviewer = current);
+  };
   const privateHeaders = (reply) => reply.header('cache-control', 'private, no-store').header('x-robots-tag', 'noindex');
   const sendBuildFile = (dir, cache) => async (request, reply) => {
     const subpath = request.params['*'];
@@ -86,7 +119,7 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
   app.get('/private/*', {
     preHandler: async (request, reply) => {
       privateHeaders(reply);
-      if (!reviewerOf(request)) return problem(reply, 401, 'Sign in to load this file.');
+      if (!(await reviewerOf(request))) return problem(reply, 401, 'Sign in to load this file.');
     },
   }, sendBuildFile('private', { cacheControl: false }));
   for (const file of ROOT_FILES) app.get(`/${file}`, async (_request, reply) => reply.sendFile(file, { maxAge: '1d' }));
@@ -96,19 +129,30 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
   app.get('/contact', async (_request, reply) => page(reply));
   app.get('/demo', async (request, reply) => {
     privateHeaders(reply);
-    return reviewerOf(request) ? reply.redirect('/demo/review', 303) : page(reply);
+    return (await reviewerOf(request)) ? reply.redirect('/demo/review', 303) : page(reply);
   });
   app.get('/demo/review', async (request, reply) => {
     privateHeaders(reply);
-    return reviewerOf(request) ? page(reply) : reply.redirect('/demo', 303);
+    return (await reviewerOf(request)) ? page(reply) : reply.redirect('/demo', 303);
   });
 
-  const signInConfigured = config.reviewers.length > 0;
+  for (const url of ACCOUNT_PAGES) {
+    app.get(url, async (_request, reply) => {
+      privateHeaders(reply);
+      return page(reply);
+    });
+  }
+  const helpers = { sameOrigin, privateHeaders, problem };
+  const { guards } = await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers });
+  registerDatasetRoutes(app, { config, store: accountStore, helpers, guards, ingestClient });
+
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,
     contactEmail: config.contactPublicEmail,
     contactConfigured: delivery.configured,
-    signInConfigured,
+    signInConfigured: await reviewers.configured(),
+    accountsAvailable: Boolean(accountStore),
+    signupOpen: Boolean(accountStore) && config.accountSignup,
     limits: LIMITS,
   }));
 
@@ -130,7 +174,7 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
 
   app.get('/api/session', async (request, reply) => {
     privateHeaders(reply);
-    return { reviewer: reviewerOf(request) };
+    return { reviewer: await reviewerOf(request) };
   });
   app.post('/api/login', {
     preHandler: sameOrigin,
@@ -139,10 +183,9 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
     privateHeaders(reply);
     const username = typeof request.body?.username === 'string' ? request.body.username.slice(0, 64) : '';
     const password = typeof request.body?.password === 'string' ? request.body.password.slice(0, 256) : '';
-    if (!signInConfigured) return problem(reply, 503, 'Reviewer access is not configured, so sign-in is unavailable.');
-    const reviewer = await authenticateReviewer(config.reviewers, username, password);
+    if (!(await reviewers.configured())) return problem(reply, 503, 'Reviewer access is not configured, so sign-in is unavailable.');
+    const { reviewer, known } = await reviewers.authenticate(username, password);
     if (!reviewer) {
-      const known = config.reviewers.some((r) => r.username === normalizeUsername(username));
       await signins.record({ event: 'failed', username: known ? normalizeUsername(username) : null });
       return problem(reply, 401, 'That username and password did not match an authorized account.');
     }
@@ -153,7 +196,7 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
     return { reviewer: request.session.get('reviewer') };
   });
   app.post('/api/logout', { preHandler: sameOrigin }, async (request) => {
-    const reviewer = reviewerOf(request);
+    const reviewer = request.session.get('reviewer') ?? null;
     await request.session.destroy();
     if (reviewer) await signins.record({ event: 'signout', username: reviewer.username });
     return { ok: true };
@@ -162,7 +205,7 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
   // Sign-in history for admin accounts only.
   app.get('/api/admin/signins', async (request, reply) => {
     privateHeaders(reply);
-    const reviewer = reviewerOf(request);
+    const reviewer = await reviewerOf(request);
     if (!reviewer) return problem(reply, 401, 'Sign in first.');
     if (reviewer.role !== 'admin') return problem(reply, 403, 'Only admin accounts can view the sign-in log.');
     return { events: signins.recent() };

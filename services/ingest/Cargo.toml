@@ -1,0 +1,37 @@
+[package]
+name = "valcairn-ingest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Receives untrusted sample uploads for Valcairn: streams them to object storage, enforces limits, hashes and type-checks them, and returns signed receipts."
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+infer = "0.19"
+object_store = { version = "0.12", features = ["aws"] }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "fs"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+http-body-util = "0.1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

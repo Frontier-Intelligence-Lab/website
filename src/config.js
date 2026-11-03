@@ -64,6 +64,24 @@ export function loadConfig(env = process.env) {
     throw new Error('CONTACT_DELIVERY=smtp requires SMTP_HOST, SMTP_PORT and CONTACT_FROM (or SMTP_USER)');
   }
 
+  const databaseUrl = env.DATABASE_URL || null;
+  const databaseSsl = env.DATABASE_SSL || (isProd ? 'require' : 'disable');
+  if (!['disable', 'require', 'verify-full'].includes(databaseSsl)) {
+    throw new Error('DATABASE_SSL must be "disable", "require" or "verify-full"');
+  }
+  if (isProd && databaseUrl && databaseSsl === 'disable') {
+    throw new Error('DATABASE_SSL=disable is not allowed in production');
+  }
+
+  // Sample uploads go to services/ingest. Both values are needed; otherwise uploads stay off.
+  const ingestPublicUrl = env.INGEST_PUBLIC_URL ? String(env.INGEST_PUBLIC_URL).replace(/\/+$/, '') : null;
+  const ingestSharedSecret = env.INGEST_SHARED_SECRET || null;
+  if (ingestPublicUrl && !/^https?:\/\/[^/]+$/.test(ingestPublicUrl)) throw new Error('INGEST_PUBLIC_URL must be an origin such as https://ingest.example.com');
+  if (isProd && ingestPublicUrl && !ingestPublicUrl.startsWith('https://')) throw new Error('INGEST_PUBLIC_URL must use https in production');
+  if (ingestSharedSecret && ingestSharedSecret.length < 32) throw new Error('INGEST_SHARED_SECRET must be at least 32 characters');
+  // Valcairn staff who may use the internal review queue; each must also confirm their email.
+  const staffEmails = String(env.STAFF_EMAILS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
   let reviewers = [];
   if (env.REVIEWERS_FILE) reviewers = parseReviewers(readFileSync(env.REVIEWERS_FILE, 'utf8'));
   else if (env.REVIEWERS_JSON) reviewers = parseReviewers(env.REVIEWERS_JSON);
@@ -84,5 +102,19 @@ export function loadConfig(env = process.env) {
     bookingUrl: env.BOOKING_URL ?? 'https://cal.com/ayushozha/15-min-getting-to-know',
     reviewers,
     signinLogFile: env.SIGNIN_LOG_FILE || null,
+    databaseUrl,
+    databaseSsl,
+    // Self-serve accounts and onboarding. Off in production unless explicitly enabled.
+    accountSignup: truthy(env.ACCOUNT_SIGNUP, !isProd),
+    ingest: ingestPublicUrl && ingestSharedSecret ? {
+      publicUrl: ingestPublicUrl,
+      // Server-to-server address for commit/delete; defaults to the public one.
+      internalUrl: (env.INGEST_INTERNAL_URL || ingestPublicUrl).replace(/\/+$/, ''),
+      secret: ingestSharedSecret,
+      maxBytes: Number(env.INGEST_MAX_BYTES ?? 200 * 1024 * 1024),
+      projectMaxFiles: Number(env.PROJECT_MAX_FILES ?? 2000),
+      projectMaxBytes: Number(env.PROJECT_MAX_BYTES ?? 20 * 1024 ** 3),
+    } : null,
+    staffEmails,
   };
 }
