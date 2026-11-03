@@ -340,6 +340,86 @@ withStore('account and dataset APIs complete a persisted review workflow', async
   } finally { await app.close(); }
 });
 
+withStore('receipt replays at quota or during submission never delete registered object bytes', async (store) => {
+  const { hashPassword } = await import('../src/lib/passwords.js');
+  const password = 'local-receipt-regression-password';
+  const owner = await store.createUser({ email: 'receipt@replay.test', name: 'Owner', passwordHash: await hashPassword(password, { cost: 2 ** 12 }) });
+  await store.setEmailVerified(owner.id);
+  const ws = await workspace(store, owner.id);
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Receipt replay', task: 'Classify', startingPoint: 'own' });
+  const scope = { workspaceId: ws.id, projectId: project.id };
+  const key = 'ws/receipt/project/uploads/original';
+  const objects = new Set([key]);
+  let submitDuringCommit = false;
+  const secret = 'local-receipt-test-secret-at-least-32-characters';
+  const app = await makeApp({ store: { ...store, close: async () => {} }, env: {
+    INGEST_PUBLIC_URL: 'http://localhost:4100', INGEST_SHARED_SECRET: secret, PROJECT_MAX_FILES: '1',
+  }, ingestClient: {
+    async commit() {
+      if (submitDuringCommit) {
+        submitDuringCommit = false;
+        await store.submitForReview({ ...scope, submittedBy: owner.id });
+      }
+      return key;
+    },
+    async remove(objectKey) { objects.delete(objectKey); },
+  } });
+  try {
+    const login = await app.inject({ method: 'POST', url: '/api/account/signin', headers: postHeaders, payload: json({ email: owner.email, password }) });
+    assert.equal(login.statusCode, 200);
+    const cookies = { 'valcairn.sid': login.cookies.find(c => c.name === 'valcairn.sid').value };
+    const receipt = signToken(secret, { kind: 'receipt', ws: ws.id, project: project.id, by: owner.id, objectKey: 'pending/original', sha256: 'a'.repeat(64), sizeBytes: 12, contentType: 'text/plain', filename: 'sample.txt', exp: Math.floor(Date.now() / 1000) + 60 });
+    const postReceipt = () => app.inject({ method: 'POST', url: `/api/workspaces/${ws.id}/projects/${project.id}/uploads`, headers: postHeaders, cookies, payload: json({ receipt }) });
+    assert.equal((await postReceipt()).statusCode, 200);
+    const replay = await postReceipt();
+    assert.equal(replay.statusCode, 409);
+    assert.equal(replay.json().code, 'quota_exceeded');
+    assert.equal(objects.has(key), true);
+    submitDuringCommit = true;
+    assert.equal((await postReceipt()).statusCode, 409);
+    assert.equal(objects.has(key), true);
+    assert.equal((await store.listUploads(scope)).length, 1);
+    assert.equal((await store.listProjectReviews(scope))[0].snapshot.files[0].objectKey, key);
+  } finally { await app.close(); }
+});
+
+withStore('a member cannot reopen approval after a stale route permission check', async (store) => {
+  const { hashPassword } = await import('../src/lib/passwords.js');
+  const password = 'local-reopen-regression-password';
+  const owner = await user(store);
+  const member = await store.createUser({ email: 'member@reopen.test', name: 'Member', passwordHash: await hashPassword(password, { cost: 2 ** 12 }) });
+  await store.setEmailVerified(member.id);
+  const ws = await workspace(store, owner.id);
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: member.email, role: 'member', tokenHash: 'reopen-race', expiresAt: new Date(Date.now() + 60_000) }] });
+  await store.acceptInvitation({ invitationId: (await store.getInvitationByTokenHash('reopen-race')).id, userId: member.id });
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Reopen race', task: 'Classify', startingPoint: 'own' });
+  const scope = { workspaceId: ws.id, projectId: project.id };
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  let approveAfterRead = false;
+  const app = await makeApp({ store: { ...store, close: async () => {}, async getProject(where) {
+    const read = await store.getProject(where);
+    if (approveAfterRead && read?.status === 'in_review') {
+      approveAfterRead = false;
+      await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' });
+    }
+    return read;
+  } } });
+  try {
+    const login = await app.inject({ method: 'POST', url: '/api/account/signin', headers: postHeaders, payload: json({ email: member.email, password }) });
+    assert.equal(login.statusCode, 200);
+    approveAfterRead = true;
+    const result = await app.inject({ method: 'POST', url: `/api/workspaces/${ws.id}/projects/${project.id}/reopen`, headers: postHeaders, cookies: { 'valcairn.sid': login.cookies.find(c => c.name === 'valcairn.sid').value }, payload: '{}' });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.json().code, 'forbidden');
+    assert.equal((await store.getProject(scope)).status, 'approved');
+    assert.equal((await store.getReview(review.id)).status, 'approved');
+    assert.equal((await store.listAudit(ws.id)).some(event => event.action === 'project.reopened'), false);
+    await store.reopenProject({ ...scope, actorId: owner.id });
+    await store.submitForReview({ ...scope, submittedBy: owner.id });
+    assert.equal((await store.reopenProject({ ...scope, actorId: member.id })).status, 'draft');
+  } finally { await app.close(); }
+});
+
 withStore('migrations are repeatable, detect edits and roll back a failed file', async (_store, pool) => {
   assert.deepEqual(await applyMigrations({ pool }), []);
   const directory = await mkdtemp(join(tmpdir(), 'valcairn-migrations-'));

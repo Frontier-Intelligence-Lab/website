@@ -431,6 +431,10 @@ export function createPostgresStore(options) {
       return transaction(async (client) => {
         const project = await lockProject(client, workspaceId, projectId);
         if (!['in_review', 'approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+        if (!isId(actorId)) throw new StoreError('forbidden');
+        const membership = (await query('SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2 FOR SHARE', [workspaceId, actorId], client)).rows[0];
+        const role = membership?.role;
+        if (!['owner', 'admin'].includes(role) && !(role === 'member' && project.status === 'in_review')) throw new StoreError('forbidden');
         await query("UPDATE reviews SET status = 'withdrawn', decided_at = clock_timestamp() WHERE project_id = $1 AND status = 'pending'", [projectId], client);
         const row = (await query("UPDATE projects SET status = 'draft', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 RETURNING *", [workspaceId, projectId], client)).rows[0];
         await addAudit(client, { workspaceId, actorId, action: 'project.reopened', targetType: 'project', targetId: projectId, metadata: { from: project.status } });

@@ -13,7 +13,7 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 ## Rules for every implementation
 
 - Every method is `async` and returns plain objects with camelCase keys. Timestamps are ISO 8601 strings in UTC. `null` means not found.
-- Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`, `quota_exceeded`.
+- Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`, `quota_exceeded`, `forbidden`.
 - **Approval integrity.** A project's review-relevant content is editable only while its status is `draft` or `changes_requested`. That content is `name, task, modalities, startingPoint, success, dataSource, model` and its uploads. In `in_review`, `approved` and `versioned`, every write to it (`updateProject` content fields, `createUpload`, `deleteUpload`) throws `invalid_state`. The check and the write must be atomic: one conditional statement, or a check under the project row lock that submission also takes. Postgres additionally enforces this with triggers (`migrations/005_review_integrity.sql`). Lifecycle `status` is never patchable through `updateProject`.
 - Password hashes and token hashes never leave the store. The only exception is `getUserAuthByEmail`, which returns the password hash for login.
 - Emails, domains and slugs are compared case-insensitively and stored lower-case.
@@ -52,10 +52,10 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 | `revokeInvitation({ workspaceId, invitationId, actorId })` | — · `not_found` (including another workspace's invitation), `already_decided` |
 | `updateWorkspaceProfile({ workspaceId, profile })` | workspace. Shallow-merges keys into `profile`. |
 | `createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, limits })` | upload. `duplicateOf` is the id of an earlier original upload in the same project with the same `sha256`, else null. Optional `limits: { maxFiles, maxBytes }` are checked under the project lock. Throws `not_found`, `duplicate_upload` (same `objectKey`), `invalid_state` (frozen) or `quota_exceeded`. |
-| `deleteUpload({ workspaceId, projectId, uploadId, actorId })` | removed upload (with `objectKey`, so the caller can delete the object). Only while editable. The earliest copy of a removed original becomes the new original. |
+| `deleteUpload({ workspaceId, projectId, uploadId, actorId })` | removed working-set upload. Only while editable. The earliest copy of a removed original becomes the new original. Committed object bytes must be retained: historical review/version snapshots or an in-flight registration may still reference the key. Physical reclamation needs a separate reference-aware policy. |
 | `listUploads({ workspaceId, projectId })` / `getUpload(id)` | uploads (with `objectKey`; routes strip it before responding) |
 | `submitForReview({ workspaceId, projectId, submittedBy })` | review (`status: 'pending'`) with `snapshot: { task, modalities, startingPoint, success, dataSource, model, files: [{ id, sha256, sizeBytes, contentType, filename, objectKey }] }`. Original files only, no duplicates. In one transaction under the project lock: project status `draft` or `changes_requested` becomes `in_review`, else `invalid_state`. |
-| `reopenProject({ workspaceId, projectId, actorId })` | project, now `draft`. From `in_review` it withdraws the pending review (`status: 'withdrawn'`). From `approved` or `versioned` it voids the approval for new versions. Other states throw `invalid_state`. |
+| `reopenProject({ workspaceId, projectId, actorId })` | project, now `draft`. From `in_review` it withdraws the pending review (`status: 'withdrawn'`). From `approved` or `versioned` it voids the approval for new versions. The store checks current membership and current state atomically: owner/admin can reopen all three states; member can withdraw only `in_review`; other or missing roles throw `forbidden`. Other states throw `invalid_state`. |
 | `listReviews({ status })` | across all workspaces (staff queue), each with `projectName`, `workspaceName` |
 | `getReview(id)` / `listProjectReviews({ workspaceId, projectId })` | review / reviews oldest first |
 | `decideReview({ reviewId, reviewerId, decision, notes, checks })` | review. `decision` is `approved` or `changes_requested`, and the project status becomes the same value in one transaction. Throws `not_found` or `already_decided` (including withdrawn reviews). |
@@ -83,6 +83,7 @@ project    { id, workspaceId, createdBy, name, task, modalities: string[], start
 
 ## Changelog
 
+- **v5:** Reopen permissions are enforced in the store against current membership/state (`forbidden`); working-set removal and refused receipt registration retain committed object bytes to protect retries and immutable history. No schema migration is required.
 - **v4:**
   - Approval integrity: frozen content, review snapshots, `reopenProject`, versions made only from an approved snapshot (one per approval).
   - `deleteUpload` and upload quotas (`quota_exceeded`).

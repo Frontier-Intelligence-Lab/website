@@ -36,8 +36,6 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
   const approver = member('manageMembers');
   const locked = (reply) => problem(reply, 409, 'This project is locked while it is in review or approved. Withdraw or reopen it to make changes.', { code: 'project_locked' });
   const lockedOr = (reply, err) => (err instanceof StoreError && err.code === 'invalid_state' ? locked(reply) : fail(reply, err));
-  // Deleting a stored object is best effort: a failure leaves an orphan for cleanup, never a broken record.
-  const discard = (key) => client.remove(key).catch((err) => app.log.warn({ err: err.message }, 'could not delete stored object'));
 
   // One grant per file: ingest refuses a grant it has already used, so a grant cannot add files later.
   app.post('/api/workspaces/:workspaceId/projects/:projectId/upload-grant', { ...post([uploadsOn, signedIn, member('writeProjects'), loadProject]), config: { rateLimit: { max: 600, timeWindow: '15 minutes' } } }, async (request, reply) => {
@@ -77,8 +75,9 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
       const { objectKey: _, ...shown } = upload;
       return { upload: shown };
     } catch (err) {
-      // The store refused the record (locked, over quota, already recorded): do not keep the object.
-      if (!(err instanceof StoreError && err.code === 'duplicate_upload')) discard(objectKey);
+      // A retried commit can return bytes already referenced by a successful upload
+      // or a historical snapshot. Retain committed bytes even when this write fails.
+      // Only uncommitted pending uploads are currently eligible for automatic cleanup.
       if (err instanceof StoreError && err.code === 'quota_exceeded') return problem(reply, 409, 'This project has reached its sample limit.', { code: 'quota_exceeded' });
       return lockedOr(reply, err);
     }
@@ -86,8 +85,8 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
 
   app.post('/api/workspaces/:workspaceId/projects/:projectId/uploads/:uploadId/delete', post([signedIn, member('writeProjects'), loadProject]), async (request, reply) => {
     try {
-      const removed = await store.deleteUpload({ workspaceId: request.project.workspaceId, projectId: request.project.id, uploadId: request.params.uploadId, actorId: request.user.id });
-      if (client) discard(removed.objectKey);
+      // Remove the editable working-set entry, not bytes used by review/version history.
+      await store.deleteUpload({ workspaceId: request.project.workspaceId, projectId: request.project.id, uploadId: request.params.uploadId, actorId: request.user.id });
       return { ok: true };
     } catch (err) { return lockedOr(reply, err); }
   });

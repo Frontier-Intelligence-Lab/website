@@ -266,6 +266,8 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
       if (!['in_review', 'approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+      const role = members.find((m) => m.workspaceId === workspaceId && m.userId === actorId)?.role;
+      if (!['owner', 'admin'].includes(role) && !(role === 'member' && project.status === 'in_review')) throw new StoreError('forbidden');
       const pending = reviews.find((r) => r.projectId === projectId && r.status === 'pending');
       if (pending) Object.assign(pending, { status: 'withdrawn', decidedAt: stamp() });
       const from = project.status;

@@ -237,7 +237,7 @@ test('approval integrity: no edits, held receipts or deletions after submission;
   await app.close();
 });
 
-test('commit failures and refused records leave nothing recorded and clean up stored objects', async () => {
+test('commit failures and refused records keep metadata consistent without deleting committed bytes', async () => {
   const ingest = fakeIngest();
   const app = await makeApp({ env: { ...INGEST, PROJECT_MAX_FILES: '1' }, ingestClient: ingest });
   const owner = await person(app, 'o@acme-robotics.com');
@@ -252,11 +252,38 @@ test('commit failures and refused records leave nothing recorded and clean up st
   assert.equal((await owner.post(`${base}/upload-grant`)).json().code, 'quota_exceeded');
   const over = await owner.post(`${base}/uploads`, { receipt: receipt(mine) });
   assert.equal(over.json().code, 'quota_exceeded');
-  assert.equal(ingest.calls.remove.length, 1, 'the refused object is deleted');
+  assert.equal(ingest.calls.remove.length, 0, 'a refused registration must not delete a committed object');
   const [u] = (await owner.get(base)).json().uploads;
   assert.equal((await owner.post(`${base}/uploads/${u.id}/delete`)).statusCode, 200);
-  assert.equal(ingest.calls.remove.length, 2);
+  assert.equal(ingest.calls.remove.length, 0, 'working-set removal retains committed bytes');
   await app.close();
+});
+
+test('removing an upload after reopening preserves its historical review and version bytes', async () => {
+  const ingest = fakeIngest();
+  const objects = new Set();
+  const commit = ingest.commit;
+  ingest.commit = async (key) => { const stored = await commit(key); objects.add(stored); return stored; };
+  ingest.remove = async (key) => { ingest.calls.remove.push(key); objects.delete(key); };
+  const app = await makeApp({ env: INGEST, ingestClient: ingest });
+  try {
+    const owner = await person(app, 'owner@history.test');
+    const staff = await person(app, 'reviewer@valcairn.test');
+    const { ws, project, base } = await projectWithData(app, owner);
+    const { upload } = (await owner.post(`${base}/uploads`, { receipt: receipt({ ws: ws.id, project: project.id, by: owner.id }) })).json();
+    const { review } = (await owner.post(`${base}/submit`)).json();
+    const checks = { rights: true, consent: true, labels: true, duplicates: true, format: true };
+    assert.equal((await staff.post(`/api/staff/reviews/${review.id}/decision`, { decision: 'approved', checks })).statusCode, 200);
+    assert.equal((await owner.post(`${base}/dataset-versions`)).statusCode, 200);
+    assert.equal((await owner.post(`${base}/reopen`)).statusCode, 200);
+    assert.equal((await owner.post(`${base}/uploads/${upload.id}/delete`)).statusCode, 200);
+    assert.equal((await owner.get(base)).json().uploads.length, 0);
+    const historical = (await staff.get(`/api/staff/reviews/${review.id}`)).json();
+    assert.equal(historical.uploads.length, 1);
+    assert.ok(historical.uploads[0].downloadUrl);
+    assert.equal(objects.size, 1, 'historical file bytes are retained');
+    assert.equal(ingest.calls.remove.length, 0);
+  } finally { await app.close(); }
 });
 
 test('academic codes are bound to the personal workspace they were requested for', async () => {

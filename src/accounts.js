@@ -12,7 +12,7 @@ const CAN = {
 };
 const CODE_TTL_MS = 15 * 60 * 1000;
 const INVITE_TTL_MS = 7 * 86400 * 1000;
-const STATUS = { email_taken: 409, slug_taken: 409, personal_exists: 409, already_member: 409, already_decided: 409, duplicate_upload: 409, invalid_state: 409, invite_expired: 410, not_found: 404 };
+const STATUS = { email_taken: 409, slug_taken: 409, personal_exists: 409, already_member: 409, already_decided: 409, duplicate_upload: 409, invalid_state: 409, invite_expired: 410, not_found: 404, forbidden: 403 };
 const MESSAGES = {
   email_taken: 'An account with that email already exists. Sign in instead.',
   slug_taken: 'That workspace address is taken. Try another.',
@@ -23,6 +23,7 @@ const MESSAGES = {
   invalid_state: 'This step is not available for the project right now.',
   invite_expired: 'This invitation has expired. Ask for a new one.',
   not_found: 'Not found.',
+  forbidden: 'Your role does not allow this.',
 };
 
 const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
