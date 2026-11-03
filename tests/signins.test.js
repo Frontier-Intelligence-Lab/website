@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { hashPassword } from '../src/lib/passwords.js';
@@ -48,6 +48,18 @@ test('sign-ins, sign-outs and failures are recorded; only admins can read them',
   assert.ok(!JSON.stringify(res.json()).includes('typed-my-password-here'));
   assert.ok(res.json().events.every((e) => !Number.isNaN(Date.parse(e.at))));
   await app.close();
+});
+
+test('unreadable lines in the log file are skipped, not fatal', async () => {
+  const { createSigninLog } = await import('../src/lib/signins.js');
+  const dir = mkdtempSync(path.join(tmpdir(), 'signins-'));
+  const file = path.join(dir, 'signins.jsonl');
+  try {
+    writeFileSync(file, '{"at":"2026-11-01T00:00:00Z","event":"signin","username":"a"}\nnot json\n{"at":"2026-11-02T00:00:00Z","event":"signin","username":"b"}\n');
+    assert.deepEqual((await createSigninLog(file)).recent().map((e) => e.username), ['b', 'a']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('the sign-in log persists to SIGNIN_LOG_FILE across restarts', async () => {

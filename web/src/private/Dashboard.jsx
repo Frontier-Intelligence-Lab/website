@@ -259,10 +259,13 @@ function AccessLog() {
 export default function Dashboard({ reviewer }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
+  const [signOutFailed, setSignOutFailed] = useState(false);
 
+  // Only leave the dashboard once the server has ended the session.
   async function signOut() {
-    await api.logout().catch(() => null);
-    navigate('/demo');
+    const res = await api.logout().catch(() => null);
+    if (res?.ok) return navigate('/demo');
+    setSignOutFailed(true);
   }
 
   return (
@@ -285,6 +288,7 @@ export default function Dashboard({ reviewer }) {
             <span className="avatar" title={reviewer.username} aria-hidden="true">{initials(reviewer.name)}</span>
             <span className="visually-hidden">Signed in as {reviewer.name}</span>
             <button type="button" className="btn-small" onClick={signOut}>Sign out</button>
+            {signOutFailed && <span className="tone-warn" role="alert">Sign-out failed. Please try again.</span>}
           </div>
         </header>
 

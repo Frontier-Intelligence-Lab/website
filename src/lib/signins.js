@@ -12,9 +12,9 @@ export async function createSigninLog(file, log) {
   let events = [];
   if (file) {
     try {
-      events = (await readFile(file, 'utf8')).split('\n').filter(Boolean).slice(-KEEP).flatMap((line) => {
+      events = (await readFile(file, 'utf8')).split('\n').filter(Boolean).flatMap((line) => {
         try { return [JSON.parse(line)]; } catch { return []; }
-      });
+      }).slice(-KEEP);
     } catch (err) {
       if (err.code !== 'ENOENT') throw err;
     }
