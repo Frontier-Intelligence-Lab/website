@@ -8,7 +8,8 @@ import fastifyStatic from '@fastify/static';
 import fastifyHelmet from '@fastify/helmet';
 import fastifyRateLimit from '@fastify/rate-limit';
 import { LIMITS, createDelivery, validateContact } from './lib/contact.js';
-import { authenticateReviewer } from './lib/reviewers.js';
+import { authenticateReviewer, normalizeUsername } from './lib/reviewers.js';
+import { createSigninLog } from './lib/signins.js';
 import { isSameOriginRequest } from './lib/origin.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
@@ -28,6 +29,7 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
 
   const app = Fastify({ logger, trustProxy: config.trustProxy, bodyLimit: 32 * 1024 });
   const delivery = createDelivery(config.smtp, contactTransport);
+  const signins = await createSigninLog(config.signinLogFile, app.log);
   // Keeps a private, no-store header set by the route; public pages revalidate so new builds are picked up.
   const page = (reply, status = 200) => {
     if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-cache');
@@ -139,14 +141,31 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
     const password = typeof request.body?.password === 'string' ? request.body.password.slice(0, 256) : '';
     if (!signInConfigured) return problem(reply, 503, 'Reviewer access is not configured, so sign-in is unavailable.');
     const reviewer = await authenticateReviewer(config.reviewers, username, password);
-    if (!reviewer) return problem(reply, 401, 'That username and password did not match an authorized account.');
+    if (!reviewer) {
+      const known = config.reviewers.some((r) => r.username === normalizeUsername(username));
+      await signins.record({ event: 'failed', username: known ? normalizeUsername(username) : null });
+      return problem(reply, 401, 'That username and password did not match an authorized account.');
+    }
     await request.session.regenerate();
     request.session.set('reviewer', { ...reviewer, signedInAt: new Date().toISOString() });
+    await signins.record({ event: 'signin', username: reviewer.username });
+    request.log.info({ username: reviewer.username }, 'reviewer signed in');
     return { reviewer: request.session.get('reviewer') };
   });
   app.post('/api/logout', { preHandler: sameOrigin }, async (request) => {
+    const reviewer = reviewerOf(request);
     await request.session.destroy();
+    if (reviewer) await signins.record({ event: 'signout', username: reviewer.username });
     return { ok: true };
+  });
+
+  // Sign-in history for admin accounts only.
+  app.get('/api/admin/signins', async (request, reply) => {
+    privateHeaders(reply);
+    const reviewer = reviewerOf(request);
+    if (!reviewer) return problem(reply, 401, 'Sign in first.');
+    if (reviewer.role !== 'admin') return problem(reply, 403, 'Only admin accounts can view the sign-in log.');
+    return { events: signins.recent() };
   });
 
   app.setNotFoundHandler(async (request, reply) => {

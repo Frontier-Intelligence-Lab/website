@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { api } from '../api.js';
 import { ThemeToggle } from '../theme.jsx';
@@ -212,6 +212,50 @@ function Financing() {
   );
 }
 
+const EVENT_LABELS = { signin: 'Signed in', signout: 'Signed out', failed: 'Failed attempt' };
+const formatTime = (iso) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
+// Admin-only: who has signed in. The server refuses this data to non-admin accounts.
+function AccessLog() {
+  const [state, setState] = useState({ status: 'loading', events: [] });
+  useEffect(() => {
+    let live = true;
+    fetch('/api/admin/signins', { credentials: 'same-origin' })
+      .then((res) => (res.ok ? res.json() : Promise.reject(res)))
+      .then(({ events }) => live && setState({ status: 'ready', events }))
+      .catch(() => live && setState({ status: 'error', events: [] }));
+    return () => { live = false; };
+  }, []);
+
+  return (
+    <section id="access-log" className="card card--table" aria-labelledby="access-title">
+      <div className="card-head">
+        <h2 id="access-title">Sign-in log</h2>
+        <span className="subtle">Visible to admins only</span>
+      </div>
+      {state.status === 'loading' && <p className="card-foot subtle" role="status">Loading…</p>}
+      {state.status === 'error' && <p className="card-foot tone-warn" role="alert">The sign-in log could not be loaded.</p>}
+      {state.status === 'ready' && (
+        <div className="table-scroll">
+          <table className="table-compact">
+            <thead><tr><th scope="col">When</th><th scope="col">Account</th><th scope="col">Event</th></tr></thead>
+            <tbody>
+              {state.events.map((e) => (
+                <tr key={`${e.at}-${e.event}-${e.username}`}>
+                  <td className="subtle">{formatTime(e.at)}</td>
+                  <td>{e.username ?? <span className="subtle">unknown username</span>}</td>
+                  <td className={e.event === 'failed' ? 'tone-warn' : 'tone-plain'}>{EVENT_LABELS[e.event] ?? e.event}</td>
+                </tr>
+              ))}
+              {state.events.length === 0 && <tr><td colSpan={3} className="subtle">No sign-ins recorded yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function Dashboard({ reviewer }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
@@ -274,6 +318,8 @@ export default function Dashboard({ reviewer }) {
           </div>
 
           <Financing />
+
+          {reviewer.role === 'admin' && <AccessLog />}
         </main>
       </div>
     </div>

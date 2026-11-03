@@ -1,13 +1,15 @@
 // Prints a reviewer entry for REVIEWERS_FILE / REVIEWERS_JSON.
-// Usage:  node scripts/hash-password.js --generate <username> "Display Name"
-//         echo "chosen-password" | node scripts/hash-password.js <username> "Display Name"
+// Usage:  node scripts/hash-password.js [--admin] --generate <username> "Display Name"
+//         echo "chosen-password" | node scripts/hash-password.js [--admin] <username> "Display Name"
+// --admin lets the account read the sign-in log; everyone else is a viewer.
 import { randomBytes } from 'node:crypto';
 import { hashPassword } from '../src/lib/passwords.js';
 import { normalizeUsername } from '../src/lib/reviewers.js';
 
 const args = process.argv.slice(2);
 const generate = args.includes('--generate');
-const [username = 'reviewer', name = username] = args.filter((a) => a !== '--generate');
+const role = args.includes('--admin') ? 'admin' : 'viewer';
+const [username = 'reviewer', name = username] = args.filter((a) => !a.startsWith('--'));
 
 let password;
 if (generate) {
@@ -24,6 +26,6 @@ if (!password || password.length < 8) {
 }
 if (password.length < 15) console.error('Warning: passwords under 15 characters are easier to guess; consider a longer one.');
 
-const entry = { username: normalizeUsername(username), name, passwordHash: await hashPassword(password) };
+const entry = { username: normalizeUsername(username), name, role, passwordHash: await hashPassword(password) };
 if (generate) console.error(`Generated password (share privately, it is not stored): ${password}`);
 console.log(JSON.stringify(entry, null, 2));

@@ -72,6 +72,7 @@ See `.env.example`. Key values:
 | `CONTACT_DELIVERY` | `disabled` (default) or `smtp`. With `smtp`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `CONTACT_TO`, `CONTACT_FROM` apply. |
 | `CONTACT_PUBLIC_EMAIL`, `BOOKING_URL` | Returned by `/api/config` and shown on the contact page. |
 | `REVIEWERS_FILE` or `REVIEWERS_JSON` | Reviewer accounts. Unset means sign-in is disabled. |
+| `SIGNIN_LOG_FILE` | Where the sign-in log is appended (JSON Lines). Unset keeps only the latest 200 events in memory, lost on restart. |
 
 ### Sign-in accounts
 
@@ -83,7 +84,11 @@ Create an entry for a chosen password (read from stdin, at least 8 characters; a
 "chosen-password" | node scripts/hash-password.js <username> "Display Name"
 ```
 
-Or let the script generate a strong password with `--generate`. Put each entry in the JSON array referenced by `REVIEWERS_FILE` and restart the server to load changes. Duplicate usernames are rejected at startup.
+Or let the script generate a strong password with `--generate`. Add `--admin` for accounts that may read the sign-in log; everyone else is a `viewer`. Put each entry in the JSON array referenced by `REVIEWERS_FILE` and restart the server to load changes. Duplicate usernames are rejected at startup.
+
+### Who viewed the demo
+
+Give each invited person their own account: a shared login only shows that *someone* signed in. Every sign-in, sign-out and failed attempt against a real account is recorded with its time and username; failed attempts with unknown usernames are stored as "unknown" because people sometimes type a password into the username field. No email addresses, IP addresses or other personal details are collected, and the sign-in page tells people that sign-ins are recorded. Admin accounts see the log at the bottom of the dashboard.
 
 ## API
 
@@ -94,6 +99,7 @@ Or let the script generate a strong password with `--generate`. Put each entry i
 | `GET /api/session` | none | `{reviewer}` or `{reviewer: null}`. |
 | `POST /api/login` | same origin, 10 per 15 min | `{username, password}` → `200 {reviewer}`, `401`, `503`. |
 | `POST /api/logout` | same origin | Ends the session. |
+| `GET /api/admin/signins` | admin account | Latest 200 sign-in events, newest first: `{at, event, username}` where `event` is `signin`, `signout` or `failed`. |
 
 ## Docker
 
@@ -110,7 +116,7 @@ This is a long-running Node server (sessions, SMTP, rate limits), not a static o
 
 1. Build the image from this repository (`docker build`); the first stage runs `vite build`, the second ships `src/`, `dist/` and production dependencies.
 2. Provide runtime configuration outside Git: `NODE_ENV=production`, `SESSION_SECRET` (32+ chars), `COOKIE_SECURE=true`, `TRUST_PROXY` set to the reverse proxy's IP/CIDR, and, for contact delivery, `CONTACT_DELIVERY=smtp` with the `SMTP_*` and `CONTACT_*` values.
-3. Mount a reviewer file read-only and set `REVIEWERS_FILE` to enable `/demo` sign-in.
+3. Mount a reviewer file read-only and set `REVIEWERS_FILE` to enable `/demo` sign-in. Mount a writable volume (the container runs as the `node` user) and set `SIGNIN_LOG_FILE`, for example `/data/signins.jsonl`, so the sign-in log survives restarts.
 4. Health check: `GET /healthz`. Run one instance (sessions are in memory).
 
 ## Development versus production

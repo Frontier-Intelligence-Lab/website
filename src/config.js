@@ -83,5 +83,6 @@ export function loadConfig(env = process.env) {
     contactPublicEmail: env.CONTACT_PUBLIC_EMAIL ?? 'contact@frontierintelligencelab.com',
     bookingUrl: env.BOOKING_URL ?? 'https://cal.com/ayushozha/15-min-getting-to-know',
     reviewers,
+    signinLogFile: env.SIGNIN_LOG_FILE || null,
   };
 }

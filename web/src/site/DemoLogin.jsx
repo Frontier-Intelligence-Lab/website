@@ -33,6 +33,7 @@ export default function DemoLogin() {
         <Field name="password" label="Password" type="password" autoComplete="current-password" maxLength={256} />
         <button className="btn btn-solid" type="submit" disabled={!signInConfigured || pending}>{pending ? 'Signing in…' : 'Sign in'}</button>
       </form>
+      <p className="muted">Sign-ins are recorded (account name and time) so we know who has seen the demo.</p>
       <p className="muted">Need access or lost your invitation? <Link to="/contact">Contact us</Link>.</p>
     </section>
   );
