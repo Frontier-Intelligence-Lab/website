@@ -147,7 +147,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
       const project = {
         id: randomUUID(), workspaceId, createdBy, name, task, modalities: [...modalities], startingPoint,
-        success: null, dataSource: null, status: 'draft', setupStep: 'success', createdAt: stamp(), updatedAt: stamp(),
+        success: null, dataSource: null, model: null, status: 'draft', setupStep: 'success', createdAt: stamp(), updatedAt: stamp(),
       };
       projects.set(project.id, project);
       audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'project.created', targetType: 'project', targetId: project.id, metadata: {}, createdAt: stamp() });
@@ -156,7 +156,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     async updateProject({ workspaceId, projectId, patch }) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) return null;
-      const allowed = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'status', 'setupStep'];
+      const allowed = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'status', 'setupStep'];
       for (const key of allowed) if (key in patch) project[key] = copy(patch[key]);
       project.updatedAt = stamp();
       return copy(project);

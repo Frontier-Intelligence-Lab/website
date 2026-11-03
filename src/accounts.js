@@ -233,12 +233,18 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   app.get('/api/workspaces/:workspaceId', get([signedIn, member('readProjects')]), async (request) => {
     const workspace = await store.getWorkspace(request.params.workspaceId);
     const manage = CAN.manageMembers.includes(request.role);
+    const pending = manage ? await store.listJoinRequests(workspace.id) : [];
+    // Admins see who is asking; the requester's id stays server-side.
+    const joinRequests = await Promise.all(pending.map(async (r) => {
+      const requester = await store.getUserById(r.userId);
+      return { id: r.id, note: r.note, createdAt: r.createdAt, name: requester?.name ?? 'Unknown', email: requester?.email ?? null };
+    }));
     return {
       workspace,
       role: request.role,
       members: await store.listMembers(workspace.id),
       invitations: manage ? await store.listInvitations(workspace.id) : [],
-      joinRequests: manage ? await store.listJoinRequests(workspace.id) : [],
+      joinRequests,
     };
   });
 
@@ -286,8 +292,10 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   });
 
   app.post('/api/workspaces/:workspaceId/projects/:projectId', post([signedIn, member('writeProjects')]), async (request, reply) => {
-    const { patch, errors } = validateProjectPatch(request.body);
-    if (errors) return problem(reply, 400, 'Please check the highlighted fields.', { errors });
+    const current = await store.getProject({ workspaceId: request.params.workspaceId, projectId: request.params.projectId });
+    if (!current) return problem(reply, 404, 'Not found.');
+    const { patch, errors } = validateProjectPatch(request.body, current);
+    if (errors) return problem(reply, 400, errors.form ?? 'Please check the highlighted fields.', { errors });
     const project = await store.updateProject({ workspaceId: request.params.workspaceId, projectId: request.params.projectId, patch });
     if (!project) return problem(reply, 404, 'Not found.');
     await store.recordAudit({ workspaceId: project.workspaceId, actorId: request.user.id, action: 'project.updated', targetType: 'project', targetId: project.id, metadata: { fields: Object.keys(patch) } });

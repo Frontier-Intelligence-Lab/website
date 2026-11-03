@@ -169,3 +169,61 @@ test('sign-in checks the password and onboarding pages are private app shells', 
   assert.equal((await c.get('/api/account')).json().user, null);
   await app.close();
 });
+
+test('only owners and admins decide join requests; members are refused and declines add nobody', async () => {
+  const app = await makeApp();
+  const { c: owner } = await verifiedUser(app, 'boss@omega.com', 'Boss');
+  const ws = (await owner.post('/api/workspaces', { name: 'Omega', joinByDomain: true })).json().workspace;
+  const { c: first } = await verifiedUser(app, 'first@omega.com', 'First');
+  const { c: second } = await verifiedUser(app, 'second@omega.com', 'Second');
+  await first.post(`/api/workspaces/${ws.id}/join-requests`, { note: 'Data team' });
+  await second.post(`/api/workspaces/${ws.id}/join-requests`, {});
+
+  const listed = (await owner.get(`/api/workspaces/${ws.id}`)).json().joinRequests;
+  assert.deepEqual(listed.map((r) => [r.name, r.email, r.note]).sort(), [['First', 'first@omega.com', 'Data team'], ['Second', 'second@omega.com', '']]);
+  assert.ok(listed.every((r) => r.userId === undefined));
+  const byName = Object.fromEntries(listed.map((r) => [r.name, r.id]));
+
+  assert.equal((await owner.post(`/api/workspaces/${ws.id}/join-requests/${byName.First}/decision`, { approve: true })).statusCode, 200);
+  // First is now a Member: may see the workspace but not decide, and sees no pending requests.
+  const asMember = (await first.get(`/api/workspaces/${ws.id}`)).json();
+  assert.equal(asMember.role, 'member');
+  assert.deepEqual(asMember.joinRequests, []);
+  assert.equal((await first.post(`/api/workspaces/${ws.id}/join-requests/${byName.Second}/decision`, { approve: true })).statusCode, 403);
+  // Not a member at all: 404.
+  assert.equal((await second.post(`/api/workspaces/${ws.id}/join-requests/${byName.Second}/decision`, { approve: true })).statusCode, 404);
+
+  const declined = await owner.post(`/api/workspaces/${ws.id}/join-requests/${byName.Second}/decision`, { approve: false });
+  assert.equal(declined.json().joinRequest.status, 'declined');
+  assert.equal((await second.get(`/api/workspaces/${ws.id}`)).statusCode, 404);
+  assert.equal((await owner.post(`/api/workspaces/${ws.id}/join-requests/${byName.Second}/decision`, { approve: true })).statusCode, 409);
+  assert.equal((await owner.get(`/api/workspaces/${ws.id}`)).json().members.length, 2);
+  await app.close();
+});
+
+test('projects that start from an existing model record the model, not a data source', async () => {
+  const app = await makeApp();
+  const { c } = await verifiedUser(app, 'ml@sigma.com', 'ML');
+  const ws = (await c.post('/api/workspaces', { name: 'Sigma' })).json().workspace;
+  const { project } = (await c.post(`/api/workspaces/${ws.id}/projects`, { task: 'Route support tickets to the right team.', modalities: ['Text'], startingPoint: 'model' })).json();
+  const url = `/api/workspaces/${ws.id}/projects/${project.id}`;
+  assert.equal((await c.post(url, { success: { measure: 'accuracy', target: '90%' } })).json().project.setupStep, 'model');
+  assert.equal((await c.post(url, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['training'] } })).statusCode, 400);
+
+  const tryModel = (model) => c.post(url, { model });
+  assert.deepEqual(Object.keys((await tryModel({})).json().errors).sort(), ['rightsConfirmed', 'source']);
+  assert.ok((await tryModel({ source: 'endpoint', endpointUrl: 'http://insecure.example.com', rightsConfirmed: true })).json().errors.endpointUrl);
+  assert.ok((await tryModel({ source: 'endpoint', endpointUrl: 'https://user:secret@api.example.com', rightsConfirmed: true })).json().errors.endpointUrl);
+  assert.ok((await tryModel({ source: 'hub', rightsConfirmed: true })).json().errors.hubId);
+
+  const saved = (await tryModel({ source: 'endpoint', endpointUrl: 'https://api.example.com/v1/classify', hubId: 'ignored', format: 'onnx', license: 'internal', rightsConfirmed: true, testSet: 'partial', testSetSize: '300 tickets' })).json().project;
+  assert.equal(saved.setupStep, 'done');
+  assert.equal(saved.model.endpointUrl, 'https://api.example.com/v1/classify');
+  assert.equal(saved.model.hubId, null);
+  assert.equal(saved.model.testSet, 'partial');
+  assert.equal(saved.dataSource, null);
+
+  const other = (await c.post(`/api/workspaces/${ws.id}/projects`, { task: 'Flag damaged boxes on line 2.', modalities: ['Images'], startingPoint: 'own' })).json().project;
+  assert.equal((await c.post(`/api/workspaces/${ws.id}/projects/${other.id}`, { model: { source: 'hub', hubId: 'a/b', rightsConfirmed: true } })).statusCode, 400);
+  await app.close();
+});

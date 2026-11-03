@@ -69,5 +69,6 @@ function accountRoutes() {
     { path: '/w/:slug/projects/:projectId', lazy: page(project, 'ProjectHome', 'projectHomeLoader') },
     { path: '/w/:slug/projects/:projectId/success', lazy: page(project, 'ProjectSuccess', 'successLoader') },
     { path: '/w/:slug/projects/:projectId/data', lazy: page(project, 'ProjectData', 'dataLoader') },
+    { path: '/w/:slug/projects/:projectId/model', lazy: page(project, 'ProjectModel', 'modelLoader') },
   ].map((route) => ({ ...route, ErrorBoundary: RouteError, HydrateFallback: Loading }));
 }

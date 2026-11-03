@@ -43,7 +43,7 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 | `listJoinRequestsForUser(userId)` | requests with `workspaceName` |
 | `decideJoinRequest({ workspaceId, requestId, deciderId, approve, role })` | request · `not_found`, `already_decided` |
 | `createProject({ workspaceId, createdBy, name, task, modalities, startingPoint })` | project (`status: 'draft'`, `setupStep: 'success'`) |
-| `updateProject({ workspaceId, projectId, patch })` | project or null. Only `name, task, modalities, startingPoint, success, dataSource, status, setupStep` may change. |
+| `updateProject({ workspaceId, projectId, patch })` | project or null. Only `name, task, modalities, startingPoint, success, dataSource, model, status, setupStep` may change. |
 | `getProject({ workspaceId, projectId })` | project or null |
 | `listProjects(workspaceId)` | projects |
 | `recordAudit({ workspaceId, actorId, action, targetType, targetId, metadata })` | — |
@@ -58,7 +58,11 @@ workspace  { id, kind: 'organization'|'personal', name, slug, website, domain, d
              industry, sizeBand, profile: {}, createdBy, createdAt }
 role       'owner'|'admin'|'member'|'finance'|'viewer'
 project    { id, workspaceId, createdBy, name, task, modalities: string[], startingPoint: 'own'|'need'|'model'|'unsure',
-             success: {...}|null, dataSource: {...}|null, status: 'draft'|'submitted', setupStep, createdAt, updatedAt }
+             success: {...}|null, dataSource: {...}|null, model: {...}|null, status: 'draft'|'submitted', setupStep, createdAt, updatedAt }
 ```
 
-`profile`, `success` and `dataSource` are JSON objects that the routes validate before they're stored. Store them as `jsonb`.
+`profile`, `success`, `dataSource` and `model` are JSON objects that the routes validate before they're stored. Store them as `jsonb`.
+
+## Changelog
+
+- **v2:** `projects.model` (`jsonb`, nullable, default `null`) for projects that start from an existing model: source (endpoint, files or hub), format, license and rights confirmation, plus test-set details. The Postgres store needs a migration that adds the column, and the column must be included in `createProject`, `updateProject` and the row mapping.

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, redirect, useLoaderData, useNavigate } from 'react-router';
+import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireVerified, requireWorkspace } from './ui.jsx';
 
@@ -285,13 +285,88 @@ const ROLE_ROWS = [
   ['Viewer', 'plain', 'View', 'No', 'No', 'No'],
 ];
 
+function JoinRequests({ workspaceId, requests }) {
+  const revalidator = useRevalidator();
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  async function decide(request, approve) {
+    setBusy(request.id);
+    setError(null);
+    const res = await api.decideJoin(workspaceId, request.id, approve).catch(() => null);
+    setBusy(null);
+    if (!res?.ok) return setError(res?.data.error ?? `Could not ${approve ? 'approve' : 'decline'} ${request.name}'s request. Check your connection and try again.`);
+    setNotice(approve ? `${request.name} joined as a Member. You can change their role later.` : `You declined ${request.name}'s request.`);
+    revalidator.revalidate();
+  }
+
+  return (
+    <section className="ob-card" aria-labelledby="requests-title" aria-busy={revalidator.state === 'loading'}>
+      <div className="ob-actions"><h2 id="requests-title">Requests to join</h2>{requests.length > 0 && <span className="ob-badge tile--blue">{requests.length} waiting</span>}</div>
+      {notice && <p className="ob-alert ob-alert--ok" role="status">{notice}</p>}
+      {error && <p className="ob-alert" role="alert">{error}</p>}
+      {requests.length === 0 ? (
+        <p className="ob-muted">No one is waiting. People who confirm a work email at your domain can ask to join, and their requests appear here.</p>
+      ) : (
+        <ul className="ob-list">
+          {requests.map((r) => (
+            <li key={r.id}>
+              <span className="avatar" aria-hidden="true">{initials(r.name)}</span>
+              <div>
+                <strong>{r.name}</strong>
+                <span className="ob-muted">{r.email}{r.note ? ` · “${r.note}”` : ''}</span>
+              </div>
+              <div className="ob-row-actions">
+                <button type="button" className="btn-ghost" disabled={busy === r.id} onClick={() => decide(r, false)}>Decline</button>
+                <button type="button" className="btn-app" disabled={busy === r.id} onClick={() => decide(r, true)}>{busy === r.id ? 'Saving…' : 'Approve'}</button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function Members({ members }) {
+  return (
+    <div className="ob-card">
+      <h2>Members · {members.length}</h2>
+      <ul className="ob-list">
+        {members.map((m) => (
+          <li key={m.user.id}>
+            <span className="avatar" aria-hidden="true">{initials(m.user.name)}</span>
+            <div><strong>{m.user.name}</strong><span className="ob-muted">{m.user.email}</span></div>
+            <span className="ob-badge">{m.role[0].toUpperCase() + m.role.slice(1)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function OrgTeam() {
   const { entry, detail } = useLoaderData();
+  const manage = ['owner', 'admin'].includes(detail.role);
+  return manage ? <OrgTeamManage entry={entry} detail={detail} /> : (
+    <SetupShell tone="blue" context={detail.workspace.name} status={null} exit={{ to: `/w/${entry.slug}`, label: 'Back to workspace' }}>
+      <title>Team — Valcairn</title>
+      <main className="ob-main ob-main--narrow">
+        <h1 className="ob-h1">Team</h1>
+        <p className="ob-lede">Only owners and admins can invite people or approve requests to join.</p>
+        <Members members={detail.members} />
+      </main>
+    </SetupShell>
+  );
+}
+
+function OrgTeamManage({ entry, detail }) {
   const navigate = useNavigate();
   const [rows, setRows] = useState([{ email: '', role: 'member' }, { email: '', role: 'member' }]);
   const [message, setMessage] = useState(null);
   const [saved, setSaved] = useState(null);
-  const canAdmin = entry.role === 'owner';
+  const canAdmin = detail.role === 'owner';
   const next = `/w/${entry.slug}/projects/new`;
 
   const update = (i, patch) => setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
@@ -314,6 +389,7 @@ export function OrgTeam() {
             <p className="ob-lede">Invite the people you'll work with. Roles decide who can see data, approve spend and open financing.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
+          {(detail.joinRequests.length > 0 || detail.workspace.joinByDomain) && <JoinRequests workspaceId={entry.id} requests={detail.joinRequests} />}
           {saved ? (
             <div className="ob-note tile--green"><Tile icon="check" tone="green" size="sm" /><span><strong>{saved.saved} invitation{saved.saved === 1 ? '' : 's'} saved.</strong> {saved.delivered ? 'We emailed them.' : 'Invitation emails aren’t switched on yet, so let them know yourself. They can also request to join with their work email.'}</span></div>
           ) : (
@@ -356,6 +432,7 @@ export function OrgTeam() {
           </div>
         </section>
         <aside className="ob-aside">
+          <Members members={detail.members} />
           <div className="ob-card">
             <h2>Other ways in</h2>
             <div className="ob-features" style={{ gap: 14 }}>

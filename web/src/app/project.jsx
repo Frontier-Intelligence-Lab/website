@@ -18,9 +18,10 @@ const PLANS = {
   unsure: [['Describe the task', 'You are here'], ['Scoping call', '30 minutes with our team'], ['Get a written plan', 'Data, approach, test method and a cost range']],
 };
 
-function Shell({ entry, current, children, title }) {
+function Shell({ entry, current, children, title, modelPath = false }) {
+  const steps = modelPath ? [STEPS[0], STEPS[1], 'Model and tests'] : STEPS;
   return (
-    <SetupShell context={`New project · ${entry.name}`} exit={{ to: `/w/${entry.slug}`, label: 'Exit setup' }} steps={STEPS} current={current}>
+    <SetupShell context={`New project · ${entry.name}`} exit={{ to: `/w/${entry.slug}`, label: 'Exit setup' }} steps={steps} current={current}>
       <title>{`${title} — Valcairn`}</title>
       {children}
     </SetupShell>
@@ -60,7 +61,7 @@ export function ProjectGoal() {
   }
 
   return (
-    <Shell entry={entry} current={0} title="Project goal">
+    <Shell entry={entry} current={0} title="Project goal" modelPath={start === 'model'}>
       <form className="ob-main" onSubmit={submit} noValidate>
         <section className="ob-col">
           <div className="ob-intro">
@@ -117,7 +118,16 @@ async function projectLoader({ params }) {
   return { entry, project, role };
 }
 export const successLoader = projectLoader;
-export const dataLoader = projectLoader;
+export async function dataLoader(args) {
+  const data = await projectLoader(args);
+  if (data.project.startingPoint === 'model') throw redirect(`/w/${data.entry.slug}/projects/${data.project.id}/model`);
+  return data;
+}
+export async function modelLoader(args) {
+  const data = await projectLoader(args);
+  if (data.project.startingPoint !== 'model') throw redirect(`/w/${data.entry.slug}/projects/${data.project.id}/data`);
+  return data;
+}
 export const projectHomeLoader = projectLoader;
 
 const MEASURES = [['recall', 'Catches real problems (recall)'], ['precision', 'Few false alarms (precision)'], ['accuracy', 'Overall accuracy'], ['success_rate', 'Task success rate'], ['rubric', 'Scored by reviewers against a rubric']];
@@ -136,7 +146,8 @@ export function ProjectSuccess() {
   const [message, setMessage] = useState(null);
   const measureLabel = MEASURES.find(([id]) => id === measure)[1].toLowerCase();
   const baselineLabel = BASELINES.find(([id]) => id === baseline)[1].toLowerCase();
-  const next = `/w/${entry.slug}/projects/${project.id}/data`;
+  const modelPath = project.startingPoint === 'model';
+  const next = `/w/${entry.slug}/projects/${project.id}/${modelPath ? 'model' : 'data'}`;
 
   async function submit(event) {
     event.preventDefault();
@@ -147,7 +158,7 @@ export function ProjectSuccess() {
   }
 
   return (
-    <Shell entry={entry} current={1} title="How you'll judge it">
+    <Shell entry={entry} current={1} title="How you'll judge it" modelPath={modelPath}>
       <form className="ob-main" onSubmit={submit} noValidate>
         <section className="ob-col">
           <div className="ob-intro">
@@ -314,7 +325,9 @@ export function ProjectData() {
           <div className="ob-card">
             <h2>Who can see this data</h2>
             <ul className="ob-list">
-              <li><Tile icon="people" tone="green" size="sm" /><div><strong>Your team</strong><span className="ob-muted">People in {entry.name} with access to this project</span></div></li>
+              {entry.kind === 'personal'
+                ? <li><Tile icon="people" tone="green" size="sm" /><div><strong>You</strong><span className="ob-muted">This is your personal workspace. No one else has access.</span></div></li>
+                : <li><Tile icon="people" tone="green" size="sm" /><div><strong>Your team</strong><span className="ob-muted">People in {entry.name} with access to this project</span></div></li>}
               <li><Tile icon="shield" tone="amber" size="sm" /><div><strong>Valcairn reviewers</strong><span className="ob-muted">Only to check rights and quality</span></div></li>
               <li><Tile icon="minus" tone="plain" size="sm" /><div><strong>Nobody else</strong><span className="ob-muted">Never listed, sold or shown to other companies</span></div></li>
             </ul>
@@ -324,6 +337,119 @@ export function ProjectData() {
     </Shell>
   );
 }
+
+const SOURCES = [
+  { id: 'endpoint', icon: 'link', tone: 'blue', title: 'A running endpoint', body: 'An HTTPS API that answers requests today.' },
+  { id: 'files', icon: 'data', tone: 'teal', title: 'Model files', body: 'Weights or an exported model in your own storage.' },
+  { id: 'hub', icon: 'store', tone: 'violet', title: 'A public model', body: 'An open-weight model published under a license.' },
+];
+
+export function ProjectModel() {
+  const { entry, project } = useLoaderData();
+  const navigate = useNavigate();
+  const m = project.model ?? {};
+  const [source, setSource] = useState(m.source ?? null);
+  const [testSet, setTestSet] = useState(m.testSet ?? 'yes');
+  const [errors, setErrors] = useState({});
+  const [pending, setPending] = useState(false);
+  const runsOn = project.success?.runsOn ?? 'later';
+  const target = { cloud: 'your cloud account', servers: 'your own servers', device: project.success?.device || 'a device', later: null }[runsOn];
+
+  async function submit(event) {
+    event.preventDefault();
+    const form = Object.fromEntries(new FormData(event.currentTarget));
+    setPending(true);
+    const res = await api.updateProject(entry.id, project.id, { model: { ...form, source, testSet, rightsConfirmed: form.rightsConfirmed === 'on' } }).catch(() => null);
+    setPending(false);
+    if (res?.ok) return navigate(`/w/${entry.slug}/projects/${project.id}`);
+    setErrors(res?.data.errors ?? { form: res?.data.error ?? 'Could not save. Check your connection and try again.' });
+  }
+
+  const field = (name, label, props = {}) => (
+    <div className="ob-field">
+      <label htmlFor={name}>{label}</label>
+      <input id={name} name={name} type="text" defaultValue={m[name] ?? ''} aria-invalid={errors[name] ? true : undefined} aria-describedby={`${name}-error`} {...props} />
+      <FieldError id={`${name}-error`}>{errors[name]}</FieldError>
+    </div>
+  );
+
+  return (
+    <Shell entry={entry} current={2} title="Model and tests" modelPath>
+      <form className="ob-main" onSubmit={submit} noValidate>
+        <section className="ob-col">
+          <div className="ob-intro">
+            <h1 className="ob-h1">Tell us about your model</h1>
+            <p className="ob-lede">We test it against your acceptance rule before anything is deployed. Nothing is retrained unless you ask.</p>
+          </div>
+          {errors.form && <p className="ob-alert" role="alert">{errors.form}</p>}
+          <fieldset aria-describedby="source-error">
+            <legend className="ob-legend">Where is the model?</legend>
+            <div className="ob-grid ob-grid--tight">
+              {SOURCES.map((s) => (
+                <button key={s.id} type="button" className="ob-option" aria-pressed={source === s.id} onClick={() => setSource(s.id)}>
+                  <Tile icon={s.icon} tone={s.tone} /><strong>{s.title}</strong><span>{s.body}</span>
+                </button>
+              ))}
+            </div>
+            <FieldError id="source-error">{errors.source}</FieldError>
+          </fieldset>
+          {source === 'endpoint' && <>
+            {field('endpointUrl', 'Endpoint address', { type: 'url', maxLength: 500, placeholder: 'https://models.example.com/v1/predict' })}
+            <p className="ob-muted">Don't paste keys or passwords here. We'll ask for credentials separately, through a secure connection, when evaluation runs open.</p>
+          </>}
+          {source === 'files' && field('location', 'Where the files are kept', { maxLength: 300, placeholder: 'e.g. our S3 bucket, internal model registry' })}
+          {source === 'hub' && field('hubId', 'Model name', { maxLength: 200, placeholder: 'organization/model-name' })}
+          <div className="ob-grid">
+            <div className="ob-field">
+              <label htmlFor="format">Format</label>
+              <select id="format" name="format" defaultValue={m.format ?? 'unknown'}>
+                <option value="unknown">Not sure</option><option value="pytorch">PyTorch</option><option value="safetensors">safetensors</option>
+                <option value="onnx">ONNX</option><option value="gguf">GGUF</option><option value="tensorflow">TensorFlow</option><option value="other">Other</option>
+              </select>
+            </div>
+            {field('license', 'License', { maxLength: 200, placeholder: 'e.g. Apache-2.0, internal, commercial' })}
+          </div>
+          <label className="ob-check"><input type="checkbox" name="rightsConfirmed" defaultChecked={m.rightsConfirmed} aria-describedby="rights-error" />We're allowed to test this model and deploy it for this task under its license.</label>
+          <FieldError id="rights-error">{errors.rightsConfirmed}</FieldError>
+          <fieldset>
+            <legend className="ob-legend">Do you have examples with the right answers?</legend>
+            <div className="ob-grid ob-grid--tight">
+              {[['yes', 'Yes, a test set'], ['partial', 'Some examples'], ['no', 'Not yet']].map(([id, label]) => (
+                <label key={id} className="ob-option ob-option--row"><input type="radio" name="testSetChoice" checked={testSet === id} onChange={() => setTestSet(id)} />{label}</label>
+              ))}
+            </div>
+          </fieldset>
+          {testSet !== 'no'
+            ? field('testSetSize', 'About how many examples?', { maxLength: 80, placeholder: 'e.g. 500 labelled images' })
+            : <p className="ob-note tile--violet">We'll help you build one. Without examples with known answers, we can't tell whether the model meets your rule.</p>}
+          <div className="ob-field">
+            <label htmlFor="rubric">Anything a reviewer should check by hand? <span className="ob-optional">(optional)</span></label>
+            <textarea id="rubric" name="rubric" rows={2} maxLength={2000} defaultValue={m.rubric ?? ''} />
+          </div>
+          <div className="ob-actions">
+            <Link className="btn-ghost" to={`/w/${entry.slug}/projects/${project.id}/success`}>Back</Link>
+            <button className="btn-app" type="submit" disabled={pending}>{pending ? 'Saving…' : 'Save and finish'} <Icon name="arrow" size={16} /></button>
+          </div>
+        </section>
+        <aside className="ob-aside">
+          <div className="ob-card">
+            <h2>Deployment target</h2>
+            <p className="ob-muted">{target ? <>From your acceptance rule: <strong style={{ color: 'var(--text)' }}>{target}</strong>.</> : 'Not decided yet. You can set it in your acceptance rule.'}</p>
+            <Link to={`/w/${entry.slug}/projects/${project.id}/success`}>Change it</Link>
+          </div>
+          <div className="ob-note tile--amber"><Tile icon="info" tone="amber" size="sm" /><span>Evaluation runs and deployment aren't open yet. We save this now so your project is ready when they are. We never call your endpoint from this form.</span></div>
+        </aside>
+      </form>
+    </Shell>
+  );
+}
+
+const MODEL_STATUS = [
+  { key: 'task', label: 'Task and acceptance rule' },
+  { key: 'data', label: 'Model and test plan' },
+  { key: 'eval', label: 'Evaluate against your rule', note: 'Compare with your baseline on held-out examples.' },
+  { key: 'deploy', label: 'Readiness check and deploy', note: 'Only a model that meets your rule can be deployed.' },
+];
 
 const STATUS = [
   { key: 'task', label: 'Task and acceptance rule' },
@@ -338,16 +464,22 @@ export function ProjectHome() {
   const { entry, project, role } = useLoaderData();
   const navigate = useNavigate();
   const base = `/w/${entry.slug}/projects/${project.id}`;
+  const modelPath = project.startingPoint === 'model';
+  const steps = modelPath ? MODEL_STATUS : STATUS;
   const taskDone = Boolean(project.success);
-  const dataDone = Boolean(project.dataSource);
+  const dataDone = Boolean(modelPath ? project.model : project.dataSource);
   const state = { task: taskDone ? 'done' : 'now', data: dataDone ? 'done' : taskDone ? 'now' : 'todo' };
   const nextStep = !taskDone ? { to: `${base}/success`, title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.' }
+    : !dataDone && modelPath ? { to: `${base}/model`, title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.' }
     : !dataDone ? { to: `${base}/data`, title: 'Record your data and its rights', body: 'Where it came from and how it may be used.' }
-    : entry.kind === 'organization' && ['owner', 'admin'].includes(role) ? { to: `/w/${entry.slug}/setup/team`, title: 'Invite whoever approves spend', body: 'Training needs their sign-off. Inviting them now avoids a wait later.' }
+    : entry.kind === 'organization' && ['owner', 'admin'].includes(role) ? { to: `/w/${entry.slug}/setup/team`, title: modelPath ? 'Invite whoever approves deployment' : 'Invite whoever approves spend', body: 'Their sign-off is needed later. Inviting them now avoids a wait.' }
     : null;
+  const [signOutState, setSignOutState] = useState('idle');
 
   async function signOut() {
-    await api.signout().catch(() => null);
+    setSignOutState('pending');
+    const res = await api.signout().catch(() => null);
+    if (!res?.ok) return setSignOutState('failed');
     navigate('/signin');
   }
 
@@ -368,7 +500,12 @@ export function ProjectHome() {
           {entry.kind === 'organization' && <a aria-disabled="true"><Tile icon="bank" tone="amber" size="sm" />Financing</a>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`}><Tile icon="people" tone="violet" size="sm" />Team</Link>}
         </nav>
-        <button type="button" className="btn-text" style={{ marginTop: 'auto', alignSelf: 'flex-start' }} onClick={signOut}>Sign out</button>
+        <div className="ob-signout">
+          {signOutState === 'failed' && <p className="ob-alert" role="alert">We couldn't sign you out, so you're still signed in. Check your connection and try again.</p>}
+          <button type="button" className="btn-text" disabled={signOutState === 'pending'} onClick={signOut}>
+            {signOutState === 'pending' ? 'Signing out…' : signOutState === 'failed' ? 'Try signing out again' : 'Sign out'}
+          </button>
+        </div>
       </aside>
       <main className="ob-body">
         <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
@@ -383,12 +520,12 @@ export function ProjectHome() {
           <section className="ob-card" style={{ flex: '999 1 420px' }} aria-labelledby="status-title">
             <h2 id="status-title">Where things stand</h2>
             <ol className="ob-list">
-              {STATUS.map((s, i) => {
+              {steps.map((s, i) => {
                 const st = state[s.key] ?? 'todo';
                 return (
                   <li key={s.key}>
                     <span className={`ob-num${st === 'done' ? ' ob-num--done' : st === 'now' ? ' ob-num--now' : ''}`}>{st === 'done' ? <Icon name="check" size={12} stroke={3} /> : i + 1}</span>
-                    <div><strong>{s.label}</strong><span className="ob-muted">{st === 'done' ? 'Done' : s.note ?? 'Next'}</span></div>
+                    <div><strong>{s.label}</strong><span className="ob-muted">{st === 'done' ? 'Done' : s.note ?? (st === 'now' ? 'Next' : 'After the step above')}</span></div>
                     {i >= 2 && <span className="ob-badge">Not open yet</span>}
                   </li>
                 );
@@ -406,7 +543,7 @@ export function ProjectHome() {
             )}
             <section className="ob-card">
               <h2>What happens next</h2>
-              <p className="ob-muted">Review, dataset versions and training open in upcoming releases. Your answers are saved, so nothing needs re-entering when they do.</p>
+              <p className="ob-muted">{modelPath ? 'Evaluation runs and deployment' : 'Review, dataset versions and training'} open in upcoming releases. Your answers are saved, so nothing needs re-entering when they do.</p>
             </section>
           </div>
         </div>

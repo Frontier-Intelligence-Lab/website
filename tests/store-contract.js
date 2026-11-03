@@ -106,7 +106,11 @@ export function runStoreContract(test, makeStore, label) {
     const b = await store.createWorkspace({ kind: 'organization', name: 'B', slug: 'b', ownerId: owner.id });
     const p = await store.createProject({ workspaceId: a.id, createdBy: owner.id, name: 'Defects', task: 'Spot damaged boxes', modalities: ['Images'], startingPoint: 'own' });
     assert.equal(p.status, 'draft');
+    assert.equal(p.model, null);
     assert.deepEqual(p.modalities, ['Images']);
+    const withModel = await store.updateProject({ workspaceId: a.id, projectId: p.id, patch: { model: { source: 'hub', hubId: 'org/model', rightsConfirmed: true } } });
+    assert.deepEqual(withModel.model, { source: 'hub', hubId: 'org/model', rightsConfirmed: true });
+    assert.deepEqual((await store.getProject({ workspaceId: a.id, projectId: p.id })).model.hubId, 'org/model');
     assert.equal(await store.getProject({ workspaceId: b.id, projectId: p.id }), null);
     assert.equal(await store.updateProject({ workspaceId: b.id, projectId: p.id, patch: { name: 'Hijack' } }), null);
     const updated = await store.updateProject({ workspaceId: a.id, projectId: p.id, patch: { success: { measure: 'recall', target: '95%' }, setupStep: 'data', id: 'ignored', workspaceId: b.id } });

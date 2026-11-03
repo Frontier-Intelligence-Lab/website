@@ -74,11 +74,53 @@ function validateDataSource(raw) {
   };
 }
 
-/** Accepts { success } or { dataSource } (one setup step at a time) and advances setupStep. */
-export function validateProjectPatch(raw) {
+// The endpoint is stored for a later evaluation run, never called from here.
+function httpsUrl(value) {
+  const raw = text(value, 500);
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : undefined;
+  } catch { return undefined; }
+}
+
+function validateModel(raw) {
+  const m = raw && typeof raw === 'object' ? raw : {};
+  const source = oneOf(m.source, ['endpoint', 'files', 'hub']);
+  const endpointUrl = source === 'endpoint' ? httpsUrl(m.endpointUrl) : null;
+  const model = {
+    source,
+    endpointUrl: endpointUrl ?? null,
+    location: source === 'files' ? text(m.location, 300) || null : null,
+    hubId: source === 'hub' ? text(m.hubId, 200) || null : null,
+    format: oneOf(m.format, ['pytorch', 'safetensors', 'onnx', 'gguf', 'tensorflow', 'other', 'unknown']) ?? 'unknown',
+    license: text(m.license, 200) || null,
+    rightsConfirmed: m.rightsConfirmed === true,
+    testSet: oneOf(m.testSet, ['yes', 'partial', 'no']) ?? 'no',
+    testSetSize: text(m.testSetSize, 80) || null,
+    rubric: text(m.rubric, 2000) || null,
+  };
+  const errors = {};
+  if (!source) errors.source = 'Choose where the model is.';
+  if (source === 'endpoint' && !endpointUrl) errors.endpointUrl = endpointUrl === undefined ? 'Use an https:// address without a username or password in it.' : 'Add the endpoint address.';
+  if (source === 'files' && !model.location) errors.location = 'Say where the model files are kept.';
+  if (source === 'hub' && !model.hubId) errors.hubId = 'Add the model name, e.g. organization/model-name.';
+  if (!model.rightsConfirmed) errors.rightsConfirmed = 'Confirm you may test and deploy this model.';
+  return Object.keys(errors).length ? { errors } : { model };
+}
+
+/** Accepts { success }, { dataSource } or { model } (one setup step at a time) and advances setupStep. */
+export function validateProjectPatch(raw, project) {
   const body = raw && typeof raw === 'object' ? raw : {};
-  if (body.success) return { patch: { success: validateSuccess(body.success), setupStep: 'data' } };
+  const modelPath = project?.startingPoint === 'model';
+  if (body.success) return { patch: { success: validateSuccess(body.success), setupStep: modelPath ? 'model' : 'data' } };
+  if (body.model) {
+    if (!modelPath) return { errors: { form: 'This project does not start from an existing model.' } };
+    const { model, errors } = validateModel(body.model);
+    return errors ? { errors } : { patch: { model, setupStep: 'done' } };
+  }
   if (body.dataSource) {
+    if (modelPath) return { errors: { form: 'This project starts from an existing model; describe the model instead.' } };
     const dataSource = validateDataSource(body.dataSource);
     const errors = {};
     if (dataSource.mode === 'upload' && !dataSource.provenance) errors.provenance = 'Tell us where the data came from.';

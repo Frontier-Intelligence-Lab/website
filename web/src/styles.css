@@ -504,7 +504,7 @@ a { color: inherit; }
 .ob-legend { padding: 0; margin-bottom: 10px; }
 .ob-field .ob-optional { font-weight: 400; color: var(--muted); }
 .ob fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
-.ob input[type="text"], .ob input[type="email"], .ob input[type="password"], .ob input[type="search"], .ob select, .ob textarea {
+.ob input[type="text"], .ob input[type="email"], .ob input[type="password"], .ob input[type="search"], .ob input[type="url"], .ob select, .ob textarea {
   width: 100%; min-height: 44px; padding: 0 12px; border: 1px solid var(--control); border-radius: 8px;
   background: var(--surface); color: var(--text); font: inherit; font-size: 15px;
 }
@@ -571,7 +571,7 @@ a { color: inherit; }
 .ob-note .tile { background: var(--surface); }
 
 .ob-actions { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
-.ob-actions > div { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+.ob-actions > div:not(.ob-intro) { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
 .btn-app, .btn-ghost {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 18px;
   border-radius: 8px; font: inherit; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer;
@@ -650,3 +650,8 @@ a { color: inherit; }
   .ob-h1 { font-size: 28px; }
   .ob-h1--xl { font-size: 32px; }
 }
+.ob-row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ob-list > li > .avatar { width: 32px; height: 32px; font-size: 11px; }
+.ob-signout { margin-top: auto; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.ob-list > li > .ob-badge, .ob-list > li > .avatar { align-self: center; }
+.ob-org-switch { color: inherit; text-decoration: none; }
