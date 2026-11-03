@@ -1,0 +1,91 @@
+// Validation for onboarding input. The store saves only what these functions return.
+
+// Webmail domains never identify a company, so they never verify or match an organization.
+export const PERSONAL_DOMAINS = new Set([
+  'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'yahoo.com', 'ymail.com',
+  'icloud.com', 'me.com', 'mac.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com', 'zoho.com', 'yandex.com', 'mail.com',
+]);
+
+const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+export const isEmail = (value) => typeof value === 'string' && value.length <= 254 && EMAIL_RE.test(value);
+export const emailDomain = (email) => String(email ?? '').split('@')[1]?.toLowerCase() || null;
+
+export const slugify = (value) => String(value ?? '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+
+/** "https://www.Acme-Robotics.com/about" -> "acme-robotics.com"; anything that is not a hostname -> null. */
+export function normalizeDomain(value) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return null;
+  let host;
+  try { host = new URL(raw.includes('://') ? raw : `https://${raw}`).hostname; } catch { return null; }
+  host = host.replace(/^www\./, '');
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) ? host : null;
+}
+
+const MODALITIES = ['Text', 'Documents', 'Images', 'Video', 'Audio', 'Sensor or time series', 'Robot trajectories'];
+const STARTS = ['own', 'need', 'model', 'unsure'];
+const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+const oneOf = (value, allowed) => (allowed.includes(value) ? value : null);
+
+export function validateProjectStart(raw) {
+  const body = raw && typeof raw === 'object' ? raw : {};
+  const task = text(body.task, 2000);
+  const values = {
+    name: text(body.name, 120) || task.split(/[.\n]/)[0].slice(0, 80) || 'Untitled project',
+    task,
+    modalities: Array.isArray(body.modalities) ? MODALITIES.filter((m) => body.modalities.includes(m)) : [],
+    startingPoint: oneOf(body.startingPoint, STARTS),
+  };
+  const errors = {};
+  if (task.length < 10) errors.task = 'Describe the task in a sentence or two.';
+  if (!values.modalities.length) errors.modalities = 'Pick at least one kind of input.';
+  if (!values.startingPoint) errors.startingPoint = 'Choose where you are starting from.';
+  return Object.keys(errors).length ? { errors } : { values };
+}
+
+function validateSuccess(raw) {
+  const s = raw && typeof raw === 'object' ? raw : {};
+  return {
+    measure: oneOf(s.measure, ['recall', 'precision', 'accuracy', 'success_rate', 'rubric']) ?? 'recall',
+    target: text(s.target, 40) || null,
+    baseline: oneOf(s.baseline, ['current', 'off_the_shelf', 'none']) ?? 'none',
+    runsOn: oneOf(s.runsOn, ['cloud', 'servers', 'device', 'later']) ?? 'later',
+    device: text(s.device, 120) || null,
+    latency: text(s.latency, 40) || null,
+    spendLimit: text(s.spendLimit, 40) || null,
+    approver: text(s.approver, 120) || null,
+  };
+}
+
+function validateDataSource(raw) {
+  const d = raw && typeof raw === 'object' ? raw : {};
+  const mode = oneOf(d.mode, ['upload', 'license', 'commission']) ?? 'upload';
+  const uses = Array.isArray(d.allowedUses) ? ['training', 'testing'].filter((u) => d.allowedUses.includes(u)) : [];
+  return {
+    mode,
+    provenance: mode === 'upload' ? oneOf(d.provenance, ['ours', 'licensed', 'users']) : null,
+    allowedUses: mode === 'upload' ? uses : [],
+    personalData: mode === 'upload' ? oneOf(d.personalData, ['no', 'yes', 'unsure']) ?? 'unsure' : null,
+    query: mode === 'license' ? text(d.query, 200) || null : null,
+    brief: mode === 'commission' ? text(d.brief, 2000) || null : null,
+    quantity: mode === 'commission' ? text(d.quantity, 80) || null : null,
+    budget: mode === 'commission' ? text(d.budget, 80) || null : null,
+    neededBy: mode === 'commission' ? text(d.neededBy, 80) || null : null,
+  };
+}
+
+/** Accepts { success } or { dataSource } (one setup step at a time) and advances setupStep. */
+export function validateProjectPatch(raw) {
+  const body = raw && typeof raw === 'object' ? raw : {};
+  if (body.success) return { patch: { success: validateSuccess(body.success), setupStep: 'data' } };
+  if (body.dataSource) {
+    const dataSource = validateDataSource(body.dataSource);
+    const errors = {};
+    if (dataSource.mode === 'upload' && !dataSource.provenance) errors.provenance = 'Tell us where the data came from.';
+    if (dataSource.mode === 'upload' && !dataSource.allowedUses.length) errors.allowedUses = 'Choose at least one allowed use.';
+    if (dataSource.mode === 'commission' && !dataSource.brief) errors.brief = 'Describe what should be collected or labeled.';
+    if (Object.keys(errors).length) return { errors };
+    return { patch: { dataSource, setupStep: 'done' } };
+  }
+  return { errors: { form: 'Nothing to update.' } };
+}

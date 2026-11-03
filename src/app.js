@@ -11,6 +11,8 @@ import { LIMITS, createDelivery, validateContact } from './lib/contact.js';
 import { authenticateReviewer, normalizeUsername } from './lib/reviewers.js';
 import { createSigninLog } from './lib/signins.js';
 import { isSameOriginRequest } from './lib/origin.js';
+import { createStore } from './store/index.js';
+import { registerAccountRoutes } from './accounts.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -19,7 +21,10 @@ export const ROOT_FILES = ['favicon.svg', 'fonts/LICENSE-Inter-OFL.txt'];
 const BUILD_DIRS = /^\/(assets|private)\//;
 const SAFE_SUBPATH = /^(?!.*\.\.)[\w./-]+$/;
 
-export async function buildApp({ config, logger = false, contactTransport, rateLimits = {}, distDir = DEFAULT_DIST }) {
+// Onboarding pages; the React app renders them and the API enforces sign-in and membership.
+const ACCOUNT_PAGES = ['/signup', '/signin', '/verify', '/start', '/setup/*', '/w/*'];
+
+export async function buildApp({ config, logger = false, contactTransport, mailTransport, store, rateLimits = {}, distDir = DEFAULT_DIST }) {
   let indexHtml;
   try {
     indexHtml = readFileSync(path.join(distDir, 'index.html'), 'utf8');
@@ -30,6 +35,8 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
   const app = Fastify({ logger, trustProxy: config.trustProxy, bodyLimit: 32 * 1024 });
   const delivery = createDelivery(config.smtp, contactTransport);
   const signins = await createSigninLog(config.signinLogFile, app.log);
+  const accountStore = store === undefined ? await createStore(config, app.log) : store;
+  if (accountStore) app.addHook('onClose', () => accountStore.close());
   // Keeps a private, no-store header set by the route; public pages revalidate so new builds are picked up.
   const page = (reply, status = 200) => {
     if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-cache');
@@ -103,12 +110,22 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
     return reviewerOf(request) ? page(reply) : reply.redirect('/demo', 303);
   });
 
+  for (const url of ACCOUNT_PAGES) {
+    app.get(url, async (_request, reply) => {
+      privateHeaders(reply);
+      return page(reply);
+    });
+  }
+  await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers: { sameOrigin, privateHeaders, problem } });
+
   const signInConfigured = config.reviewers.length > 0;
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,
     contactEmail: config.contactPublicEmail,
     contactConfigured: delivery.configured,
     signInConfigured,
+    accountsAvailable: Boolean(accountStore),
+    signupOpen: Boolean(accountStore) && config.accountSignup,
     limits: LIMITS,
   }));
 

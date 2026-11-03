@@ -64,6 +64,15 @@ export function loadConfig(env = process.env) {
     throw new Error('CONTACT_DELIVERY=smtp requires SMTP_HOST, SMTP_PORT and CONTACT_FROM (or SMTP_USER)');
   }
 
+  const databaseUrl = env.DATABASE_URL || null;
+  const databaseSsl = env.DATABASE_SSL || (isProd ? 'require' : 'disable');
+  if (!['disable', 'require', 'verify-full'].includes(databaseSsl)) {
+    throw new Error('DATABASE_SSL must be "disable", "require" or "verify-full"');
+  }
+  if (isProd && databaseUrl && databaseSsl === 'disable') {
+    throw new Error('DATABASE_SSL=disable is not allowed in production');
+  }
+
   let reviewers = [];
   if (env.REVIEWERS_FILE) reviewers = parseReviewers(readFileSync(env.REVIEWERS_FILE, 'utf8'));
   else if (env.REVIEWERS_JSON) reviewers = parseReviewers(env.REVIEWERS_JSON);
@@ -84,5 +93,9 @@ export function loadConfig(env = process.env) {
     bookingUrl: env.BOOKING_URL ?? 'https://cal.com/ayushozha/15-min-getting-to-know',
     reviewers,
     signinLogFile: env.SIGNIN_LOG_FILE || null,
+    databaseUrl,
+    databaseSsl,
+    // Self-serve accounts and onboarding. Off in production unless explicitly enabled.
+    accountSignup: truthy(env.ACCOUNT_SIGNUP, !isProd),
   };
 }
