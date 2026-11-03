@@ -155,3 +155,101 @@ This is a long-running Node server (sessions, SMTP, rate limits), not a static o
 ## License
 
 No application license file is currently checked in. The bundled Inter font includes its OFL license (`web/public/fonts/LICENSE-Inter-OFL.txt`). This is a private project workspace.
+
+## Database
+
+The optional Postgres store implements [the storage contract](docs/STORE_CONTRACT.md). With `DATABASE_URL` unset, development and tests use the existing in-memory store. Production without a database keeps the new account routes unavailable. Existing reviewer credentials and the sign-in JSONL log are separate and are not migrated by these scripts.
+
+### Local Postgres 17
+
+Start the local database from this repository root:
+
+```sh
+docker compose -f docker-compose.postgres.yml up -d --wait
+docker compose -f docker-compose.postgres.yml exec postgres createdb -U valcairn valcairn_test
+```
+
+The second command creates the test-only database once. The service binds **only `127.0.0.1:5432`**, stores data in the named `valcairn_postgres_data` volume, and uses intentionally public local-only credentials. Never reuse these credentials or this initialization superuser in production. `docker compose ... down` retains the volume; adding `-v` deletes its contents.
+
+For the application, put these values in an ignored local `.env`:
+
+```dotenv
+DATABASE_URL=postgresql://valcairn:valcairn_local_only@127.0.0.1:5432/valcairn
+DATABASE_SSL=disable
+```
+
+Then run `npm run db:migrate` before starting the app. The npm script reads `.env`. Migrations are not run automatically by the web server.
+
+`DATABASE_SSL` accepts `disable` (local plain TCP), `require` (encrypted connection without certificate verification) or `verify-full` (encrypted connection with certificate/hostname verification). Production defaults to `require` and refuses `disable`. Prefer `verify-full` in production with a certificate valid for the configured database hostname; provide a private CA through Node's trusted-CA configuration, such as an appropriately mounted `NODE_EXTRA_CA_CERTS` file. Keep TLS settings in `DATABASE_SSL` rather than contradictory SSL options in the connection URL.
+
+### Store tests
+
+The database tests use **only `TEST_DATABASE_URL`** for connections. They apply migrations to the dedicated test database and reset the store tables between tests. This intentionally deletes test records: use the separate local `valcairn_test` database, never a production database or one containing real data. The safety guard rejects an application-database target, requires a test-named database with an explicit host and port, and refuses query parameters that could override the destination. Unset `DATABASE_URL` for isolated tests; if it is present, it is only inspected for the safety comparison and must also be unambiguous. Its test role needs migration and table-reset privileges; the application role in production does not. Keep this test file serial; parallel CI jobs need separate test databases.
+
+On macOS/Linux:
+
+```sh
+env -u DATABASE_URL TEST_DATABASE_URL='postgresql://valcairn:valcairn_local_only@127.0.0.1:5432/valcairn_test' node --test tests/store-postgres.test.js
+```
+
+On PowerShell:
+
+```powershell
+$env:TEST_DATABASE_URL = 'postgresql://valcairn:valcairn_local_only@127.0.0.1:5432/valcairn_test'
+$env:DATABASE_URL = $null
+node --test tests/store-postgres.test.js
+Remove-Item Env:TEST_DATABASE_URL
+```
+
+With `TEST_DATABASE_URL` unset, the Postgres suite skips cleanly and `npm run check` still runs without a database.
+
+### Migrations and schema
+
+`scripts/migrate.js` applies numbered SQL files in order, records their SHA-256 checksums in `schema_migrations`, and commits each file and its ledger entry atomically. It serializes concurrent runners with a database/schema advisory lock. Applied files must remain unchanged; append a new numbered migration instead. The exported `applyMigrations({ pool })` also accepts an existing `pg.Pool`, which lets the tests select an isolated schema without modifying the SQL files.
+
+- `001_init.sql`: users, email-verification codes, workspaces, memberships, invitations, join requests, projects and audit events.
+- `002_sessions.sql`: expiring sessions, reserved for the separate Fastify session-store integration.
+
+Relative to the starting schema, the migrations explicitly constrain lower-case email/domain/slug storage, nonnegative code attempts, object-shaped JSON, valid project statuses, and verified domains having a domain value. They add relationship/expiry indexes and foreign keys. `audit_events.target_id` is text because audit targets are generic identifiers. PostgreSQL 17 provides `gen_random_uuid()` directly, so no extension is needed. No provider, listing or financing tables are added.
+
+The session adapter is not wired into `src/app.js` by this change. Its factory is `createPgSessionStore({ connectionString, ssl, logger, ttlMs, pruneIntervalMs })`; defaults are eight hours for the fallback TTL and 15 minutes for pruning. It supplies callback-compatible `get`, `set`, `destroy` and `compareAndSet` methods (the installed `@fastify/session` also requires compare-and-set), plus `pruneExpired()` and `close()`. Omitting callbacks returns promises.
+
+For the later Fastify integration, construct it once, pass `store: sessionStore` to the existing `@fastify/session` options, and close it with the app:
+
+```js
+import { createPgSessionStore } from './store/pg-session-store.js';
+
+const sessionStore = createPgSessionStore({
+  connectionString: config.databaseUrl,
+  ssl: config.databaseSsl,
+  logger: app.log,
+  ttlMs: config.sessionTtlMs,
+});
+// Keep the existing secret/cookie options; add store: sessionStore there.
+app.addHook('onClose', async () => sessionStore.close());
+```
+
+Keep this integration separate from the application-data store and retain the existing production session secret.
+
+### Production deployment proposal — not executed
+
+Proposed production layout (requires approval before any server changes; never reuse the local Compose credentials or superuser):
+
+- Prefer a **Coolify-managed Postgres 17 service**, with a dedicated internal database network shared only with `frontier-landing`. The app also keeps its existing `coolify` proxy network. Publish no database ports and create no Traefik route for it. If Coolify cannot provide the required TLS/role/backup controls, use an explicitly managed Postgres container with the same private-network boundary.
+- Proposed persistent bind location: `/home/ayush/valcairn/postgres-data` to `/var/lib/postgresql/data`, owned by the database container's runtime UID. This is a proposed new path, not an existing provisioned volume. Keep it separate from the current reviewer files and sign-in log.
+- A bootstrap administrator creates the database and two non-superuser logins. `valcairn_migrator` owns the application schema/objects and can run DDL there, but cannot create databases or roles. `valcairn_app` is not an owner and has only schema usage, data-table read/write privileges and required sequence usage. Do not grant the application write access to `schema_migrations`. Set matching default privileges for future migrations. Use a separate read-only backup identity.
+- Configure PostgreSQL TLS with a certificate valid for its internal hostname, mount the CA into the application, and use `DATABASE_SSL=verify-full`. Supply the application URL through the existing protected runtime secret file or scoped Coolify secret; supply the migration URL only to a one-off migration job. Never put either production URL in command history, source, screenshots or logs.
+- Proposed backup job: daily at **02:00 UTC**, create a consistent custom-format dump, encrypt it, retain 7 daily/4 weekly/3 monthly copies, and send a verified copy to a private off-host object-storage bucket. A proposed local staging directory is `/home/ayush/valcairn/backups/postgres`; local-only backups are insufficient. Alert on failed jobs, missing uploads and stale backup age. Run a monthly restore drill into a separate database and verify migrations, representative records, workspace isolation and login. Agree on the recovery-point/recovery-time targets before relying on this policy.
+- Roll out only after an approved backup and migration rehearsal. Keep the existing reviewer allowlist, session secret and `SIGNIN_LOG_FILE` mounts unchanged. Session-store wiring is a separate reviewed step; this branch does not change it.
+
+#### Restore rehearsal actually performed locally
+
+Postgres **17.8** was tested locally using the commands below. A synthetic record and both migration-ledger entries were recovered into an isolated database (record count 1; migration count 2). This is evidence for the restore procedure, not a production backup claim. Choose a fresh restore database name on subsequent runs.
+
+```sh
+docker compose -f docker-compose.postgres.yml exec -T postgres pg_dump -U valcairn -d valcairn_test --format=custom --file=/tmp/valcairn-restore-check.dump
+docker compose -f docker-compose.postgres.yml exec -T postgres createdb -U valcairn valcairn_restore_test_20261103
+docker compose -f docker-compose.postgres.yml exec -T postgres pg_restore -U valcairn --exit-on-error --no-owner --dbname=valcairn_restore_test_20261103 /tmp/valcairn-restore-check.dump
+```
+
+Pending production decisions: private backup destination/region and retention obligations; recovery targets; TLS certificate/CA ownership; and approval of the database service, private network, roles and persistent path. No production database, container, Coolify setting or secret was changed by this work.

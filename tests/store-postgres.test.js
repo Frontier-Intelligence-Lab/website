@@ -1,0 +1,263 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, unlink, rmdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import Fastify from 'fastify';
+import cookie from '@fastify/cookie';
+import session from '@fastify/session';
+import { createPostgresPool, createPostgresStore } from '../src/store/postgres.js';
+import { createPgSessionStore } from '../src/store/pg-session-store.js';
+import { applyMigrations } from '../scripts/migrate.js';
+import { runStoreContract } from './store-contract.js';
+
+// These tests reset ONLY the explicitly supplied, dedicated test database.
+// No application connection string is ever used to establish a connection.
+const connectionString = process.env.TEST_DATABASE_URL;
+const options = { connectionString, ssl: 'disable' };
+const dbIdentity = (value) => {
+  const url = new URL(value);
+  // pg accepts destination overrides in URL query parameters. Refuse ambiguous
+  // targets before any connection or destructive reset, including the app URL.
+  if (!url.hostname || !url.port || url.search) throw new Error('Database safety checks require explicit-host and port URLs without query parameters; unset DATABASE_URL when running isolated tests');
+  const hostname = decodeURIComponent(url.hostname).toLowerCase();
+  const host = ['localhost', '127.0.0.1', '[::1]'].includes(hostname) ? 'loopback' : hostname;
+  return `${host}:${url.port}${decodeURI(url.pathname)}`;
+};
+function validateTestDatabase(testUrl, applicationUrl) {
+  const identity = dbIdentity(testUrl);
+  const database = decodeURI(new URL(testUrl).pathname.slice(1));
+  if (!/(^|[_-])test($|[_-])/i.test(database)) throw new Error('TEST_DATABASE_URL must name a dedicated test database (for example valcairn_test)');
+  if (applicationUrl && identity === dbIdentity(applicationUrl)) {
+    throw new Error('TEST_DATABASE_URL must not target the application DATABASE_URL database');
+  }
+}
+if (connectionString) validateTestDatabase(connectionString, process.env.DATABASE_URL);
+
+async function makeStore() {
+  const pool = createPostgresPool(options);
+  try {
+    await applyMigrations({ pool });
+    await pool.query('TRUNCATE TABLE sessions, audit_events, projects, join_requests, invitations, memberships, email_codes, workspaces, users RESTART IDENTITY CASCADE');
+  } finally { await pool.end(); }
+  return createPostgresStore(options);
+}
+
+// Node's top-level tests are serial: every makeStore starts with empty tables.
+runStoreContract(connectionString ? test : test.skip, makeStore, 'postgres store');
+const withStore = (name, fn) => test(`postgres store: ${name}`, { skip: !connectionString, concurrency: false }, async () => {
+  const store = await makeStore();
+  const pool = createPostgresPool(options);
+  try { await fn(store, pool); } finally { await store.close(); await pool.end(); }
+});
+const user = (store, email = 'owner@example.test') => store.createUser({ email, name: 'Owner', passwordHash: 'test-hash' });
+const workspace = (store, ownerId, extra = {}) => store.createWorkspace({ kind: 'organization', name: 'Example', slug: 'example', ownerId, ...extra });
+
+withStore('parallel email-code consumers have exactly one winner', async (store) => {
+  const { id: userId } = await user(store);
+  await store.createEmailCode({ userId, email: 'owner@example.test', purpose: 'signup', codeHash: 'right', expiresAt: new Date(Date.now() + 60_000) });
+  const results = await Promise.all(Array.from({ length: 8 }, () => store.consumeEmailCode({ userId, purpose: 'signup', codeHash: 'right' })));
+  assert.equal(results.filter(r => r.ok).length, 1);
+  assert.equal(results.filter(r => r.reason === 'invalid').length, 7);
+});
+
+withStore('parallel wrong codes cannot bypass the attempt limit', async (store) => {
+  const { id: userId } = await user(store);
+  await store.createEmailCode({ userId, email: 'owner@example.test', purpose: 'academic', codeHash: 'right', expiresAt: new Date(Date.now() + 60_000) });
+  await Promise.all(Array.from({ length: 8 }, () => store.consumeEmailCode({ userId, purpose: 'academic', codeHash: 'wrong' })));
+  assert.deepEqual(await store.consumeEmailCode({ userId, purpose: 'academic', codeHash: 'right' }), { ok: false, reason: 'too_many_attempts' });
+});
+
+withStore('personal workspace uniqueness survives parallel requests', async (store) => {
+  const owner = await user(store);
+  const results = await Promise.allSettled(['personal-a', 'personal-b'].map(slug => workspace(store, owner.id, { kind: 'personal', slug })));
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'personal_exists');
+  assert.equal((await store.listWorkspacesForUser(owner.id)).length, 1);
+});
+
+withStore('concurrent invitation replacement keeps one pending invite', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  await Promise.all(['first', 'second'].map(tokenHash => store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: 'INVITEE@example.test', role: 'member', tokenHash, expiresAt: new Date(Date.now() + 60_000) }] })));
+  const invites = await store.listInvitations(ws.id);
+  assert.equal(invites.length, 1);
+  assert.equal(invites[0].email, 'invitee@example.test');
+  assert.equal('tokenHash' in invites[0], false);
+});
+
+withStore('failed invitation batches roll back revocations and audit rows', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const invite = { email: 'invitee@example.test', role: 'member', tokenHash: 'original', expiresAt: new Date(Date.now() + 60_000) };
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [invite] });
+  const before = await store.listInvitations(ws.id);
+  const auditBefore = await store.listAudit(ws.id);
+  await assert.rejects(store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [
+    { ...invite, tokenHash: 'duplicate' }, { ...invite, email: 'second@example.test', tokenHash: 'duplicate' },
+  ] }), { code: '23505' });
+  assert.deepEqual(await store.listInvitations(ws.id), before);
+  assert.deepEqual(await store.listAudit(ws.id), auditBefore);
+});
+
+withStore('workspace and owner roll back when audit insertion fails', async (store, pool) => {
+  const owner = await user(store);
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_creation CHECK (action <> 'workspace.created')");
+  try {
+    await assert.rejects(workspace(store, owner.id), { code: '23514' });
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM workspaces')).rows[0].count, 0);
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM memberships')).rows[0].count, 0);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_creation'); }
+});
+
+withStore('parallel join requests and decisions preserve a single outcome', async (store) => {
+  const owner = await user(store);
+  const joiner = await user(store, 'joiner@example.test');
+  const ws = await workspace(store, owner.id);
+  const requests = await Promise.all(Array.from({ length: 6 }, () => store.createJoinRequest({ workspaceId: ws.id, userId: joiner.id })));
+  assert.equal(new Set(requests.map(r => r.id)).size, 1);
+  const results = await Promise.allSettled([true, false].map(approve => store.decideJoinRequest({ workspaceId: ws.id, requestId: requests[0].id, deciderId: owner.id, approve })));
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'already_decided');
+  const outcome = results.find(r => r.status === 'fulfilled').value;
+  assert.equal(Boolean(await store.getMembership(ws.id, joiner.id)), outcome.status === 'approved');
+});
+
+withStore('normalization, safe shapes, first verification and nullable patches', async (store) => {
+  const owner = await user(store, 'UPPER@example.test');
+  const verified = await store.setEmailVerified(owner.id);
+  assert.equal((await store.setEmailVerified(owner.id)).emailVerifiedAt, verified.emailVerifiedAt);
+  const ws = await workspace(store, owner.id, { slug: 'UPPER-SLUG', domain: 'EXAMPLE.TEST' });
+  assert.equal(ws.slug, 'upper-slug');
+  assert.equal(await store.isSlugAvailable('UPPER-SLUG'), false);
+  assert.match(ws.createdAt, /Z$/);
+  assert.equal('personalOwnerId' in ws, false);
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Test', task: 'Classify', startingPoint: 'own' });
+  await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: { target: 1 }, dataSource: { kind: 'upload' } } });
+  const reset = await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: null, dataSource: null, modalities: [] } });
+  assert.equal(reset.success, null);
+  assert.equal(reset.dataSource, null);
+  assert.deepEqual(reset.modalities, []);
+  assert.equal(await store.getUserById('not-a-uuid'), null);
+  assert.equal(await store.getWorkspace('not-a-uuid'), null);
+});
+
+withStore('migrations are repeatable, detect edits and roll back a failed file', async (_store, pool) => {
+  assert.deepEqual(await applyMigrations({ pool }), []);
+  const directory = await mkdtemp(join(tmpdir(), 'valcairn-migrations-'));
+  const edited = join(directory, '001_init.sql');
+  const failing = join(directory, '999_fail.sql');
+  try {
+    await writeFile(edited, 'SELECT 1;');
+    await assert.rejects(applyMigrations({ pool, directory }), /has changed/);
+    await unlink(edited);
+    await writeFile(failing, 'CREATE TABLE migration_atomic_probe (id integer); SELECT missing_migration_function();');
+    await assert.rejects(applyMigrations({ pool, directory }));
+    assert.equal((await pool.query("SELECT to_regclass('migration_atomic_probe') AS name")).rows[0].name, null);
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM schema_migrations WHERE filename = $1', ['999_fail.sql'])).rows[0].count, 0);
+  } finally {
+    await unlink(edited).catch(() => {});
+    await unlink(failing).catch(() => {});
+    await rmdir(directory);
+  }
+});
+
+const call = (store, method, ...args) => new Promise((resolve, reject) => {
+  store[method](...args, (error, result) => error ? reject(error) : resolve(result));
+});
+
+test('postgres connection policy cannot be downgraded by URL SSL parameters', async () => {
+  for (const [mode, expected] of [['disable', false], ['require', { rejectUnauthorized: false }], ['verify-full', { rejectUnauthorized: true }]]) {
+    const pool = createPostgresPool({ connectionString: 'postgresql://local@127.0.0.1/test?sslmode=disable&options=-csearch_path%3Dpublic', ssl: mode });
+    try {
+      assert.deepEqual(pool.options.ssl, expected);
+      const url = new URL(pool.options.connectionString);
+      assert.equal(url.searchParams.has('sslmode'), false);
+      assert.equal(url.searchParams.get('options'), '-csearch_path=public');
+    } finally { await pool.end(); }
+  }
+  assert.throws(() => createPostgresPool({ connectionString: 'not-a-url' }), /Invalid Postgres connection string/);
+  assert.throws(() => createPostgresPool({ connectionString: 'postgresql://localhost/test', ssl: 'allow' }), /Invalid Postgres SSL mode/);
+});
+
+test('test database safety rejects destination overrides and application aliases', () => {
+  const local = 'postgresql://local@127.0.0.1:5432/valcairn_test';
+  assert.doesNotThrow(() => validateTestDatabase(local));
+  for (const query of ['host=production.internal', 'port=5544', 'dbname=production', 'options=-csearch_path%3Dpublic']) {
+    assert.throws(() => validateTestDatabase(`${local}?${query}`), /without query parameters/);
+    assert.throws(() => validateTestDatabase(local, `${local}?${query}`), /without query parameters/);
+  }
+  assert.throws(() => validateTestDatabase(local, 'postgresql://other@localhost:5432/valcairn_test'), /must not target/);
+  assert.throws(() => validateTestDatabase(local, 'postgresql://other@LOCALHOST:5432/valcairn_test'), /must not target/);
+  assert.throws(() => validateTestDatabase(local, 'postgresql://other@%6cocalhost:5432/valcairn_test'), /must not target/);
+  assert.throws(() => validateTestDatabase(local.replace('valcairn_test', 'valcairn%5Ftest'), local), /must not target/);
+  assert.throws(() => validateTestDatabase(local, local.replace('valcairn_test', 'valcairn%5Ftest')), /must not target/);
+  assert.throws(() => validateTestDatabase('postgresql://local@localhost/valcairn_test'), /explicit-host and port/);
+  assert.throws(() => validateTestDatabase('postgresql:///valcairn_test'), /explicit-host/);
+  assert.throws(() => validateTestDatabase('postgresql://local@localhost:5432/production'), /dedicated test/);
+});
+
+withStore('SQL-like input stays data and conflict errors do not expose rows', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const name = "x'); DROP TABLE users; --";
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name, task: 'test', startingPoint: 'own' });
+  assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).name, name);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM users')).rows[0].count, 1);
+  await assert.rejects(store.createUser({ email: 'OWNER@EXAMPLE.TEST', name: 'duplicate', passwordHash: 'must-not-leak' }), error => {
+    assert.equal(error.code, 'email_taken');
+    assert.equal(error.detail, undefined);
+    assert.equal(error.message.includes('must-not-leak'), false);
+    return true;
+  });
+});
+
+withStore('session data persists across pools, expires and prunes', async (_store, pool) => {
+  const first = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  const second = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  try {
+    const data = { user: { id: 'test-user' }, cookie: { expires: new Date(Date.now() + 60_000) } };
+    await call(first, 'set', 'persisted', data);
+    await first.close();
+    assert.equal((await call(second, 'get', 'persisted')).user.id, 'test-user');
+    await call(second, 'set', 'expired', { cookie: { expires: new Date(Date.now() - 1_000) } });
+    assert.equal(await call(second, 'get', 'expired'), null);
+    assert.equal(await second.pruneExpired(), 1);
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM sessions WHERE sid = $1', ['expired'])).rows[0].count, 0);
+    await call(second, 'destroy', 'persisted');
+    assert.equal(await call(second, 'get', 'persisted'), null);
+  } finally { await second.close(); }
+});
+
+withStore('session compare-and-set rejects stale generations and destroyed sessions', async () => {
+  const store = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  try {
+    const data = { cookie: { maxAge: 60_000 }, __fastifySessionMetadata: { generation: 'first' } };
+    await call(store, 'set', 'session', data);
+    await call(store, 'compareAndSet', 'session', 'first', { ...data, __fastifySessionMetadata: { generation: 'second' } });
+    await assert.rejects(call(store, 'compareAndSet', 'session', 'first', data), { code: 'ENOENT' });
+    await call(store, 'destroy', 'session');
+    await assert.rejects(call(store, 'compareAndSet', 'session', 'second', data), { code: 'ENOENT' });
+  } finally { await store.close(); }
+});
+
+withStore('session store works with the installed Fastify plugin', async () => {
+  const store = createPgSessionStore({ ...options, pruneIntervalMs: 0 });
+  const app = Fastify();
+  try {
+    await app.register(cookie);
+    await app.register(session, { secret: 'a-test-secret-with-at-least-32-characters', store, cookie: { secure: false, maxAge: 60_000 } });
+    app.get('/count', async request => { request.session.set('count', (request.session.get('count') ?? 0) + 1); return { count: request.session.get('count') }; });
+    app.post('/rotate', async request => { await request.session.regenerate(); return { ok: true }; });
+    app.post('/logout', async request => { await request.session.destroy(); return { ok: true }; });
+    const first = await app.inject('/count');
+    assert.equal(first.statusCode, 200);
+    const cookieHeader = first.headers['set-cookie'].split(';')[0];
+    const second = await app.inject({ url: '/count', headers: { cookie: cookieHeader } });
+    assert.deepEqual(second.json(), { count: 2 });
+    const rotated = await app.inject({ method: 'POST', url: '/rotate', headers: { cookie: cookieHeader } });
+    assert.equal(rotated.statusCode, 200);
+    const rotatedCookie = rotated.headers['set-cookie'].split(';')[0];
+    assert.equal((await app.inject({ method: 'POST', url: '/logout', headers: { cookie: rotatedCookie } })).statusCode, 200);
+  } finally { await app.close(); await store.close(); }
+});
