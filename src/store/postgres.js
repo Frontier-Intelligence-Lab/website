@@ -29,6 +29,7 @@ function databaseError(error) {
       users_email_lower_key: 'email_taken',
       workspaces_slug_key: 'slug_taken',
       workspaces_personal_owner_id_key: 'personal_exists',
+      uploads_object_key_key: 'duplicate_upload',
     }[error.constraint];
     if (code) return new StoreError(code);
   }
@@ -62,13 +63,28 @@ const joinRow = (r) => ({
 const projectRow = (r) => r ? {
   id: r.id, workspaceId: r.workspace_id, createdBy: r.created_by, name: r.name,
   task: r.task, modalities: r.modalities, startingPoint: r.starting_point,
-  success: r.success, dataSource: r.data_source, status: r.status, setupStep: r.setup_step,
+  success: r.success, dataSource: r.data_source, model: r.model, status: r.status, setupStep: r.setup_step,
   createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
 } : null;
 const auditRow = (r) => ({
   id: Number(r.id), workspaceId: r.workspace_id, actorId: r.actor_id,
   action: r.action, targetType: r.target_type, targetId: r.target_id,
   metadata: r.metadata, createdAt: iso(r.created_at),
+});
+const uploadRow = (r) => r ? {
+  id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, uploadedBy: r.uploaded_by,
+  objectKey: r.object_key, sha256: r.sha256, sizeBytes: Number(r.size_bytes),
+  contentType: r.content_type, filename: r.filename, duplicateOf: r.duplicate_of,
+  createdAt: iso(r.created_at),
+} : null;
+const reviewRow = (r) => r ? {
+  id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, submittedBy: r.submitted_by,
+  status: r.status, reviewerId: r.reviewer_id, notes: r.notes, checks: r.checks,
+  decidedAt: iso(r.decided_at), createdAt: iso(r.created_at),
+} : null;
+const versionRow = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, number: r.number,
+  createdBy: r.created_by, manifest: r.manifest, createdAt: iso(r.created_at),
 });
 
 export function createPostgresStore(options) {
@@ -94,6 +110,12 @@ export function createPostgresStore(options) {
     if (!isId(workspaceId)) throw new StoreError('not_found');
     const result = await query('SELECT id FROM workspaces WHERE id = $1 FOR UPDATE', [workspaceId], client);
     if (!result.rowCount) throw new StoreError('not_found');
+  };
+  const lockProject = async (client, workspaceId, projectId) => {
+    if (!isId(workspaceId) || !isId(projectId)) throw new StoreError('not_found');
+    const result = await query('SELECT * FROM projects WHERE workspace_id = $1 AND id = $2 FOR UPDATE', [workspaceId, projectId], client);
+    if (!result.rowCount) throw new StoreError('not_found');
+    return result.rows[0];
   };
   const addAudit = async (client, { workspaceId = null, actorId = null, action, targetType = null, targetId = null, metadata = {} }) => {
     await query(`INSERT INTO audit_events (workspace_id, actor_id, action, target_type, target_id, metadata)
@@ -217,6 +239,49 @@ export function createPostgresStore(options) {
         AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > clock_timestamp()
         ORDER BY created_at, id`, [workspaceId])).rows.map(invitationRow);
     },
+    async getInvitationByTokenHash(tokenHash) {
+      const row = (await query(`SELECT i.*, w.name AS workspace_name, w.slug AS workspace_slug
+        FROM invitations i JOIN workspaces w ON w.id = i.workspace_id
+        WHERE i.token_hash = $1`, [tokenHash])).rows[0];
+      return row ? { ...invitationRow(row), workspaceName: row.workspace_name, workspaceSlug: row.workspace_slug } : null;
+    },
+    async acceptInvitation({ invitationId, userId }) {
+      if (!isId(invitationId) || !isId(userId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const target = (await query('SELECT workspace_id FROM invitations WHERE id = $1', [invitationId], client)).rows[0];
+        if (!target) throw new StoreError('not_found');
+        // Share the workspace lock used by invitation replacement and membership changes.
+        await lockWorkspace(client, target.workspace_id);
+        const invite = (await query(`SELECT *, expires_at <= clock_timestamp() AS expired
+          FROM invitations WHERE id = $1 FOR UPDATE`, [invitationId], client)).rows[0];
+        if (!invite) throw new StoreError('not_found');
+        if (invite.accepted_at || invite.revoked_at) throw new StoreError('already_decided');
+        if (invite.expired) throw new StoreError('invite_expired');
+        await query('UPDATE invitations SET accepted_at = clock_timestamp() WHERE id = $1', [invitationId], client);
+        const added = await query(`INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)
+          ON CONFLICT (workspace_id, user_id) DO NOTHING RETURNING role`, [invite.workspace_id, userId, invite.role], client);
+        const member = added.rows[0] ?? (await query('SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2', [invite.workspace_id, userId], client)).rows[0];
+        await addAudit(client, { workspaceId: invite.workspace_id, actorId: userId, action: 'invitation.accepted', targetType: 'invitation', targetId: invitationId, metadata: { role: invite.role } });
+        return { workspaceId: invite.workspace_id, role: member.role, alreadyMember: added.rowCount === 0 };
+      });
+    },
+    async revokeInvitation({ workspaceId, invitationId, actorId }) {
+      if (!isId(invitationId)) throw new StoreError('not_found');
+      await transaction(async (client) => {
+        await lockWorkspace(client, workspaceId);
+        const invite = (await query('SELECT * FROM invitations WHERE workspace_id = $1 AND id = $2 FOR UPDATE', [workspaceId, invitationId], client)).rows[0];
+        if (!invite) throw new StoreError('not_found');
+        if (invite.accepted_at || invite.revoked_at) throw new StoreError('already_decided');
+        await query('UPDATE invitations SET revoked_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2', [workspaceId, invitationId], client);
+        await addAudit(client, { workspaceId, actorId, action: 'invitation.revoked', targetType: 'invitation', targetId: invitationId });
+      });
+    },
+    async updateWorkspaceProfile({ workspaceId, profile }) {
+      if (!isId(workspaceId)) throw new StoreError('not_found');
+      const row = (await query('UPDATE workspaces SET profile = profile || $2::jsonb WHERE id = $1 RETURNING *', [workspaceId, JSON.stringify(profile)])).rows[0];
+      if (!row) throw new StoreError('not_found');
+      return workspaceRow(row);
+    },
 
     async createJoinRequest({ workspaceId, userId, note = '' }) {
       if (!isId(userId)) throw new StoreError('not_found');
@@ -256,15 +321,15 @@ export function createPostgresStore(options) {
     async createProject({ workspaceId, createdBy, name, task, modalities = [], startingPoint }) {
       if (!isId(workspaceId)) throw new StoreError('not_found');
       return transaction(async (client) => {
-        const row = (await query(`INSERT INTO projects (workspace_id, created_by, name, task, modalities, starting_point)
-          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [workspaceId, createdBy, name, task, modalities, startingPoint], client)).rows[0];
+        const row = (await query(`INSERT INTO projects (workspace_id, created_by, name, task, modalities, starting_point, model)
+          VALUES ($1, $2, $3, $4, $5, $6, NULL) RETURNING *`, [workspaceId, createdBy, name, task, modalities, startingPoint], client)).rows[0];
         await addAudit(client, { workspaceId, actorId: createdBy, action: 'project.created', targetType: 'project', targetId: row.id });
         return projectRow(row);
       });
     },
     async updateProject({ workspaceId, projectId, patch }) {
       if (!isId(workspaceId) || !isId(projectId)) return null;
-      const allowed = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'status', 'setupStep'];
+      const allowed = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'status', 'setupStep'];
       const changes = Object.fromEntries(allowed.filter(key => Object.hasOwn(patch, key)).map(key => [key, patch[key]]));
       const result = await query(`UPDATE projects SET
         name = CASE WHEN $3::jsonb ? 'name' THEN $3::jsonb ->> 'name' ELSE name END,
@@ -273,6 +338,7 @@ export function createPostgresStore(options) {
         starting_point = CASE WHEN $3::jsonb ? 'startingPoint' THEN $3::jsonb ->> 'startingPoint' ELSE starting_point END,
         success = CASE WHEN $3::jsonb ? 'success' THEN NULLIF($3::jsonb -> 'success', 'null'::jsonb) ELSE success END,
         data_source = CASE WHEN $3::jsonb ? 'dataSource' THEN NULLIF($3::jsonb -> 'dataSource', 'null'::jsonb) ELSE data_source END,
+        model = CASE WHEN $3::jsonb ? 'model' THEN NULLIF($3::jsonb -> 'model', 'null'::jsonb) ELSE model END,
         status = CASE WHEN $3::jsonb ? 'status' THEN $3::jsonb ->> 'status' ELSE status END,
         setup_step = CASE WHEN $3::jsonb ? 'setupStep' THEN $3::jsonb ->> 'setupStep' ELSE setup_step END,
         updated_at = clock_timestamp()
@@ -287,6 +353,89 @@ export function createPostgresStore(options) {
       if (!isId(workspaceId)) return [];
       return (await query('SELECT * FROM projects WHERE workspace_id = $1 ORDER BY created_at, id', [workspaceId])).rows.map(projectRow);
     },
+
+    async createUpload({ workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename }) {
+      return transaction(async (client) => {
+        // Serialize duplicate detection within this project, including parallel receipts.
+        await lockProject(client, workspaceId, projectId);
+        const duplicate = (await query('SELECT id FROM uploads WHERE project_id = $1 AND sha256 = $2 AND duplicate_of IS NULL ORDER BY created_at, id LIMIT 1', [projectId, sha256], client)).rows[0];
+        const row = (await query(`INSERT INTO uploads
+          (workspace_id, project_id, uploaded_by, object_key, sha256, size_bytes, content_type, filename, duplicate_of)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [workspaceId, projectId, uploadedBy, objectKey, sha256, sizeBytes, contentType, filename, duplicate?.id ?? null], client)).rows[0];
+        return uploadRow(row);
+      });
+    },
+    async listUploads({ workspaceId, projectId }) {
+      if (!isId(workspaceId) || !isId(projectId)) return [];
+      return (await query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId])).rows.map(uploadRow);
+    },
+    async getUpload(uploadId) {
+      if (!isId(uploadId)) return null;
+      return uploadRow((await query('SELECT * FROM uploads WHERE id = $1', [uploadId])).rows[0]);
+    },
+
+    async submitForReview({ workspaceId, projectId, submittedBy }) {
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!['draft', 'changes_requested'].includes(project.status)) throw new StoreError('invalid_state');
+        const row = (await query('INSERT INTO reviews (workspace_id, project_id, submitted_by) VALUES ($1, $2, $3) RETURNING *', [workspaceId, projectId, submittedBy], client)).rows[0];
+        await query("UPDATE projects SET status = 'in_review', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2", [workspaceId, projectId], client);
+        await addAudit(client, { workspaceId, actorId: submittedBy, action: 'review.submitted', targetType: 'project', targetId: projectId, metadata: { reviewId: row.id } });
+        return reviewRow(row);
+      });
+    },
+    async listReviews({ status = 'pending' } = {}) {
+      return (await query(`SELECT r.*, p.name AS project_name, w.name AS workspace_name
+        FROM reviews r JOIN projects p ON p.id = r.project_id JOIN workspaces w ON w.id = r.workspace_id
+        WHERE r.status = $1 ORDER BY r.created_at, r.id`, [status])).rows.map(row => ({ ...reviewRow(row), projectName: row.project_name, workspaceName: row.workspace_name }));
+    },
+    async getReview(reviewId) {
+      if (!isId(reviewId)) return null;
+      return reviewRow((await query('SELECT * FROM reviews WHERE id = $1', [reviewId])).rows[0]);
+    },
+    async listProjectReviews({ workspaceId, projectId }) {
+      if (!isId(workspaceId) || !isId(projectId)) return [];
+      return (await query('SELECT * FROM reviews WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId])).rows.map(reviewRow);
+    },
+    async decideReview({ reviewId, reviewerId, decision, notes = null, checks = {} }) {
+      if (!isId(reviewId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const target = (await query('SELECT workspace_id, project_id FROM reviews WHERE id = $1', [reviewId], client)).rows[0];
+        if (!target) throw new StoreError('not_found');
+        // Lock projects before reviews consistently with submission/version creation.
+        await lockProject(client, target.workspace_id, target.project_id);
+        const review = (await query('SELECT * FROM reviews WHERE id = $1 FOR UPDATE', [reviewId], client)).rows[0];
+        if (!review) throw new StoreError('not_found');
+        if (review.status !== 'pending') throw new StoreError('already_decided');
+        if (!['approved', 'changes_requested'].includes(decision)) throw new StoreError('invalid_state');
+        const row = (await query(`UPDATE reviews SET status = $2, reviewer_id = $3, notes = $4,
+          checks = $5::jsonb, decided_at = clock_timestamp() WHERE id = $1 RETURNING *`,
+        [reviewId, decision, reviewerId, notes, JSON.stringify(checks)], client)).rows[0];
+        await query('UPDATE projects SET status = $3, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2', [review.workspace_id, review.project_id, decision], client);
+        await addAudit(client, { workspaceId: review.workspace_id, actorId: reviewerId, action: `review.${decision}`, targetType: 'project', targetId: review.project_id, metadata: { reviewId } });
+        return reviewRow(row);
+      });
+    },
+
+    async createDatasetVersion({ workspaceId, projectId, createdBy, manifest }) {
+      return transaction(async (client) => {
+        const project = await lockProject(client, workspaceId, projectId);
+        if (!['approved', 'versioned'].includes(project.status)) throw new StoreError('invalid_state');
+        const row = (await query(`INSERT INTO dataset_versions (workspace_id, project_id, number, created_by, manifest)
+          SELECT $1, $2, COALESCE(MAX(number), 0) + 1, $3, $4::jsonb
+          FROM dataset_versions WHERE project_id = $2 RETURNING *`,
+        [workspaceId, projectId, createdBy, JSON.stringify(manifest)], client)).rows[0];
+        await query("UPDATE projects SET status = 'versioned', updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2", [workspaceId, projectId], client);
+        await addAudit(client, { workspaceId, actorId: createdBy, action: 'dataset_version.created', targetType: 'project', targetId: projectId, metadata: { number: row.number } });
+        return versionRow(row);
+      });
+    },
+    async listDatasetVersions({ workspaceId, projectId }) {
+      if (!isId(workspaceId) || !isId(projectId)) return [];
+      return (await query('SELECT * FROM dataset_versions WHERE workspace_id = $1 AND project_id = $2 ORDER BY number', [workspaceId, projectId])).rows.map(versionRow);
+    },
+
     async recordAudit(event) { await addAudit(pool, event); },
     async listAudit(workspaceId, { limit = 50 } = {}) {
       if (workspaceId !== null && !isId(workspaceId)) return [];

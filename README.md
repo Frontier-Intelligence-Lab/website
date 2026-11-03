@@ -209,8 +209,14 @@ With `TEST_DATABASE_URL` unset, the Postgres suite skips cleanly and `npm run ch
 
 - `001_init.sql`: users, email-verification codes, workspaces, memberships, invitations, join requests, projects and audit events.
 - `002_sessions.sql`: expiring sessions, reserved for the separate Fastify session-store integration.
+- `003_project_model.sql`: nullable object-shaped model intake metadata.
+- `004_onboarding_v3.sql`: uploads, staff reviews and numbered dataset versions, plus the v3 project statuses. Legacy `submitted` projects return to `draft` because the old status did not record a staff review. Other project data is retained.
 
 Relative to the starting schema, the migrations explicitly constrain lower-case email/domain/slug storage, nonnegative code attempts, object-shaped JSON, valid project statuses, and verified domains having a domain value. They add relationship/expiry indexes and foreign keys. `audit_events.target_id` is text because audit targets are generic identifiers. PostgreSQL 17 provides `gen_random_uuid()` directly, so no extension is needed. No provider, listing or financing tables are added.
+
+The v3 tables use composite foreign keys to keep each upload, review and version in its project's workspace. Duplicate uploads reference an original in that same project; SHA-256 strings are lowercase hex and file sizes are nonnegative safe JavaScript integers. A partial unique index permits one pending review per project. Dataset numbers are unique per project and assigned while its row is locked. Invitation acceptance/revocation, review transitions and version creation include their audit entries in the same transaction. The nine shared contract tests and additional Postgres concurrency/rollback tests cover these operations.
+
+An upgrade rehearsal from migrations 001/002 preserved a legacy project while converting `submitted` to `draft` and adding `model: null`. After v3 writes, rollback requires a reviewed data conversion or backup restore; restoring the old status constraint alone will reject the new states.
 
 The session adapter is not wired into `src/app.js` by this change. Its factory is `createPgSessionStore({ connectionString, ssl, logger, ttlMs, pruneIntervalMs })`; defaults are eight hours for the fallback TTL and 15 minutes for pruning. It supplies callback-compatible `get`, `set`, `destroy` and `compareAndSet` methods (the installed `@fastify/session` also requires compare-and-set), plus `pruneExpired()` and `close()`. Omitting callbacks returns promises.
 
@@ -242,14 +248,25 @@ Proposed production layout (requires approval before any server changes; never r
 - Proposed backup job: daily at **02:00 UTC**, create a consistent custom-format dump, encrypt it, retain 7 daily/4 weekly/3 monthly copies, and send a verified copy to a private off-host object-storage bucket. A proposed local staging directory is `/home/ayush/valcairn/backups/postgres`; local-only backups are insufficient. Alert on failed jobs, missing uploads and stale backup age. Run a monthly restore drill into a separate database and verify migrations, representative records, workspace isolation and login. Agree on the recovery-point/recovery-time targets before relying on this policy.
 - Roll out only after an approved backup and migration rehearsal. Keep the existing reviewer allowlist, session secret and `SIGNIN_LOG_FILE` mounts unchanged. Session-store wiring is a separate reviewed step; this branch does not change it.
 
+The current web Docker image does not contain `scripts/migrate.js` or `migrations/`. Run the migration job from a release artifact that includes them and `pg`; do not assume `npm run db:migrate` will work inside the current web image. Updating that image/job is a separate deployment change.
+
+#### Object storage and ingest routing proposal
+
+- Prefer a private managed S3 bucket with a dedicated `valcairn/` prefix, Block Public Access enabled, encryption, and object versioning. This avoids putting the only copy of uploaded data on the same VPS as Postgres. MinIO on the VPS remains an option, but requires a separate persistent volume and off-host replication/backup. The existing Rust `object_store` integration supports S3-compatible endpoints.
+- Give only the ingest service the storage identity: object read/write/delete and necessary multipart operations scoped to its prefix, with bucket listing limited by `s3:prefix`. No bucket administration, public ACLs or account-wide listing. Keep backup/version-deletion privileges separate. Web receives signed receipts and does not need an object-store key. If a provider only supports bucket-level credential scopes, dedicate an entire bucket to this app rather than treating an unenforced prefix as an access boundary.
+- Route a dedicated HTTPS origin, proposed `https://ingest.frontierintelligencelab.com`, through Traefik to the ingest container on a private network. Set `INGEST_PUBLIC_URL` on web to that origin, `INGEST_ALLOWED_ORIGINS` on ingest to the exact website origin, and `INGEST_BIND=0.0.0.0:4100` inside its container; do not publish port 4100 on the host. The current web config accepts an origin only, so same-origin path routing would require a separate config/URL handling change.
+- Inject the same strong `INGEST_SHARED_SECRET` into web and ingest through scoped runtime secrets. Supply `INGEST_STORAGE=s3://<private-bucket>/valcairn/` and provider credentials only to ingest. Keep existing signed-grant/receipt checks; do not expose the shared secret in public config, build arguments, logs or browser code.
+- Keep object retention long enough to restore every retained database backup, and test restore by resolving a restored dataset manifest to its stored files and verifying hashes. A database dump alone does not back up file bytes. Define orphan-upload cleanup, quotas, malware scanning and secret rotation before production; these are not implemented by this database patch.
+- Release remains blocked until approval is bound to immutable reviewed content: the current onboarding API can edit rights or record a held upload receipt after approval. The route and store contract must agree on atomic status/revision guards before treating a version as staff-approved.
+
 #### Restore rehearsal actually performed locally
 
-Postgres **17.8** was tested locally using the commands below. A synthetic record and both migration-ledger entries were recovered into an isolated database (record count 1; migration count 2). This is evidence for the restore procedure, not a production backup claim. Choose a fresh restore database name on subsequent runs.
+Postgres **17.8** was tested locally using the commands below. The v3 rehearsal recovered all four migration-ledger entries and one synthetic upload, review and dataset version into an isolated database. This is evidence for the restore procedure, not a production backup claim. Choose a fresh restore database name on subsequent runs.
 
 ```sh
-docker compose -f docker-compose.postgres.yml exec -T postgres pg_dump -U valcairn -d valcairn_test --format=custom --file=/tmp/valcairn-restore-check.dump
-docker compose -f docker-compose.postgres.yml exec -T postgres createdb -U valcairn valcairn_restore_test_20261103
-docker compose -f docker-compose.postgres.yml exec -T postgres pg_restore -U valcairn --exit-on-error --no-owner --dbname=valcairn_restore_test_20261103 /tmp/valcairn-restore-check.dump
+docker compose -f docker-compose.postgres.yml exec -T postgres pg_dump -U valcairn -d valcairn_v3_upgrade_test --format=custom --file=/tmp/valcairn-v3-restore.dump
+docker compose -f docker-compose.postgres.yml exec -T postgres createdb -U valcairn valcairn_v3_restore_test
+docker compose -f docker-compose.postgres.yml exec -T postgres pg_restore -U valcairn --exit-on-error --no-owner --dbname=valcairn_v3_restore_test /tmp/valcairn-v3-restore.dump
 ```
 
-Pending production decisions: private backup destination/region and retention obligations; recovery targets; TLS certificate/CA ownership; and approval of the database service, private network, roles and persistent path. No production database, container, Coolify setting or secret was changed by this work.
+Pending production decisions: private object/backup provider and region, retention obligations and budget; recovery targets; TLS certificate/CA ownership; ingest hostname; and approval of the database service, private network, roles and persistent path. No production database, bucket, container, DNS record, Coolify setting or secret was changed by this work.

@@ -10,6 +10,8 @@ import { createPostgresPool, createPostgresStore } from '../src/store/postgres.j
 import { createPgSessionStore } from '../src/store/pg-session-store.js';
 import { applyMigrations } from '../scripts/migrate.js';
 import { runStoreContract } from './store-contract.js';
+import { makeApp, json, postHeaders } from './helpers.js';
+import { signToken } from '../src/lib/tokens.js';
 
 // These tests reset ONLY the explicitly supplied, dedicated test database.
 // No application connection string is ever used to establish a connection.
@@ -38,7 +40,7 @@ async function makeStore() {
   const pool = createPostgresPool(options);
   try {
     await applyMigrations({ pool });
-    await pool.query('TRUNCATE TABLE sessions, audit_events, projects, join_requests, invitations, memberships, email_codes, workspaces, users RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE TABLE sessions, audit_events, dataset_versions, reviews, uploads, projects, join_requests, invitations, memberships, email_codes, workspaces, users RESTART IDENTITY CASCADE');
   } finally { await pool.end(); }
   return createPostgresStore(options);
 }
@@ -140,6 +142,159 @@ withStore('normalization, safe shapes, first verification and nullable patches',
   assert.deepEqual(reset.modalities, []);
   assert.equal(await store.getUserById('not-a-uuid'), null);
   assert.equal(await store.getWorkspace('not-a-uuid'), null);
+});
+
+withStore('parallel invitation acceptance has one winner and preserves existing roles', async (store) => {
+  const owner = await user(store);
+  const guest = await user(store, 'guest@example.test');
+  const ws = await workspace(store, owner.id);
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: guest.email, role: 'finance', tokenHash: 'parallel-invite', expiresAt: new Date(Date.now() + 60_000) }] });
+  const invite = await store.getInvitationByTokenHash('parallel-invite');
+  const attempts = await Promise.allSettled(Array.from({ length: 6 }, () => store.acceptInvitation({ invitationId: invite.id, userId: guest.id })));
+  assert.equal(attempts.filter(r => r.status === 'fulfilled').length, 1);
+  assert.ok(attempts.filter(r => r.status === 'rejected').every(r => r.reason.code === 'already_decided'));
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: guest.email, role: 'viewer', tokenHash: 'role-preserved', expiresAt: new Date(Date.now() + 60_000) }] });
+  const again = await store.getInvitationByTokenHash('role-preserved');
+  assert.deepEqual(await store.acceptInvitation({ invitationId: again.id, userId: guest.id }), { workspaceId: ws.id, role: 'finance', alreadyMember: true });
+  assert.deepEqual(await store.getMembership(ws.id, guest.id), { role: 'finance' });
+  assert.equal('tokenHash' in again, false);
+});
+
+withStore('invitation acceptance and revocation roll back with their audit event', async (store, pool) => {
+  const owner = await user(store);
+  const guest = await user(store, 'guest@example.test');
+  const ws = await workspace(store, owner.id);
+  await store.createInvitations({ workspaceId: ws.id, invitedBy: owner.id, invites: [{ email: guest.email, role: 'member', tokenHash: 'atomic-invite', expiresAt: new Date(Date.now() + 60_000) }] });
+  const invite = await store.getInvitationByTokenHash('atomic-invite');
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_invitation CHECK (action NOT IN ('invitation.accepted', 'invitation.revoked'))");
+  try {
+    await assert.rejects(store.acceptInvitation({ invitationId: invite.id, userId: guest.id }), { code: '23514' });
+    assert.equal((await store.getInvitationByTokenHash('atomic-invite')).acceptedAt, null);
+    assert.equal(await store.getMembership(ws.id, guest.id), null);
+    await assert.rejects(store.revokeInvitation({ workspaceId: ws.id, invitationId: invite.id, actorId: owner.id }), { code: '23514' });
+    assert.equal((await store.getInvitationByTokenHash('atomic-invite')).revokedAt, null);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_invitation'); }
+});
+
+withStore('concurrent profile updates preserve independent keys and merge shallowly', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id, { profile: { keep: 'yes', nested: { old: true } } });
+  await Promise.all([
+    store.updateWorkspaceProfile({ workspaceId: ws.id, profile: { academicEmail: 'student@uni.edu' } }),
+    store.updateWorkspaceProfile({ workspaceId: ws.id, profile: { academicVerifiedAt: '2026-11-03T00:00:00.000Z', nested: { new: true } } }),
+  ]);
+  assert.deepEqual((await store.getWorkspace(ws.id)).profile, { keep: 'yes', academicEmail: 'student@uni.edu', academicVerifiedAt: '2026-11-03T00:00:00.000Z', nested: { new: true } });
+});
+
+const dataProject = async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Dataset', task: 'Classify', startingPoint: 'own' });
+  return { owner, ws, project, scope: { workspaceId: ws.id, projectId: project.id } };
+};
+
+withStore('parallel uploads mark duplicate content and reject reused object keys', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  const fields = { ...scope, uploadedBy: owner.id, sha256: 'b'.repeat(64), sizeBytes: 2048, contentType: 'text/plain', filename: 'sample.txt' };
+  const uploads = await Promise.all(Array.from({ length: 8 }, (_, i) => store.createUpload({ ...fields, objectKey: `objects/${i}` })));
+  assert.equal(uploads.filter(u => u.duplicateOf === null).length, 1);
+  const ids = new Set(uploads.map(u => u.id));
+  assert.ok(uploads.every(u => u.duplicateOf === null || ids.has(u.duplicateOf)));
+  assert.ok(uploads.every(u => u.sizeBytes === 2048 && /Z$/.test(u.createdAt)));
+  await assert.rejects(store.createUpload({ ...fields, objectKey: 'objects/0' }), { code: 'duplicate_upload' });
+  assert.equal((await store.listUploads(scope)).length, 8);
+  const other = await workspace(store, owner.id, { slug: 'other' });
+  assert.equal((await store.listUploads({ ...scope, workspaceId: other.id })).length, 0);
+  await assert.rejects(pool.query('UPDATE uploads SET workspace_id = $1 WHERE id = $2', [other.id, uploads[0].id]), { code: '23503' });
+});
+
+withStore('parallel review submissions and decisions preserve one outcome', async (store) => {
+  const { owner, scope } = await dataProject(store);
+  const attempts = await Promise.allSettled(Array.from({ length: 6 }, () => store.submitForReview({ ...scope, submittedBy: owner.id })));
+  assert.equal(attempts.filter(r => r.status === 'fulfilled').length, 1);
+  assert.ok(attempts.filter(r => r.status === 'rejected').every(r => r.reason.code === 'invalid_state'));
+  const review = attempts.find(r => r.status === 'fulfilled').value;
+  const decisions = await Promise.allSettled(['approved', 'changes_requested'].map(decision => store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision, checks: { rights: true } })));
+  assert.equal(decisions.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(decisions.find(r => r.status === 'rejected').reason.code, 'already_decided');
+  const decided = decisions.find(r => r.status === 'fulfilled').value;
+  assert.equal((await store.getProject(scope)).status, decided.status);
+  assert.equal((await store.getReview(review.id)).status, decided.status);
+  assert.equal((await store.listProjectReviews(scope)).length, 1);
+});
+
+withStore('failed review operations roll back the review and project together', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_review CHECK (action NOT LIKE 'review.%')");
+  try {
+    await assert.rejects(store.submitForReview({ ...scope, submittedBy: owner.id }), { code: '23514' });
+    assert.equal((await store.getProject(scope)).status, 'draft');
+    assert.deepEqual(await store.listProjectReviews(scope), []);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_review'); }
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_decision CHECK (action <> 'review.approved')");
+  try {
+    await assert.rejects(store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' }), { code: '23514' });
+    assert.equal((await store.getProject(scope)).status, 'in_review');
+    assert.equal((await store.getReview(review.id)).status, 'pending');
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_decision'); }
+});
+
+withStore('dataset versions receive consecutive numbers under concurrency and roll back on failure', async (store, pool) => {
+  const { owner, scope } = await dataProject(store);
+  const review = await store.submitForReview({ ...scope, submittedBy: owner.id });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved' });
+  await pool.query("ALTER TABLE audit_events ADD CONSTRAINT test_reject_version CHECK (action <> 'dataset_version.created')");
+  try {
+    await assert.rejects(store.createDatasetVersion({ ...scope, createdBy: owner.id, manifest: { files: [] } }), { code: '23514' });
+    assert.equal((await store.getProject(scope)).status, 'approved');
+    assert.deepEqual(await store.listDatasetVersions(scope), []);
+  } finally { await pool.query('ALTER TABLE audit_events DROP CONSTRAINT test_reject_version'); }
+  const versions = await Promise.all(Array.from({ length: 8 }, (_, i) => store.createDatasetVersion({ ...scope, createdBy: owner.id, manifest: { ordinal: i } })));
+  assert.deepEqual(versions.map(v => v.number).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.deepEqual((await store.listDatasetVersions(scope)).map(v => v.number), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal((await store.getProject(scope)).status, 'versioned');
+});
+
+withStore('account and dataset APIs complete a persisted review workflow', async (store) => {
+  const secret = 'local-api-integration-secret-at-least-32-characters';
+  // The outer fixture owns the pool; Fastify gets a non-owning store for this test.
+  const app = await makeApp({ store: { ...store, close: async () => {} }, env: {
+    INGEST_PUBLIC_URL: 'http://localhost:4100', INGEST_SHARED_SECRET: secret, STAFF_EMAILS: 'staff@example.test',
+  } });
+  const person = async (email) => {
+    let cookies = {};
+    const call = async (method, url, body) => {
+      const result = await app.inject({ method, url, cookies, headers: method === 'GET' ? {} : postHeaders, payload: body === undefined ? undefined : json(body) });
+      const cookie = result.cookies.find(c => c.name === 'valcairn.sid');
+      if (cookie) cookies = { 'valcairn.sid': cookie.value };
+      assert.equal(result.statusCode, 200, `${method} ${url}: ${result.body}`);
+      return result.json();
+    };
+    const created = await call('POST', '/api/account/signup', { email, name: email.split('@')[0], password: 'local-fixture-password' });
+    await call('POST', '/api/account/verify', { code: created.devCode });
+    return { call, id: created.user.id };
+  };
+  try {
+    const owner = await person('owner@acme-example.com');
+    const staff = await person('staff@example.test');
+    const { workspace: ws } = await owner.call('POST', '/api/workspaces', { name: 'Integration Workspace' });
+    const { project } = await owner.call('POST', `/api/workspaces/${ws.id}/projects`, { task: 'Classify sample documents', modalities: ['Documents'], startingPoint: 'own' });
+    const base = `/api/workspaces/${ws.id}/projects/${project.id}`;
+    await owner.call('POST', base, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'], personalData: 'no' } });
+    const receipt = signToken(secret, { v: 1, kind: 'receipt', ws: ws.id, project: project.id, by: owner.id, objectKey: 'api-integration/sample', sha256: 'c'.repeat(64), sizeBytes: 12, contentType: 'text/plain', filename: 'sample.txt', exp: Math.floor(Date.now() / 1000) + 60 });
+    await owner.call('POST', `${base}/uploads`, { receipt });
+    const { review } = await owner.call('POST', `${base}/submit`, {});
+    const detail = await staff.call('GET', `/api/staff/reviews/${review.id}`);
+    assert.equal(detail.project.name, project.name);
+    assert.equal(detail.uploads.length, 1);
+    await staff.call('POST', `/api/staff/reviews/${review.id}/decision`, { decision: 'approved', checks: { rights: true, consent: true, labels: true, duplicates: true, format: true } });
+    const { version } = await owner.call('POST', `${base}/dataset-versions`, {});
+    assert.equal(version.number, 1);
+    assert.equal(version.files, 1);
+    assert.equal((await store.getProject({ workspaceId: ws.id, projectId: project.id })).status, 'versioned');
+    assert.equal((await store.listDatasetVersions({ workspaceId: ws.id, projectId: project.id }))[0].manifest.files[0].sha256, 'c'.repeat(64));
+  } finally { await app.close(); }
 });
 
 withStore('migrations are repeatable, detect edits and roll back a failed file', async (_store, pool) => {
