@@ -25,7 +25,7 @@ test('production rejects insecure cookies; development allows them', () => {
 
 test('spoofed X-Forwarded-For cannot reset rate limits when no proxy is trusted', async () => {
   const app = await makeApp({ rateLimits: { login: 1 } });
-  const attempt = (ip) => app.inject({ method: 'POST', url: '/api/login', headers: { ...postHeaders, 'x-forwarded-for': ip }, remoteAddress: '203.0.113.9', payload: json({ email: 'a@b.co', password: 'anything-at-all' }) });
+  const attempt = (ip) => app.inject({ method: 'POST', url: '/api/login', headers: { ...postHeaders, 'x-forwarded-for': ip }, remoteAddress: '203.0.113.9', payload: json({ username: 'someone', password: 'anything-at-all' }) });
   assert.equal((await attempt('198.51.100.1')).statusCode, 503);
   assert.equal((await attempt('198.51.100.2')).statusCode, 429);
   await app.close();
@@ -33,7 +33,7 @@ test('spoofed X-Forwarded-For cannot reset rate limits when no proxy is trusted'
 
 test('a trusted proxy address is honored for the client IP', async () => {
   const app = await makeApp({ env: { TRUST_PROXY: '203.0.113.9' }, rateLimits: { login: 1 } });
-  const attempt = (ip) => app.inject({ method: 'POST', url: '/api/login', headers: { ...postHeaders, 'x-forwarded-for': ip }, remoteAddress: '203.0.113.9', payload: json({ email: 'a@b.co', password: 'anything-at-all' }) });
+  const attempt = (ip) => app.inject({ method: 'POST', url: '/api/login', headers: { ...postHeaders, 'x-forwarded-for': ip }, remoteAddress: '203.0.113.9', payload: json({ username: 'someone', password: 'anything-at-all' }) });
   assert.equal((await attempt('198.51.100.1')).statusCode, 503);
   assert.equal((await attempt('198.51.100.1')).statusCode, 429);
   assert.equal((await attempt('198.51.100.2')).statusCode, 503);

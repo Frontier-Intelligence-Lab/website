@@ -29,7 +29,7 @@ export default function DemoLogin() {
       )}
       {error && <p className="notice notice--error" role="alert">{error}</p>}
       <form onSubmit={submit} noValidate>
-        <Field name="email" label="Email" type="email" autoComplete="username" maxLength={254} />
+        <Field name="username" label="Username" autoComplete="username" autoCapitalize="none" spellCheck={false} maxLength={64} />
         <Field name="password" label="Password" type="password" autoComplete="current-password" maxLength={256} />
         <button className="btn btn-solid" type="submit" disabled={!signInConfigured || pending}>{pending ? 'Signing in…' : 'Sign in'}</button>
       </form>

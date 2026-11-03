@@ -73,13 +73,17 @@ See `.env.example`. Key values:
 | `CONTACT_PUBLIC_EMAIL`, `BOOKING_URL` | Returned by `/api/config` and shown on the contact page. |
 | `REVIEWERS_FILE` or `REVIEWERS_JSON` | Reviewer accounts. Unset means sign-in is disabled. |
 
-### Adding a reviewer
+### Sign-in accounts
+
+Only the accounts listed in `REVIEWERS_FILE` (or `REVIEWERS_JSON`) can sign in to `/demo` and reach the dashboard; anything else gets `401`. Accounts use a username, matched case-insensitively, and store only a scrypt hash, never the password. Credentials and hashes are never committed: keep the file outside Git and mount it read-only in production.
+
+Create an entry for a chosen password (read from stdin, at least 8 characters; a warning is printed under 15):
 
 ```powershell
-node scripts/hash-password.js --generate reviewer@example.com "Reviewer Name"
+"chosen-password" | node scripts/hash-password.js <username> "Display Name"
 ```
 
-Prints a generated password to stderr and a JSON entry to stdout. Put the entry in the array referenced by `REVIEWERS_FILE` (mounted into the container, never committed) and share the password privately. Restart the server to load changes.
+Or let the script generate a strong password with `--generate`. Put each entry in the JSON array referenced by `REVIEWERS_FILE` and restart the server to load changes. Duplicate usernames are rejected at startup.
 
 ## API
 
@@ -88,7 +92,7 @@ Prints a generated password to stderr and a JSON entry to stdout. Put the entry 
 | `GET /api/config` | none | Booking link, public email, whether contact delivery and sign-in are configured, field limits. |
 | `POST /api/contact` | same origin, 5 per 15 min | `{name, email, organization?, message}` → `200 {ok}`, `400 {errors}`, `503`/`502 {error}`. Never reports success unless the mail server accepted the message. |
 | `GET /api/session` | none | `{reviewer}` or `{reviewer: null}`. |
-| `POST /api/login` | same origin, 10 per 15 min | `{email, password}` → `200 {reviewer}`, `401`, `503`. |
+| `POST /api/login` | same origin, 10 per 15 min | `{username, password}` → `200 {reviewer}`, `401`, `503`. |
 | `POST /api/logout` | same origin | Ends the session. |
 
 ## Docker

@@ -16,10 +16,34 @@ test('scrypt hashes verify only for the right password and reject malformed hash
   assert.equal(await verifyPassword('pw-123456789', hash.replace('4096', String(2 ** 21))), false);
 });
 
-test('reviewer config is validated and emails normalized', () => {
-  assert.equal(parseReviewers('[{"email":" A@B.co ","passwordHash":"scrypt$x"}]')[0].email, 'a@b.co');
+test('reviewer config is validated and usernames normalized', () => {
+  assert.equal(parseReviewers('[{"username":" Admin ","passwordHash":"scrypt$x"}]')[0].username, 'admin');
+  assert.equal(parseReviewers('[{"email":"A@B.co","passwordHash":"scrypt$x"}]')[0].username, 'a@b.co');
   assert.throws(() => parseReviewers('{}'));
-  assert.throws(() => parseReviewers('[{"email":"a@b.co","passwordHash":"plain"}]'));
+  assert.throws(() => parseReviewers('[{"username":"admin","passwordHash":"plain"}]'));
+  assert.throws(() => parseReviewers('[{"username":"has space","passwordHash":"scrypt$x"}]'));
+  assert.throws(() => parseReviewers('[{"username":"admin","passwordHash":"scrypt$x"},{"username":"ADMIN","passwordHash":"scrypt$y"}]'), /repeats/);
+});
+
+test('only the configured accounts can sign in, each with its own password', async () => {
+  const hash = (pw) => hashPassword(pw, { cost: 2 ** 12 });
+  const accounts = [
+    { username: 'first', name: 'First', passwordHash: await hash('first-secret-1') },
+    { username: 'second', name: 'Second', passwordHash: await hash('second-secret-2') },
+  ];
+  const app = await makeApp({ env: { REVIEWERS_JSON: JSON.stringify(accounts) } });
+  const login = (username, password) => app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ username, password }) });
+
+  assert.equal((await login('first', 'first-secret-1')).json().reviewer.username, 'first');
+  assert.equal((await login('SECOND', 'second-secret-2')).json().reviewer.username, 'second');
+  for (const [username, password] of [['first', 'second-secret-2'], ['second', 'first-secret-1'], ['first', 'FIRST-SECRET-1'], ['admin', 'first-secret-1'], ['', ''], ['first', '']]) {
+    const res = await login(username, password);
+    assert.equal(res.statusCode, 401, `${username}/${password}`);
+    assert.equal(res.headers['set-cookie'], undefined);
+  }
+  const legacyEmailField = await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ email: 'first', password: 'first-secret-1' }) });
+  assert.equal(legacyEmailField.statusCode, 401);
+  await app.close();
 });
 
 test('signed-out requests never receive private pages or reviewer-only code', async () => {
@@ -43,7 +67,7 @@ test('signed-out requests never receive private pages or reviewer-only code', as
 
 test('login fails closed when no reviewers are configured', async () => {
   const app = await makeApp();
-  const res = await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ email: 'a@b.co', password: 'anything-at-all' }) });
+  const res = await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ username: 'someone', password: 'anything-at-all' }) });
   assert.equal(res.statusCode, 503);
   assert.match(res.json().error, /not configured/);
   assert.equal(res.headers['set-cookie'], undefined);
@@ -53,13 +77,13 @@ test('login fails closed when no reviewers are configured', async () => {
 test('wrong credentials get 401 and no session; CSRF-less posts get 403', async () => {
   const r = await reviewerFixture();
   const app = await makeApp({ env: { REVIEWERS_JSON: JSON.stringify([r]) } });
-  for (const creds of [{ email: r.email, password: 'wrong-password-1' }, { email: 'nobody@example.com', password: r.password }]) {
+  for (const creds of [{ username: r.username, password: 'wrong-password-1' }, { username: 'nobody', password: r.password }]) {
     const res = await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json(creds) });
     assert.equal(res.statusCode, 401);
     assert.equal(res.headers['set-cookie'], undefined);
     assert.match(res.json().error, /did not match/);
   }
-  const noOrigin = await app.inject({ method: 'POST', url: '/api/login', headers: { 'content-type': 'application/json' }, payload: json({ email: r.email, password: r.password }) });
+  const noOrigin = await app.inject({ method: 'POST', url: '/api/login', headers: { 'content-type': 'application/json' }, payload: json({ username: r.username, password: r.password }) });
   assert.equal(noOrigin.statusCode, 403);
   await app.close();
 });
@@ -67,9 +91,9 @@ test('wrong credentials get 401 and no session; CSRF-less posts get 403', async 
 test('valid login creates an HttpOnly Lax session that unlocks the dashboard; logout revokes it', async () => {
   const r = await reviewerFixture();
   const app = await makeApp({ env: { REVIEWERS_JSON: JSON.stringify([r]) } });
-  const login = await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ email: r.email.toUpperCase(), password: r.password }) });
+  const login = await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ username: r.username.toUpperCase(), password: r.password }) });
   assert.equal(login.statusCode, 200);
-  assert.equal(login.json().reviewer.email, r.email);
+  assert.equal(login.json().reviewer.username, r.username);
   assert.equal(login.json().reviewer.passwordHash, undefined);
   const cookie = login.cookies.find((c) => c.name === 'valcairn.sid');
   assert.ok(cookie?.httpOnly);
@@ -96,7 +120,7 @@ test('login attempts are rate limited', async () => {
   const r = await reviewerFixture();
   const app = await makeApp({ env: { REVIEWERS_JSON: JSON.stringify([r]) }, rateLimits: { login: 2 } });
   const codes = [];
-  for (let i = 0; i < 3; i++) codes.push((await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ email: r.email, password: 'bad-password-xx' }) })).statusCode);
+  for (let i = 0; i < 3; i++) codes.push((await app.inject({ method: 'POST', url: '/api/login', headers: postHeaders, payload: json({ username: r.username, password: 'bad-password-xx' }) })).statusCode);
   assert.deepEqual(codes, [401, 401, 429]);
   await app.close();
 });

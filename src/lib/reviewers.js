@@ -1,25 +1,35 @@
 import { hashPassword, verifyPassword } from './passwords.js';
 
-/** Reviewer accounts: [{ "email": "...", "name": "...", "passwordHash": "scrypt$..." }] */
+// Usernames are matched case-insensitively; letters, digits and . _ - @ + only.
+const USERNAME_RE = /^[a-z0-9._@+-]{1,64}$/;
+export const normalizeUsername = (value) => String(value ?? '').trim().toLowerCase();
+
+/**
+ * Reviewer accounts: [{ "username": "...", "name": "...", "passwordHash": "scrypt$..." }].
+ * Only accounts listed here can sign in. Older entries keyed by "email" are still accepted.
+ */
 export function parseReviewers(json) {
   const list = JSON.parse(json);
   if (!Array.isArray(list)) throw new Error('Reviewer config must be a JSON array');
+  const seen = new Set();
   return list.map((entry, i) => {
-    const email = String(entry?.email ?? '').trim().toLowerCase();
+    const username = normalizeUsername(entry?.username ?? entry?.email);
     const passwordHash = String(entry?.passwordHash ?? '');
-    if (!email.includes('@') || !passwordHash.startsWith('scrypt$')) {
-      throw new Error(`Reviewer entry ${i} needs an email and a scrypt passwordHash`);
+    if (!USERNAME_RE.test(username) || !passwordHash.startsWith('scrypt$')) {
+      throw new Error(`Reviewer entry ${i} needs a username and a scrypt passwordHash`);
     }
-    return { email, name: String(entry.name ?? email), passwordHash };
+    if (seen.has(username)) throw new Error(`Reviewer entry ${i} repeats the username "${username}"`);
+    seen.add(username);
+    return { username, name: String(entry.name ?? username), passwordHash };
   });
 }
 
-// Verified when the email is unknown so a failed login takes the same time either way.
+// Verified when the username is unknown so a failed login takes the same time either way.
 const dummyHash = await hashPassword('dummy-password-for-constant-time');
 
-export async function authenticateReviewer(reviewers, email, password) {
-  const normalized = String(email ?? '').trim().toLowerCase();
-  const reviewer = reviewers.find((r) => r.email === normalized);
+export async function authenticateReviewer(reviewers, username, password) {
+  const normalized = normalizeUsername(username);
+  const reviewer = reviewers.find((r) => r.username === normalized);
   const ok = await verifyPassword(password, reviewer?.passwordHash ?? dummyHash);
-  return ok && reviewer ? { email: reviewer.email, name: reviewer.name } : null;
+  return ok && reviewer ? { username: reviewer.username, name: reviewer.name } : null;
 }

@@ -135,11 +135,11 @@ export async function buildApp({ config, logger = false, contactTransport, rateL
     config: { rateLimit: { max: rateLimits.login ?? 10, timeWindow: '15 minutes' } },
   }, async (request, reply) => {
     privateHeaders(reply);
-    const email = typeof request.body?.email === 'string' ? request.body.email.slice(0, 254) : '';
+    const username = typeof request.body?.username === 'string' ? request.body.username.slice(0, 64) : '';
     const password = typeof request.body?.password === 'string' ? request.body.password.slice(0, 256) : '';
     if (!signInConfigured) return problem(reply, 503, 'Reviewer access is not configured, so sign-in is unavailable.');
-    const reviewer = await authenticateReviewer(config.reviewers, email, password);
-    if (!reviewer) return problem(reply, 401, 'That email and password did not match an invited reviewer.');
+    const reviewer = await authenticateReviewer(config.reviewers, username, password);
+    if (!reviewer) return problem(reply, 401, 'That username and password did not match an authorized account.');
     await request.session.regenerate();
     request.session.set('reviewer', { ...reviewer, signedInAt: new Date().toISOString() });
     return { reviewer: request.session.get('reviewer') };

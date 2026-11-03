@@ -238,7 +238,7 @@ export default function Dashboard({ reviewer }) {
               <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search projects…" />
             </label>
             <ThemeToggle />
-            <span className="avatar" title={reviewer.email} aria-hidden="true">{initials(reviewer.name)}</span>
+            <span className="avatar" title={reviewer.username} aria-hidden="true">{initials(reviewer.name)}</span>
             <span className="visually-hidden">Signed in as {reviewer.name}</span>
             <button type="button" className="btn-small" onClick={signOut}>Sign out</button>
           </div>

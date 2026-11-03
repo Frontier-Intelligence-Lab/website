@@ -10,7 +10,7 @@ export const FIXTURE_DIST = path.join(path.dirname(fileURLToPath(import.meta.url
 
 export async function reviewerFixture() {
   const passwordHash = await hashPassword('correct horse battery', { cost: 2 ** 12 });
-  return { email: 'reviewer@example.com', name: 'Test Reviewer', passwordHash, password: 'correct horse battery' };
+  return { username: 'reviewer', name: 'Test Reviewer', passwordHash, password: 'correct horse battery' };
 }
 
 export async function makeApp({ env = {}, contactTransport, rateLimits } = {}) {
