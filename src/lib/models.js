@@ -87,6 +87,8 @@ export const COMPUTE_OPTIONS = [
   { id: 'nebius', name: 'Nebius', gpus: '8 × H100', region: 'EU' },
   { id: 'coreweave', name: 'CoreWeave', gpus: '8 × H100', region: 'US' },
   { id: 'lambda', name: 'Lambda', gpus: '8 × H200', region: 'US' },
+  // The workspace's own linked machine (src/jobs.js): local GPUs, no provider spend.
+  { id: 'runner', name: 'Your Valcairn Runner', gpus: 'GPUs on your machine', region: 'Your machine' },
 ];
 
 export const MAX_SPEND_CAP_USD = 100000;

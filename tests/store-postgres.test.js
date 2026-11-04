@@ -1011,6 +1011,26 @@ withStore('a requested enhance run cannot be changed or deleted, even by direct 
   await assert.rejects(pool.query("INSERT INTO model_pulls (workspace_id, model_id, requested_by) VALUES ($1, 'Bad Id', $2)", [ws.id, owner.id]), (err) => err.code === '23514');
 });
 
+withStore('jobs: inputs and finished jobs cannot change and events cannot be edited, even by direct SQL', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'e'.repeat(64), keyPrefix: 'vrk_eeeeee' });
+  const job = await store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: 'sql-key-0001', createdBy: owner.id });
+  await assert.rejects(pool.query(`UPDATE jobs SET spec = '{"checks":["shell"]}'::jsonb WHERE id = $1`, [job.id]), (err) => /job_frozen/.test(err.message));
+  await store.leaseJob({ runnerId: runner.id, leaseHash: 'f'.repeat(64) });
+  const who = { runnerId: runner.id, jobId: job.id, leaseHash: 'f'.repeat(64) };
+  await store.appendJobEvents({ ...who, events: [{ seq: 0, kind: 'log', data: { level: 'info', message: 'a' } }] });
+  await assert.rejects(pool.query(`UPDATE job_events SET data = '{}'::jsonb WHERE job_id = $1`, [job.id]), (err) => /job_event_frozen/.test(err.message));
+  await assert.rejects(pool.query('DELETE FROM job_events WHERE job_id = $1', [job.id]), (err) => /job_event_frozen/.test(err.message));
+  await store.finishJob({ ...who, outcome: 'succeeded', result: { gpu: true } });
+  await assert.rejects(pool.query("UPDATE jobs SET status = 'queued', finished_at = NULL WHERE id = $1", [job.id]), (err) => /job_frozen/.test(err.message));
+  await assert.rejects(pool.query("INSERT INTO jobs (workspace_id, runner_id, kind, spec, idempotency_key, created_by) VALUES ($1, $2, 'train', '{}'::jsonb, 'sql-key-0002', $3)", [ws.id, runner.id, owner.id]), (err) => err.code === '23514', 'training needs a plan');
+  await assert.rejects(pool.query("INSERT INTO jobs (workspace_id, runner_id, kind, spec, idempotency_key, created_by, status) VALUES ($1, $2, 'probe', '{}'::jsonb, 'sql-key-0003', $3, 'running')", [ws.id, runner.id, owner.id]), (err) => err.code === '23514', 'a running job needs a lease');
+  // Deleting the workspace removes its runners, jobs and events together.
+  await pool.query('DELETE FROM workspaces WHERE id = $1', [ws.id]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM job_events WHERE job_id = $1', [job.id])).rows[0].n, 0);
+});
+
 const capitalDraft = (extra = {}) => ({ purpose: 'Pilot', requestedAmountCents: 5000000, timing: { neededBy: null, termMonths: null }, company: { legalName: 'QA ONLY Co', registrationRef: '', country: '', foundedYear: null, employees: null, website: '', description: '' }, costItems: [{ id: 'ci_1', category: 'compute', label: 'GPU hours', amountCents: 250000, period: 'one_time', basis: 'estimated', source: 'Price list', observedAt: '2026-11-01', evidenceId: null }], references: [], datasetVersions: [], ...extra });
 // The hash of exactly what sending would freeze, from the same reads a route makes.
 const capitalHash = async (store, mine) => snapshotHash(capitalSnapshot(await store.getCapitalCase(mine), await store.listCreditRecords(mine.workspaceId), await store.listCapitalEvidence(mine)));

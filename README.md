@@ -15,6 +15,7 @@ Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, co
 | Projects: goal, acceptance rule, rights record, existing-model intake, scoping call | Implemented. |
 | Sample uploads (Rust `services/ingest`), staff review, dataset versions | Implemented. Submitted content is frozen; versions contain exactly the approved snapshot. |
 | Run on this device (`/w/:slug/device`): connect a local Ollama, download, verify, run, measure | Implemented and tested against a real local Ollama 0.40.13. The browser talks to Ollama on the visitor's own loopback address; the server stores only client-reported records (devices, model installs with digests, measured runs). Not yet deployed. |
+| Valcairn Runners and jobs (`/api/workspaces/:id/runners`, `/jobs`, `/api/runner/*`) | Queue and runner API implemented and tested against Postgres: link a machine with a key shown once, queue jobs from approved plans, one lease per runner, retries, cancel and revoke. The runner program and the training, evaluation and export workers are separate increments, so nothing executes a job yet. See [docs/RUNNERS.md](docs/RUNNERS.md). |
 | In-browser (WebGPU) and remote-GPU execution | **Planned.** Labelled planned on the device screen. |
 | Provider onboarding, training, evaluation, deployment, financing | **Planned.** Shown as planned in the app; nothing executes. |
 | `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
@@ -118,6 +119,7 @@ Give each invited person their own account: a shared login only shows that *some
 | `GET /api/session` | none | `{reviewer}` or `{reviewer: null}`. |
 | `POST /api/login` | same origin, 10 per 15 min | `{username, password}` → `200 {reviewer}`, `401`, `503`. |
 | `POST /api/logout` | same origin | Ends the session. |
+| `/api/workspaces/:id/runners`, `/api/workspaces/:id/jobs`, `/api/runner/*` | session (people) or runner key (runners) | Runners and the job queue; full reference in [docs/RUNNERS.md](docs/RUNNERS.md). |
 | `GET /api/admin/signins` | admin account | Latest 200 sign-in events, newest first: `{at, event, username}` where `event` is `signin`, `signout` or `failed`. |
 
 ## Docker

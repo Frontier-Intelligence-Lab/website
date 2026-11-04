@@ -673,4 +673,75 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal((await store.listProjects(a.id)).length, 1);
     assert.equal((await store.listProjects(b.id)).length, 0);
   });
+
+  withStore('runners and jobs: keys stay hidden, one lease per runner, events once, bounded retries, cancel and revoke', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'A', slug: 'a-jobs', ownerId: owner.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'B', slug: 'b-jobs', ownerId: owner.id });
+    const hash = (c) => c.repeat(64);
+    const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: hash('a'), keyPrefix: 'vrk_abcdef' });
+    assert.equal(runner.keyHash, undefined);
+    assert.deepEqual([runner.status, runner.lastSeenAt, runner.capabilities], ['active', null, {}]);
+    assert.equal((await store.findActiveRunnerByKeyHash(hash('a'))).id, runner.id);
+    assert.equal(await store.findActiveRunnerByKeyHash(hash('b')), null);
+    assert.equal(await store.getRunner({ workspaceId: other.id, runnerId: runner.id }), null);
+    assert.ok((await store.reportRunner({ runnerId: runner.id, capabilities: { gpus: [] } })).lastSeenAt);
+
+    const mk = (key, extra = {}) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: key, createdBy: owner.id, ...extra });
+    const job = await mk('key-00000001');
+    assert.equal((await mk('key-00000001')).id, job.id, 'same request key, same job');
+    await assert.rejects(store.createJob({ workspaceId: other.id, runnerId: runner.id, kind: 'probe', spec: {}, idempotencyKey: 'key-00000002', createdBy: owner.id }), { code: 'not_found' });
+
+    const lease = (h, leaseMs) => store.leaseJob({ runnerId: runner.id, leaseHash: h, leaseMs });
+    const held = await lease(hash('1'));
+    assert.deepEqual([held.id, held.status, held.attempt, held.spec.checks[0]], [job.id, 'leased', 1, 'gpu']);
+    assert.equal(held.leaseHash, undefined);
+    await mk('key-00000003');
+    assert.equal(await lease(hash('2')), null, 'one job at a time');
+    const who = { runnerId: runner.id, jobId: job.id, leaseHash: hash('1') };
+    await assert.rejects(store.touchJob({ ...who, leaseHash: hash('9') }), { code: 'lease_lost' });
+    assert.equal((await store.touchJob(who)).status, 'running');
+    const events = [{ seq: 0, kind: 'log', data: { level: 'info', message: 'a' } }, { seq: 1, kind: 'log', data: { level: 'info', message: 'b' } }];
+    assert.equal((await store.appendJobEvents({ ...who, events })).added, 2);
+    assert.equal((await store.appendJobEvents({ ...who, events })).added, 0);
+    assert.deepEqual((await store.listJobEvents({ workspaceId: ws.id, jobId: job.id })).map((e) => [e.attempt, e.seq, e.data.message]), [[1, 0, 'a'], [1, 1, 'b']]);
+    assert.deepEqual(await store.listJobEvents({ workspaceId: other.id, jobId: job.id }), []);
+    // Retryable failure: back to the queue, a new attempt, a separate event sequence.
+    assert.equal((await store.finishJob({ ...who, outcome: 'failed', failure: 'out_of_memory', retryable: true })).status, 'queued');
+    const again = await lease(hash('3'));
+    assert.deepEqual([again.id, again.attempt], [job.id, 2]);
+    await store.appendJobEvents({ runnerId: runner.id, jobId: job.id, leaseHash: hash('3'), events: [events[0]] });
+    assert.equal((await store.listJobEvents({ workspaceId: ws.id, jobId: job.id })).length, 3);
+    const done = await store.finishJob({ runnerId: runner.id, jobId: job.id, leaseHash: hash('3'), outcome: 'succeeded', result: { ok: true } });
+    assert.deepEqual([done.status, done.result, done.leaseExpiresAt, Boolean(done.finishedAt)], ['succeeded', { ok: true }, null, true]);
+    await assert.rejects(store.finishJob({ runnerId: runner.id, jobId: job.id, leaseHash: hash('3'), outcome: 'succeeded', result: {} }), { code: 'lease_lost' });
+    await assert.rejects(store.cancelJob({ workspaceId: ws.id, jobId: job.id, actorId: owner.id }), { code: 'invalid_state' });
+
+    // An expired lease is retried until attempts run out, then fails as lease_expired.
+    const lost = (await store.listJobs({ workspaceId: ws.id })).find((j) => j.status === 'queued');
+    for (let i = 0; i < lost.maxAttempts; i += 1) {
+      assert.equal((await lease(hash(String(4 + i)), 1)).id, lost.id);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    const expired = await store.getJob({ workspaceId: ws.id, jobId: lost.id });
+    assert.deepEqual([expired.status, expired.failure, expired.attempt], ['failed', 'lease_expired', lost.maxAttempts]);
+
+    // Cancel while running is honoured when the runner reports; revoke fails a held job and cancels waiting ones.
+    const c1 = await mk('key-00000010');
+    await lease(hash('c'));
+    assert.equal((await store.cancelJob({ workspaceId: ws.id, jobId: c1.id, actorId: owner.id })).status, 'cancel_requested');
+    assert.equal((await store.touchJob({ runnerId: runner.id, jobId: c1.id, leaseHash: hash('c') })).status, 'cancel_requested');
+    assert.equal((await store.finishJob({ runnerId: runner.id, jobId: c1.id, leaseHash: hash('c'), outcome: 'failed', failure: 'runtime_error' })).status, 'cancelled');
+    const h1 = await mk('key-00000011');
+    const w1 = await mk('key-00000012');
+    await lease(hash('d'));
+    await store.revokeRunner({ workspaceId: ws.id, runnerId: runner.id, actorId: owner.id });
+    assert.deepEqual([(await store.getJob({ workspaceId: ws.id, jobId: h1.id })).failure, (await store.getJob({ workspaceId: ws.id, jobId: w1.id })).status], ['runner_revoked', 'cancelled']);
+    assert.equal(await store.findActiveRunnerByKeyHash(hash('a')), null);
+    await assert.rejects(store.revokeRunner({ workspaceId: ws.id, runnerId: runner.id, actorId: owner.id }), { code: 'invalid_state' });
+    await assert.rejects(mk('key-00000013'), { code: 'invalid_state' });
+    await assert.rejects(store.reportRunner({ runnerId: runner.id, capabilities: {} }), { code: 'invalid_state' });
+    const actions = (await store.listAudit(ws.id)).map((a) => a.action);
+    for (const a of ['runner.linked', 'job.created', 'job.cancel_requested', 'runner.revoked']) assert.ok(actions.includes(a), a);
+  });
 }
