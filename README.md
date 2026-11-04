@@ -119,6 +119,8 @@ Give each invited person their own account: a shared login only shows that *some
 | `POST /api/login` | same origin, 10 per 15 min | `{username, password}` → `200 {reviewer}`, `401`, `503`. |
 | `POST /api/logout` | same origin | Ends the session. |
 | `GET /api/admin/signins` | admin account | Latest 200 sign-in events, newest first: `{at, event, username}` where `event` is `signin`, `signout` or `failed`. |
+| `GET /api/workspaces/:id/capital`, `POST …/capital/cases`, `GET\|POST …/capital/cases/:caseId`, `POST …/submit`, `POST …/withdraw`, `POST …/evidence`, `POST …/evidence/:evidenceId/delete`, `GET …/export`, `POST …/capital/credits` | owner, admin or finance member of an organization (sending and withdrawing: owner or admin) | Capital: cases with a revisioned draft (`expectedRevision` on every save; `409 stale_revision` when someone saved first), sending with `expectedRevision`, `contentHash` (returned by the case GET only, never by a save: the hash of exactly what will be frozen, including evidence and credit records; `409 content_changed` if any of it changed since) and `sendToReview: true`, frozen submissions, append-only credit records, evidence references (`409 evidence_in_use` when a cost item cites the record) and the audited JSON evidence package (the sent revision as frozen, staff marks apart; or the draft, labelled). Members and viewers get `403`; non-members `404`. |
+| `GET /api/staff/capital`, `GET /api/staff/capital/:caseId`, `POST …/decision`, `POST …/evidence/:evidenceId/review` | `STAFF_EMAILS` account, not a member of that workspace for decisions | Internal review of sent revisions only, read from the frozen snapshot (never a live draft, title, evidence or credit record). Every action names the `submissionId` the reviewer saw; `409 stale_submission` if the customer withdrew or sent a newer revision since. Decisions are `changes_requested` (with notes) or `evidence_reviewed`; marks are append-only per submission and frozen evidence id. No approval, offer or funding exists. Opening a case is recorded in the customer's audit log. |
 
 ## Docker
 
@@ -162,7 +164,7 @@ This is a long-running Node server (sessions, SMTP, rate limits), not a static o
 ## Repository map
 
 - `web/` React app: `src/router.jsx` routes and loaders, `src/site/` public pages, `src/private/` reviewer-only dashboard and sample data, `src/theme.jsx` light/dark toggle, `src/styles.css` theme tokens and styles, `src/assets/` self-hosted Inter and hero artwork.
-- `src/` Fastify server: `app.js` routes, API and static serving; `config.js` environment parsing; `lib/` contact validation and delivery, password hashing, reviewer lookup, origin check.
+- `src/` Fastify server: `app.js` routes, API and static serving; `config.js` environment parsing; `accounts.js`, `datasets.js`, `workspace-data.js`, `models.js`, `devices.js`, `capital.js` the JSON API by area; `lib/` contact validation and delivery, password hashing, reviewer lookup, origin check, and the validation shared with the browser (`onboarding.js`, `devices.js`, `capital.js`); `store/` the memory and Postgres stores.
 - `tests/` server tests (`node --test`) and the fixture build.
 - `vite.config.js` build config, including the `/private/` chunk rule.
 
