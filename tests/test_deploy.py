@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -199,17 +201,18 @@ class RuntimePreservation(unittest.TestCase):
             def inspect(self, *args, **kwargs): return old
             def request(self, *args): self.calls.append(args)
         release = object.__new__(deploy.Release)
-        release.swaps = [("web", old)]
+        release.swaps, release.receipt = [("web", old)], {}
         release.docker = FakeDocker()
         release.config = {"web_container": "web", "ingest_container": "ingest"}
         release.health = lambda *args, **kwargs: None
         release.homepage_health = lambda: None
         release.rollback()
         self.assertEqual(release.docker.calls, [])
+        self.assertTrue(release.receipt["containers_restored"])
 
     def test_rollback_health_failure_is_not_success(self):
         release = object.__new__(deploy.Release)
-        release.swaps = []
+        release.swaps, release.receipt = [], {}
         release.config = {"web_container": "web", "ingest_container": "ingest"}
         release.docker = types.SimpleNamespace(inspect=lambda name: {})
         def failed(*args, **kwargs):
@@ -217,6 +220,34 @@ class RuntimePreservation(unittest.TestCase):
         release.health = failed
         with self.assertRaises(deploy.ReleaseError):
             release.rollback()
+        # Restored is recorded before verification, so the receipt distinguishes "back" from "verified".
+        self.assertTrue(release.receipt["containers_restored"])
+
+    def test_rollback_verification_failure_never_masks_the_primary_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = object.__new__(deploy.Release)
+            release.config = {"web_container": "web", "ingest_container": "ingest"}
+            release.sha, release.web, release.ingest = SHA, {}, {}
+            release.images, release.receipt, release.swaps = {"web": "web", "ingest": "ingest"}, {}, []
+            release.backup_dir = Path(directory)
+            release.preflight = release.free_space = release.backup = release.build = release.migrate = lambda: None
+            release.validate_catalogs = release.ensure_grants = release.verify_catalogs_unchanged = lambda: None
+            release.protected_snapshot = lambda: {}
+            def failing_swap(*args):
+                release.swaps.append(("ingest", {}))
+                raise deploy.ReleaseError("Running image differs from the built release")
+            release.swap = failing_swap
+            def failing_rollback():
+                release.receipt["containers_restored"] = True
+                raise deploy.ReleaseError("Restored public homepage check failed")
+            release.rollback = failing_rollback
+            with patch.object(deploy, "already_running", return_value=False), patch.object(deploy, "verify_release", return_value=1):
+                with self.assertRaises(deploy.ReleaseError):
+                    release.execute()
+            receipt = json.loads((Path(directory) / "receipt.json").read_text())
+            self.assertEqual(receipt["failure"], "Running image differs from the built release")
+            self.assertEqual(receipt["rollback_failure"], "Restored public homepage check failed")
+            self.assertEqual((receipt["containers_restored"], receipt["containers_rolled_back"], receipt["live"]), (True, False, False))
 
     def test_existing_protected_rows_cannot_change_or_disappear(self):
         before = {"reviewers": [{"id": "admin", "digest": "original"}], "versions": [{"id": "v1", "digest": "frozen"}]}
@@ -576,6 +607,200 @@ class FeatureGuards(unittest.TestCase):
         for bad in ("5", True, -1, 1.5):
             with self.subTest(value=bad), self.assertRaises(deploy.ReleaseError):
                 deploy.free_space_floor({"min_free_bytes": bad})
+
+
+class FakeResponse:
+    """Just what the controller reads from urlopen: status, final URL and the CSP header."""
+    def __init__(self, url, status=200, csp="default-src 'self';script-src 'self';img-src 'self' blob: https://ingest.example;media-src 'self' blob: https://ingest.example"):
+        self.status, self.url, self.headers = status, url, {"Content-Security-Policy": csp}
+    def geturl(self): return self.url
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+
+
+def http_error(url, code):
+    return deploy.HTTPError(url, code, "status " + str(code), {}, None)
+
+
+class Readiness(unittest.TestCase):
+    """A replaced container must pass Docker's health gate, and the public edge may lag while it re-routes."""
+
+    def release(self, inspections):
+        release = object.__new__(deploy.Release)
+        release.config = {"network": "coolify", "public_url": "https://frontierintelligencelab.com"}
+        release.web = {"Config": {"Env": ["INGEST_PUBLIC_URL=https://ingest.example"]}}
+        release.receipt, release.inspected = {}, 0
+        def inspect(container_id, **kwargs):
+            state = inspections[min(release.inspected, len(inspections) - 1)]
+            release.inspected += 1
+            return {"State": state, "NetworkSettings": {"Networks": {"coolify": {"IPAddress": "10.0.1.43"}}}}
+        release.docker = types.SimpleNamespace(inspect=inspect)
+        return release
+
+    def clock(self, step=1):
+        now = [0.0]
+        def monotonic():
+            now[0] += step
+            return now[0]
+        return monotonic
+
+    def test_docker_health_gate_must_be_healthy_even_when_the_internal_endpoint_answers(self):
+        starting = {"Running": True, "Health": {"Status": "starting", "FailingStreak": 0}}
+        healthy = {"Running": True, "Health": {"Status": "healthy", "FailingStreak": 0}}
+        release = self.release([starting, starting, healthy])
+        with patch.object(deploy, "urlopen", return_value=FakeResponse("http://10.0.1.43:3000/healthz")), \
+             patch.object(deploy.time, "sleep") as sleep, patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            release.health({"Id": "new", "Config": {"Env": ["PORT=3000"]}})
+        self.assertEqual((release.inspected, sleep.call_count), (3, 2))
+
+    def test_container_without_a_healthcheck_is_ready_on_internal_200(self):
+        plain = {"Running": True}
+        release = self.release([plain])
+        answers = [OSError("refused"), FakeResponse("http://10.0.1.43:4100/healthz")]
+        with patch.object(deploy, "urlopen", side_effect=answers), patch.object(deploy.time, "sleep") as sleep, \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            release.health({"Id": "ingest", "Config": {"Env": ["INGEST_BIND=0.0.0.0:4100"]}}, ingest=True)
+        self.assertEqual((release.inspected, sleep.call_count), (2, 1))
+
+    def test_health_propagates_a_termination_request_raised_during_the_internal_probe(self):
+        release = self.release([{"Running": True, "Health": {"Status": "healthy"}}])
+        interrupted = deploy.ReleaseError("Deployment interrupted; restoring previous containers")
+        with patch.object(deploy, "urlopen", side_effect=[interrupted, FakeResponse("x")]) as opened, patch.object(deploy.time, "sleep") as sleep, \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.health({"Id": "new", "Config": {"Env": []}})
+        self.assertIs(failure.exception, interrupted)
+        self.assertEqual((opened.call_count, sleep.call_count), (1, 0))
+
+    def test_health_fails_closed_on_unhealthy_exited_or_a_bounded_timeout(self):
+        cases = (("unhealthy", [{"Running": True, "Health": {"Status": "unhealthy", "FailingStreak": 3}}], "failed its own health check"),
+                 ("exited", [{"Running": False, "Health": {"Status": "healthy"}}], "exited"),
+                 ("never healthy", [{"Running": True, "Health": {"Status": "starting"}}], "timed out"),
+                 ("internal never answers", [{"Running": True}], "timed out"))
+        for name, inspections, message in cases:
+            release = self.release(inspections)
+            with self.subTest(case=name), patch.object(deploy, "urlopen", side_effect=OSError("refused") if name == "internal never answers" else [FakeResponse("x")] * 1000), \
+                 patch.object(deploy.time, "sleep") as sleep, patch.object(deploy.time, "monotonic", side_effect=self.clock(step=30)):
+                with self.assertRaises(deploy.ReleaseError) as failure:
+                    release.health({"Id": "new", "Config": {"Env": []}})
+            self.assertIn(message, str(failure.exception))
+            self.assertLessEqual(sleep.call_count, deploy.HEALTH_TIMEOUT // 30 + 1)
+
+    SITE, INGEST = "https://frontierintelligencelab.com", "https://ingest.example"
+    PAGES = ("/", "/contact", "/demo", "/signin", "/signup")
+
+    def pages(self):
+        return [FakeResponse(self.SITE + page) for page in self.PAGES]
+
+    def test_public_checks_retry_transient_edge_answers_then_apply_strict_checks(self):
+        release = self.release([])
+        answers = [http_error(self.SITE + "/", 503), deploy.URLError(ConnectionRefusedError()), ConnectionResetError(), TimeoutError(), socket.gaierror()] + self.pages() + \
+                  [http_error(self.INGEST + "/v1/preview?token=invalid", 503), http_error(self.INGEST + "/v1/preview?token=invalid", 401)]
+        with patch.object(deploy, "public_open", side_effect=answers) as opened, patch.object(deploy.time, "sleep") as sleep, \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            release.public_checks()
+        self.assertEqual(release.receipt["public_checks"]["pages_200"], list(self.PAGES))
+        self.assertEqual((release.receipt["public_checks"]["invalid_preview_status"], sleep.call_count, opened.call_count), (401, 6, 12))
+        with patch.object(deploy, "public_open", side_effect=[http_error(self.SITE + "/", 503), FakeResponse(self.SITE + "/")]), patch.object(deploy.time, "sleep"), \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            release.homepage_health()
+
+    def test_public_checks_fail_at_once_on_non_transient_answers_and_time_out_on_permanent_503(self):
+        release = self.release([])
+        cases = (("not found", [http_error(self.SITE + "/", 404)], "Public page check failed"),
+                 ("redirect is not followed and refused", [http_error(self.SITE + "/", 302)], "Public page check failed"),
+                 ("preview accepts an invalid token", self.pages() + [FakeResponse(self.INGEST + "/v1/preview?token=invalid")], "did not reject"),
+                 ("preview missing", self.pages() + [http_error(self.INGEST + "/v1/preview?token=invalid", 404)], "Protected preview route check failed"))
+        for name, answers, message in cases:
+            with self.subTest(case=name), patch.object(deploy, "public_open", side_effect=answers), patch.object(deploy.time, "sleep") as sleep, \
+                 patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+                with self.assertRaises(deploy.ReleaseError) as failure:
+                    release.public_checks()
+            self.assertIn(message, str(failure.exception))
+            self.assertEqual(sleep.call_count, 0, name)
+        with patch.object(deploy, "public_open", side_effect=http_error(self.SITE + "/", 503)), patch.object(deploy.time, "sleep") as sleep, \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock(step=30)):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.homepage_health()
+        self.assertIn("did not become ready in time", str(failure.exception))
+        self.assertLessEqual(sleep.call_count, deploy.PUBLIC_TIMEOUT // 30 + 1)
+        self.assertTrue(any(isinstance(handler, deploy.NoRedirect) for handler in deploy.PUBLIC_OPENER.handlers))
+        self.assertIsNone(deploy.NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://elsewhere.example/"))
+
+    def test_public_answers_must_come_from_the_exact_requested_origin(self):
+        release = self.release([])
+        cases = (("same-host https to http downgrade", [FakeResponse("http://frontierintelligencelab.com/")]),
+                 ("same host, other port", [FakeResponse(self.SITE + ":8443/")]),
+                 ("other host", [FakeResponse("https://elsewhere.example/")]),
+                 ("preview 401 from a foreign origin", self.pages() + [http_error("https://foreign.invalid/elsewhere", 401)]),
+                 ("preview 401 from the ingest host over http", self.pages() + [http_error("http://ingest.example/v1/preview?token=invalid", 401)]),
+                 ("preview 503 from a foreign origin is final, not transient", self.pages() + [http_error("https://foreign.invalid/v1/preview", 503)]))
+        for name, answers in cases:
+            with self.subTest(case=name), patch.object(deploy, "public_open", side_effect=answers) as opened, patch.object(deploy.time, "sleep") as sleep, \
+                 patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+                with self.assertRaises(deploy.ReleaseError) as failure:
+                    release.public_checks()
+            self.assertIn("unexpected origin", str(failure.exception), name)
+            self.assertEqual((sleep.call_count, opened.call_count), (0, len(answers)), name)
+        # A 401 on the right origin but the wrong endpoint is not the preview refusal either.
+        with patch.object(deploy, "public_open", side_effect=self.pages() + [http_error(self.INGEST + "/v1/other", 401)]), patch.object(deploy.time, "sleep"), \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.public_checks()
+        self.assertIn("Protected preview route check failed", str(failure.exception))
+        release.web = {"Config": {"Env": ["INGEST_PUBLIC_URL=http://ingest.example"]}}
+        with patch.object(deploy, "public_open") as opened:
+            with self.assertRaises(deploy.ReleaseError):
+                release.public_checks()
+        opened.assert_not_called()
+
+    def test_abort_tls_and_protocol_failures_are_never_retried(self):
+        release = self.release([])
+        interrupted = deploy.ReleaseError("Deployment interrupted; restoring previous containers")
+        with patch.object(deploy, "public_open", side_effect=[interrupted, FakeResponse(self.SITE + "/")]) as opened, patch.object(deploy.time, "sleep") as sleep, \
+             patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.homepage_health()
+        self.assertIs(failure.exception, interrupted)
+        self.assertEqual((opened.call_count, sleep.call_count), (1, 0))
+        final = (("wrapped certificate failure", deploy.URLError(ssl.SSLCertVerificationError("synthetic"))),
+                 ("bare certificate failure", ssl.SSLCertVerificationError("synthetic")),
+                 ("other TLS failure", ssl.SSLError("synthetic")),
+                 ("unsupported url", ValueError("unknown url type")),
+                 ("url error without transport cause", deploy.URLError("unknown url type")),
+                 ("malformed response", deploy.http.client.BadStatusLine("synthetic")),
+                 ("unexpected OS error", OSError("synthetic")))
+        for name, error in final:
+            with self.subTest(case=name), patch.object(deploy, "public_open", side_effect=[error, FakeResponse(self.SITE + "/")]) as opened, \
+                 patch.object(deploy.time, "sleep") as sleep, patch.object(deploy.time, "monotonic", side_effect=self.clock()):
+                with self.assertRaises(deploy.ReleaseError) as failure:
+                    release.homepage_health()
+            self.assertIn("failed before answering", str(failure.exception), name)
+            self.assertEqual((opened.call_count, sleep.call_count), (1, 0), name)
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.public_fetch("ftp://frontierintelligencelab.com/", 10 ** 9)
+
+    def test_public_budget_is_checked_before_each_request_and_caps_the_request_timeout(self):
+        release = self.release([])
+        with patch.object(deploy, "public_open") as opened, patch.object(deploy.time, "monotonic", return_value=200.0):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                deploy.public_fetch(self.SITE + "/", 100.0)
+        self.assertIn("did not become ready in time", str(failure.exception))
+        opened.assert_not_called()
+        with patch.object(deploy, "public_open", return_value=FakeResponse(self.SITE + "/")) as opened, patch.object(deploy.time, "monotonic", side_effect=[95.0, 96.0]):
+            self.assertEqual(deploy.public_fetch(self.SITE + "/", 100.0), (200, "/", opened.return_value.headers["Content-Security-Policy"]))
+        self.assertLessEqual(opened.call_args.kwargs["timeout"], 5.0)
+        # An answer that only arrives after the deadline is refused, and a later route never starts after a shared deadline.
+        with patch.object(deploy, "public_open", return_value=FakeResponse(self.SITE + "/")), patch.object(deploy.time, "monotonic", side_effect=[99.0, 101.0]):
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.public_fetch(self.SITE + "/", 100.0)
+        answers = [FakeResponse(self.SITE + "/"), FakeResponse(self.SITE + "/contact")]
+        with patch.object(deploy, "public_open", side_effect=answers) as opened, patch.object(deploy.time, "sleep") as sleep, \
+             patch.object(deploy.time, "monotonic", side_effect=[0.0, 1.0, 2.0, deploy.PUBLIC_TIMEOUT + 1.0, deploy.PUBLIC_TIMEOUT + 2.0]):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.public_checks()
+        self.assertIn("did not become ready in time", str(failure.exception))
+        self.assertEqual((opened.call_count, sleep.call_count), (1, 0))
 
 
 PROOF_URL = os.environ.get("RELEASE_GUARDS_TEST_DATABASE_URL", "")

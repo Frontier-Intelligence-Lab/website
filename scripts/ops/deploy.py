@@ -13,13 +13,14 @@ import selectors
 import signal
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
 import time
 from urllib.parse import quote, unquote, urlsplit
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.error import HTTPError, URLError
 from contextlib import contextmanager
 
 
@@ -69,6 +70,10 @@ LOOPBACK_ORIGIN = r"http://(127\.0\.0\.1|localhost|\[::1\]):[0-9]{1,5}"
 MEMORY_SECRET_NAME = r"PROVENA_.*|.*MEMORY.*(KEY|TOKEN|SECRET|PASSWORD).*"
 CATALOG_LIMIT = 1024 * 1024
 DEFAULT_FREE_BYTES = 5 * 1024 ** 3
+# Readiness is bounded: a container must pass Docker's own health gate (when its image defines one) and answer
+# internally, and the public edge may answer 502/503/504 or refuse connections while it re-routes to a replaced
+# container. Those transient answers are retried until the deadline; every other failure is final at once.
+HEALTH_TIMEOUT, PUBLIC_TIMEOUT, TRANSIENT_STATUSES = 180, 120, {502, 503, 504}
 REVISION_LABEL = "org.opencontainers.image.revision"
 
 
@@ -435,6 +440,63 @@ def verify_csp(csp, origin):
         raise ReleaseError("Blob sources must be limited to images and media")
 
 
+class NoRedirect(HTTPRedirectHandler):
+    """Readiness checks never follow a redirect: a 3xx answer surfaces as its own status for the caller to refuse."""
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+PUBLIC_OPENER = build_opener(NoRedirect)  # the default handlers keep certificate verification
+TRANSIENT_ERRORS = (TimeoutError, ConnectionError, socket.gaierror)
+
+
+def public_open(url, timeout):
+    return PUBLIC_OPENER.open(Request(url, headers={"User-Agent": "valcairn-deploy"}), timeout=timeout)
+
+
+def origin_of(url):
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ReleaseError("Public route has an unsupported origin")
+    return parts.scheme, parts.hostname, parts.port or {"http": 80, "https": 443}[parts.scheme]
+
+
+def transient(error):
+    """Only transport interruptions are retried; TLS, protocol, URL and every other failure is final."""
+    reason = error.reason if isinstance(error, URLError) else error
+    return isinstance(reason, TRANSIENT_ERRORS) and not isinstance(reason, ssl.SSLError)
+
+
+def public_fetch(url, deadline):
+    """Fetch one public URL on its exact origin (scheme, host, port), never following a redirect, within the budget
+    left before `deadline`. Only 502/503/504 and transient transport errors are retried; the answer must arrive on
+    the requested origin before the deadline. Returns (status, path, csp) for the caller's strict checks. A
+    ReleaseError, including a termination request raised while waiting, propagates at once."""
+    expected = origin_of(url)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReleaseError("Public route did not become ready in time")
+        try:
+            with public_open(url, timeout=min(15, remaining)) as response:
+                answer = response.status, response.geturl(), response.headers.get("Content-Security-Policy", "")
+        except HTTPError as error:
+            answer = error.code, error.geturl(), ""
+        except (URLError, OSError, http.client.HTTPException, ValueError) as error:
+            if not transient(error):
+                raise ReleaseError("Public route failed before answering") from None
+            answer = None
+        if answer is not None:
+            status, final, csp = answer
+            if origin_of(final) != expected:
+                raise ReleaseError("Public route answered from an unexpected origin")
+            if time.monotonic() > deadline:
+                raise ReleaseError("Public route did not become ready in time")
+            if status not in TRANSIENT_STATUSES:
+                return status, urlsplit(final).path, csp
+        time.sleep(min(2, max(0.0, deadline - time.monotonic())))
+
+
 def verify_protected_records(before, after):
     for table, rows in before.items():
         current = {row["id"]: row["digest"] for row in after.get(table, [])}
@@ -776,18 +838,30 @@ class Release:
     def health(self, container, ingest=False):
         env = env_map(container)
         port = int(env.get("INGEST_BIND", "0.0.0.0:4100").rsplit(":", 1)[1]) if ingest else int(env.get("PORT", "3000"))
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + HEALTH_TIMEOUT
+        while True:
             fresh = self.docker.inspect(container["Id"])
             if not fresh["State"]["Running"]:
                 raise ReleaseError("New container exited")
+            # Docker's own gate decides when the image defines a HEALTHCHECK: "starting" is not ready, "unhealthy" is final.
+            status = (fresh["State"].get("Health") or {}).get("Status")
+            if status == "unhealthy":
+                raise ReleaseError("Container failed its own health check")
             ip = fresh["NetworkSettings"]["Networks"][self.config["network"]]["IPAddress"]
-            try:
-                with urlopen("http://" + ip + ":" + str(port) + "/healthz", timeout=3) as response:
-                    if response.status == 200: return
-            except Exception:
-                time.sleep(1)
-        raise ReleaseError("Container health check timed out")
+            if status in (None, "healthy") and self.internal_ok(ip, port):
+                return
+            if time.monotonic() >= deadline:
+                raise ReleaseError("Container health check timed out")
+            time.sleep(1)
+
+    def internal_ok(self, ip, port):
+        try:
+            with urlopen("http://" + ip + ":" + str(port) + "/healthz", timeout=3) as response:
+                return response.status == 200
+        except ReleaseError:
+            raise  # a termination request raised while probing must stop the release, not read as "not ready yet"
+        except Exception:
+            return False
 
     def rollback(self):
         for name, original in reversed(self.swaps):
@@ -803,43 +877,35 @@ class Release:
                     self.docker.request("POST", "/networks/" + quote(network) + "/connect", {"Container": original["Id"], "EndpointConfig": endpoint})
             if not old["State"]["Running"]:
                 self.docker.request("POST", "/containers/" + original["Id"] + "/start")
+        # The previous containers are back; what follows is verification, recorded separately in the receipt.
+        self.receipt["containers_restored"] = True
         self.health(self.docker.inspect(self.config["ingest_container"]), ingest=True)
         self.health(self.docker.inspect(self.config["web_container"]))
         self.homepage_health()
 
     def homepage_health(self):
-        try:
-            with urlopen(self.config["public_url"] + "/", timeout=15) as response:
-                if response.status != 200 or urlsplit(response.geturl()).netloc != urlsplit(self.config["public_url"]).netloc:
-                    raise ReleaseError("Restored public homepage check failed")
-        except Exception:
-            raise ReleaseError("Restored public homepage check failed") from None
+        status, path, _ = public_fetch(self.config["public_url"] + "/", time.monotonic() + PUBLIC_TIMEOUT)
+        if (status, path) != (200, "/"):
+            raise ReleaseError("Restored public homepage check failed")
 
     def public_checks(self):
-        checked = []
-        for path in ("/", "/contact", "/demo", "/signin", "/signup"):
-            try:
-                with urlopen(self.config["public_url"] + path, timeout=15) as response:
-                    if response.status != 200 or urlsplit(response.geturl()).netloc != urlsplit(self.config["public_url"]).netloc:
-                        raise ReleaseError("Public page check failed")
-                    csp = response.headers.get("Content-Security-Policy", "")
-                    origin = env_map(self.web)["INGEST_PUBLIC_URL"]
-                    verify_csp(csp, origin)
-                    checked.append(path)
-            except ReleaseError:
-                raise
-            except Exception:
-                raise ReleaseError("Public page check failed") from None
-        try:
-            with urlopen(env_map(self.web)["INGEST_PUBLIC_URL"] + "/v1/preview?token=invalid", timeout=15):
-                raise ReleaseError("Preview route did not reject an invalid token")
-        except HTTPError as error:
-            if error.code != 401:
-                raise ReleaseError("Protected preview route check failed") from None
-        except ReleaseError:
-            raise
-        except Exception:
-            raise ReleaseError("Protected preview route check failed") from None
+        deadline, origin, checked = time.monotonic() + PUBLIC_TIMEOUT, env_map(self.web)["INGEST_PUBLIC_URL"], []
+        if origin_of(origin)[0] != "https":
+            raise ReleaseError("Ingest origin must be https")
+        for page in ("/", "/contact", "/demo", "/signin", "/signup"):
+            status, path, csp = public_fetch(self.config["public_url"] + page, deadline)
+            if (status, path) != (200, page):
+                raise ReleaseError("Public page check failed")
+            verify_csp(csp, origin)
+            checked.append(page)
+        # The refusal must come from the exact ingest origin and endpoint; any other 401 proves nothing.
+        status, path, _ = public_fetch(origin + "/v1/preview?token=invalid", deadline)
+        if path != "/v1/preview":
+            raise ReleaseError("Protected preview route check failed")
+        if status == 200:
+            raise ReleaseError("Preview route did not reject an invalid token")
+        if status != 401:
+            raise ReleaseError("Protected preview route check failed")
         self.receipt["public_checks"] = {"pages_200": checked, "csp": csp, "invalid_preview_status": 401}
 
     def execute(self):
@@ -885,8 +951,10 @@ class Release:
                     with defer_termination():
                         self.rollback()
                     self.receipt["containers_rolled_back"] = True
-                except Exception:
+                except Exception as rollback_error:
+                    # Kept apart from `failure` so a verification problem during rollback never masks the original error.
                     self.receipt["containers_rolled_back"] = False
+                    self.receipt["rollback_failure"] = str(rollback_error) if isinstance(rollback_error, ReleaseError) else "unexpected host error"
             raise ReleaseError("Release health failed; inspect the private receipt and rollback state") from None
         finally:
             if hasattr(self, "backup_dir"):
