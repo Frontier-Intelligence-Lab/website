@@ -25,8 +25,8 @@ from contextlib import contextmanager
 
 REPOSITORY = "Frontier-Intelligence-Lab/website"
 REQUIRED_JOBS = {"Web / no database", "Web / PostgreSQL 17", "Ingest / Rust 1.99.1"}
-# Tables grouped by the numbered migration that creates them: 001-010 as in migrations/, 011-013 as in the
-# reviewed Models, Device and (still provisional) Capital branches. The migration ledger decides which groups
+# Tables grouped by the numbered migration that creates them, 001-013 as in migrations/ (Models, Device and
+# Capital included; Memory and Agents add no server table). The migration ledger decides which groups
 # must exist: a listed migration requires its whole group, an unlisted one forbids it. 003, 005 and 008-010
 # add no tables. The ledger table itself comes from the migrator, and 006 is the baseline the preflight needs.
 TABLE_GROUPS = {

@@ -853,6 +853,52 @@ html:has(.ob), html:has(.ob-split) { background: var(--bg); }
   .mdl-mem-row { grid-template-columns: 80px minmax(0, 1fr) 56px; }
 }
 
+/* Capital: cost plan, financing request, evidence */
+.cap-form { display: flex; flex-direction: column; gap: 12px; padding-top: 14px; border-top: 1px solid var(--divider); }
+.cap-h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.cap-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 10px; }
+.cap-totals > div { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); min-width: 0; }
+.cap-totals strong { font-size: 15px; letter-spacing: -0.01em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cap-total-line { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.cap-total-line .ob-muted { font-size: 12px; }
+.cap-totals .ob-muted { font-size: 12px; }
+.cap-tab { display: inline-flex; align-items: center; min-height: 40px; padding: 0 16px; border-radius: 7px; color: var(--text-2); font-size: 14px; font-weight: 500; text-decoration: none; }
+.cap-tab[aria-current="page"] { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12); }
+.cap-stages { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; font-size: 12.5px; color: var(--muted); }
+.cap-stages li { display: flex; flex-direction: column; gap: 6px; }
+.cap-stages li > span:first-child { height: 4px; border-radius: 2px; background: var(--todo); }
+.cap-stages .is-done { color: var(--text); font-weight: 500; }
+.cap-stages .is-done > span:first-child { background: var(--done); }
+.cap-stages .is-current { color: var(--t-orange); font-weight: 600; }
+.cap-stages .is-current > span:first-child { background: var(--t-orange); }
+.cap-stages .is-planned > span:first-child { background: repeating-linear-gradient(90deg, var(--control) 0 6px, transparent 6px 10px); }
+.cap-stages .ob-badge { align-self: flex-start; font-size: 10.5px; padding: 1px 6px; }
+.cap-ref { padding: 12px 0; border-top: 1px solid var(--divider); align-items: end; }
+.cap-review { display: flex; flex-direction: column; gap: 12px; padding: 4px 0 14px; }
+/* Reference facts: the whole stored reference of an evidence record, read-only, nested lists for nested values. */
+.ob .cap-facts-details { margin-top: 4px; border: 0; border-radius: 0; padding: 0; background: none; }
+.ob .cap-facts-details > summary { min-height: 26px; font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+.cap-facts { margin: 4px 0 6px; display: grid; grid-template-columns: minmax(110px, max-content) minmax(0, 1fr); gap: 3px 12px; font-size: 12.5px; }
+.cap-facts dt { color: var(--muted); }
+.cap-facts dd { margin: 0; overflow-wrap: anywhere; }
+.cap-facts--nested { margin: 0; padding: 6px 10px; border-left: 2px solid var(--divider); }
+.cap-facts-meta { opacity: 0.75; }
+.cap-facts-list { margin: 0; padding-left: 18px; }
+.cap-facts-empty { font-size: 12.5px; margin: 4px 0 6px; }
+/* Evidence rows: tile, text body, badges, optional action. Desktop keeps one row; phones wrap badges and actions under the text. */
+.cap-evidence-badges { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; flex: none; }
+@media (max-width: 720px) {
+  .cap-evidence > li { flex-wrap: wrap; gap: 8px 10px; }
+  .cap-evidence > li > div { flex: 1 1 calc(100% - 38px); }
+  .cap-evidence > li > .cap-evidence-badges { flex-direction: row; flex-wrap: wrap; align-items: center; flex: 1 1 100%; }
+  .cap-evidence > li > .btn-small { flex: 0 0 auto; }
+  /* Facts stack the label above its value so values keep their full width, nested facts included. */
+  .cap-facts, .cap-facts--nested { grid-template-columns: minmax(0, 1fr); gap: 1px 0; }
+  .cap-facts dt { margin-top: 5px; font-size: 11.5px; }
+  .cap-facts--nested { padding: 4px 0 4px 8px; }
+}
+@media (max-width: 720px) { .cap-totals { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); } }
+
 /* Run on this device */
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 /* A header cell holding only hidden text positions it against itself, so it scrolls with the table instead of widening the page. */
@@ -883,3 +929,27 @@ th:has(> .sr-only) { position: relative; }
   .dev-msg { max-width: 92%; }
   .dev-compose { flex-direction: column; align-items: stretch; }
 }
+
+/* ---------- Memory ---------- */
+.mem-search { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.mem-search input[type="search"] { flex: 1 1 220px; }
+.mem-search select { flex: 0 1 130px; width: auto; }
+.mem-list > li > div { gap: 4px; }
+.mem-snippet { font-size: 13.5px; line-height: 1.45; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mem-h3 { margin: 4px 0 0; font-size: 12.5px; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.04em; }
+.mem-content { margin: 0; padding: 12px 14px; max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); font: inherit; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mem-ref { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px dashed var(--control); border-radius: 10px; }
+.mem-passages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.mem-passages > li { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.mem-passages .mem-snippet { max-height: 160px; overflow: auto; }
+.mem-cited { display: block; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.ob input[type="file"] { font: inherit; font-size: 14px; }
+
+/* Agents */
+.agt-ready { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; }
+.agt-ready > li { display: flex; gap: 8px; align-items: flex-start; }
+.agt-ready > li > span:first-child { flex: none; margin-top: 2px; }
+.agt-form { max-width: none; }
+.agt-question { margin: 0; padding: 12px 14px; border-left: 3px solid var(--accent); background: var(--surface-2); border-radius: 0 8px 8px 0; font-size: 14.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agt-steps > li > div { gap: 4px; }
+.agt-steps code, .ob-card .agt-question code { overflow-wrap: anywhere; }

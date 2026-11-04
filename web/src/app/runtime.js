@@ -17,6 +17,7 @@ function classify(text, status) {
   if (/out of memory|requires more system memory|insufficient memory|cudaMalloc|unable to allocate/i.test(t)) return new RuntimeError('out_of_memory', t.slice(0, 300));
   if (/no space left|disk full|not enough space/i.test(t)) return new RuntimeError('disk_full', t.slice(0, 300));
   if (status === 404 || /not found/i.test(t)) return new RuntimeError('not_found', t.slice(0, 300));
+  if (/does not support tools/i.test(t)) return new RuntimeError('no_tools', t.slice(0, 300));
   return new RuntimeError('runtime_error', t.slice(0, 300) || `The runtime answered ${status}.`);
 }
 
@@ -132,11 +133,30 @@ export function createRuntime(origin) {
       return {
         content,
         doneReason: final.done_reason ?? null,
-        counters: { loadMs: ms(final.load_duration), promptTokens: final.prompt_eval_count ?? null, promptEvalMs: ms(final.prompt_eval_duration), outputTokens: final.eval_count ?? null, evalMs: ms(final.eval_duration) },
+        counters: counters(final),
       };
+    },
+    /**
+     * One structured completion for an agent turn: the runtime is given tool definitions and returns the tool calls
+     * it parsed itself (`message.tool_calls`), separately from any text. Nothing here reads a call out of prose: a
+     * model that answers in text only returns `toolCalls: []`. Streams like `chat` so Stop aborts it the same way.
+     */
+    async complete({ model, messages, tools, options, think, signal }) {
+      const body = { model, messages, tools, stream: true, options, ...(think == null ? {} : { think }) };
+      let content = '';
+      const toolCalls = [];
+      let final = null;
+      for await (const part of lines(await call('/api/chat', { method: 'POST', body, signal }))) {
+        content += part.message?.content ?? '';
+        for (const c of part.message?.tool_calls ?? []) toolCalls.push({ name: c.function?.name, arguments: c.function?.arguments });
+        if (part.done) { final = part; break; }
+      }
+      if (!final) throw new RuntimeError('disconnected', 'The reply ended before the runtime finished it.');
+      return { content, toolCalls, doneReason: final.done_reason ?? null, counters: counters(final) };
     },
   };
 }
+const counters = (final) => ({ loadMs: ms(final.load_duration), promptTokens: final.prompt_eval_count ?? null, promptEvalMs: ms(final.prompt_eval_duration), outputTokens: final.eval_count ?? null, evalMs: ms(final.eval_duration) });
 
 /** What this browser says about the machine. Hints only: browsers round, cap or hide these values. */
 export async function browserHints() {

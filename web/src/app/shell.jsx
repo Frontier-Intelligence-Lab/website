@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router';
 import { api } from '../api.js';
 import { ThemeToggle } from '../theme.jsx';
 import { Icon, Tile, initials } from './ui.jsx';
+import { forgetConnections } from './memory.js';
 
 export const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 export const roleName = (role) => role[0].toUpperCase() + role.slice(1);
@@ -20,6 +21,9 @@ const DATASET_PAGES = [
   ['import', 'Import', '/import'],
   ['versions', 'Versions', '/versions'],
 ];
+
+// Capital (cost plan, financing request, evidence) is for the people who run the company and its finances.
+export const CAPITAL_ROLES = ['owner', 'admin', 'finance'];
 
 // Models pages, shown under Models while you are in one of them.
 const MODEL_PAGES = [
@@ -40,6 +44,8 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
     setSignOutState('pending');
     const res = await api.signout().catch(() => null);
     if (!res?.ok) return setSignOutState('failed');
+    // The signed-in person is gone from this tab, so its local-memory keys go too; the memories stay in the store.
+    forgetConnections();
     navigate('/signin');
   }
   const toggle = () => {
@@ -84,9 +90,12 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
             </div>
           )}
           <Link to={`/w/${entry.slug}/device`} title="Run on this device" aria-current={current === 'device' ? 'page' : undefined}><Tile icon="play" tone="green" size="sm" /><span className="ob-side-label">Run on this device</span></Link>
-          {entry.kind === 'organization' && <a aria-disabled="true" title="Financing: planned, not available yet"><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Financing</span> <span className="ob-badge">Planned</span></a>}
+          <Link to={`/w/${entry.slug}/memory`} title="Memory" aria-current={current === 'memory' ? 'page' : undefined}><Tile icon="data" tone="teal" size="sm" /><span className="ob-side-label">Memory</span></Link>
+          <Link to={`/w/${entry.slug}/agents`} title="Agents" aria-current={current === 'agents' ? 'page' : undefined}><Tile icon="target" tone="blue" size="sm" /><span className="ob-side-label">Agents</span></Link>
+          {entry.kind === 'organization' && CAPITAL_ROLES.includes(role) && <Link to={`/w/${entry.slug}/capital`} title="Capital" aria-current={current.startsWith('capital') ? 'page' : undefined}><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Capital</span></Link>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`} title="Team"><Tile icon="people" tone="violet" size="sm" /><span className="ob-side-label">Team</span></Link>}
           {account.isStaff && <Link to="/staff" title="Review queue"><Tile icon="shield" tone="green" size="sm" /><span className="ob-side-label">Review queue</span></Link>}
+          {account.isStaff && <Link to="/staff/capital" title="Capital review"><Tile icon="bank" tone="green" size="sm" /><span className="ob-side-label">Capital review</span></Link>}
         </nav>
         <div className="ob-side-foot">
           <ThemeToggle className="icon-btn ob-side-theme" />

@@ -128,7 +128,8 @@ test('the page may reach only the loopback runtime, never an arbitrary host', as
   const { app, owner } = await setup();
   const csp = (await app.inject({ method: 'GET', url: '/' })).headers['content-security-policy'];
   const connect = csp.split(';').map((d) => d.trim()).find((d) => d.startsWith('connect-src'));
-  assert.equal(connect, "connect-src 'self' http://127.0.0.1:11434 http://localhost:11434");
+  // The runtime and the memory gateway, both on loopback, and nothing else.
+  assert.equal(connect, "connect-src 'self' http://127.0.0.1:11434 http://localhost:11434 http://127.0.0.1:8787 http://localhost:8787");
   assert.doesNotMatch(csp, /unsafe-/);
   const local = (await owner.get('/api/local-models')).json();
   assert.deepEqual(local.runtimeOrigins, ['http://127.0.0.1:11434', 'http://localhost:11434']);
