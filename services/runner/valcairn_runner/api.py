@@ -12,6 +12,18 @@ from . import __version__
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib's default handler re-sends the Authorization header to wherever a 3xx points, including another
+    origin and plain http. The runner API never redirects, so every redirect is refused and surfaces as an error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def authenticated_opener():
+    return urllib.request.build_opener(_RefuseRedirects).open
+
+
 class AuthError(Exception):
     """The key is wrong or revoked, or the person who linked the runner no longer manages the workspace."""
 
@@ -46,7 +58,7 @@ class Api:
             raise ValueError("The runner key starts with vrk_")
         self._key = key
         self.timeout = timeout
-        self._open = opener or urllib.request.urlopen
+        self._open = opener or authenticated_opener()
 
     def _call(self, method: str, path: str, body: dict | None = None) -> dict:
         data = None if body is None else json.dumps(body).encode()

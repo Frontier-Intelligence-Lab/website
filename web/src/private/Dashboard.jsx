@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { api } from '../api.js';
 import { ThemeToggle } from '../theme.jsx';
 import { ATTENTION, CAMPAIGNS, FINANCING, KPIS, LIFECYCLE, NAV, PROJECTS, RUNS } from './sampleData.js';
@@ -270,7 +270,7 @@ export default function Dashboard({ reviewer }) {
 
   return (
     <div className="dash">
-      <title>Overview — Valcairn workspace</title>
+      <title>Sample overview — Valcairn reviewer demo</title>
       <Sidebar />
       <div className="dash-body">
         <header className="dash-top">
@@ -293,11 +293,14 @@ export default function Dashboard({ reviewer }) {
         </header>
 
         <main id="overview" className="dash-main">
-          <section className="dash-heading">
-            <div className="cell-stack">
-              <h1>Overview</h1>
-              <p className="subtle">Data, models and capital across five active projects. Sample workspace for invited reviewers.</p>
+          {/* This page is a static illustration for invited reviewers. The product itself runs in the working app, behind
+              workspace accounts that are separate from reviewer logins; the link below only navigates there. */}
+          <section className="dash-heading row-between row-wrap">
+            <div className="cell-stack" style={{ flex: '1 1 460px' }}>
+              <h1>Sample overview</h1>
+              <p className="subtle">The overview cards show sample data for invited reviewers. Real projects, data, models, memory, agents and capital run in the working app, which needs a workspace account: sign in with yours, or accept a workspace invitation. The reviewer demo login does not open it.</p>
             </div>
+            <Link className="btn-solid-app" to="/start">Open working app <Icon name="arrow" size={16} /></Link>
           </section>
 
           <section aria-label="Key figures" className="kpis">

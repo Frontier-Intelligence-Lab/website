@@ -82,6 +82,28 @@ test('stopping a reply aborts the request and is reported as stopped, not failed
   await ollama.close();
 });
 
+test('a structured completion returns only the tool calls the runtime parsed, never one read from prose, and tells an unsupported model apart', async (t) => {
+  const ollama = await fakeOllama(t, {
+    'POST /api/chat': (body, res) => {
+      assert.equal(body.tools[0].function.name, 'search_notes');
+      if (body.model === 'plain:1b') { res.writeHead(400).end(JSON.stringify({ error: 'registry.ollama.ai/library/plain:1b does not support tools' })); return; }
+      ndjson(res, [
+        { message: { role: 'assistant', content: 'Searching: search_notes({"query":"fake"})' }, done: false },
+        { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'search_notes', arguments: { query: 'deploy', limit: 2 } } }] }, done: false },
+        { message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop', eval_count: 9, eval_duration: 9e6 },
+      ]);
+    },
+  });
+  const rt = createRuntime(ollama.origin);
+  const tools = [{ type: 'function', function: { name: 'search_notes', parameters: { type: 'object' } } }];
+  const out = await rt.complete({ model: 'demo-tools:1b', messages: [{ role: 'user', content: 'q' }], tools });
+  assert.deepEqual(out.toolCalls, [{ name: 'search_notes', arguments: { query: 'deploy', limit: 2 } }], 'exactly the runtime’s parsed call; the prose mention is text');
+  assert.equal(out.content, 'Searching: search_notes({"query":"fake"})');
+  assert.equal(out.counters.outputTokens, 9);
+  await assert.rejects(rt.complete({ model: 'plain:1b', messages: [], tools }), (e) => e instanceof RuntimeError && e.kind === 'no_tools');
+  await ollama.close();
+});
+
 test('download progress sums real bytes across layers and needs the runtime’s success line', async (t) => {
   const ollama = await fakeOllama(t, {
     'POST /api/pull': (body, res) => ndjson(res, body.model === 'cut:1b'
