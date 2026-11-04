@@ -66,7 +66,13 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
     if (runner.status !== 'active') return invalid(reply, { runnerId: 'This runner was disconnected. Link it again first.' });
     const run = typeof body.enhanceRunId === 'string' ? await store.getEnhanceRun({ workspaceId, runId: body.enhanceRunId }) : null;
     if (body.enhanceRunId != null && !run) return invalid(reply, { enhanceRunId: 'Choose an approved enhance plan.' });
-    const spec = buildJobSpec({ kind: body.kind, run, catalog: config.modelCatalog });
+    let trainJob = null;
+    if (['evaluate', 'export'].includes(body.kind) && typeof body.trainJobId === 'string') {
+      trainJob = await store.getJob({ workspaceId, jobId: body.trainJobId });
+      // The adapter lives on the runner that trained it, so it must be the same plan and the same runner.
+      if (trainJob && (trainJob.kind !== 'train' || trainJob.enhanceRunId !== run?.id || trainJob.runnerId !== runner.id)) trainJob = null;
+    }
+    const spec = buildJobSpec({ kind: body.kind, run, catalog: config.modelCatalog, trainJob });
     if (spec.errors) return invalid(reply, spec.errors);
     try {
       return { job: view(await store.createJob({ workspaceId, runnerId: runner.id, kind: body.kind, enhanceRunId: run?.id ?? null, spec: spec.values, idempotencyKey, createdBy: request.user.id })) };

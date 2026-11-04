@@ -45,7 +45,7 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 | `POST /api/workspaces/:id/runners/:runnerId/revoke` | owner, admin | `{ runner }`; `409` if already revoked. |
 | `GET /api/workspaces/:id/jobs` | member | `{ jobs }`, newest first, at most 50. |
 | `GET /api/workspaces/:id/jobs/:jobId?after=<eventId>` | member | `{ job, events }`, events after the given id. |
-| `POST /api/workspaces/:id/jobs` | owner, admin | `{ kind: 'probe'\|'train'\|'evaluate'\|'export', runnerId, enhanceRunId?, idempotencyKey }` → `{ job }`. |
+| `POST /api/workspaces/:id/jobs` | owner, admin | `{ kind: 'probe'\|'train'\|'evaluate'\|'export', runnerId, enhanceRunId?, trainJobId?, idempotencyKey }` → `{ job }`. Evaluation and export need `trainJobId`: a succeeded training run of the same plan on the same runner. Its adapter's SHA-256 and location are frozen into the job's `spec.source`, so the runner can check it has exactly that adapter. |
 | `POST /api/workspaces/:id/jobs/:jobId/cancel` | owner, admin | `{ job }`; `409` if it already finished. |
 
 ## API for runners (`Authorization: Bearer vrk_…`, no cookies)

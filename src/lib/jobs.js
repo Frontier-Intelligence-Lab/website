@@ -114,7 +114,7 @@ export function validateFinish(raw) {
  * whose compute is the workspace's own runner; the plan, its model entry and its dataset list are copied, so later
  * catalog edits never change what the job runs.
  */
-export function buildJobSpec({ kind, run, catalog }) {
+export function buildJobSpec({ kind, run, catalog, trainJob = null }) {
   if (!JOB_KINDS.includes(kind)) return { errors: { kind: 'Choose a job type.' } };
   if (kind === 'probe') {
     if (run) return { errors: { enhanceRunId: 'A sandbox check does not use a plan.' } };
@@ -125,8 +125,16 @@ export function buildJobSpec({ kind, run, catalog }) {
   if (run.compute !== 'runner') return { errors: { enhanceRunId: 'This plan is set to run on a GPU provider, not on your runner.' } };
   const baseModel = catalog.find((m) => m.id === run.baseModelId);
   if (!baseModel) return { errors: { enhanceRunId: 'This plan\'s model is no longer in the catalog.' } };
+  // Evaluation and export work on one finished training run of this plan, on the same runner that holds its adapter.
+  let source = null;
+  if (kind !== 'train') {
+    const adapter = trainJob?.result?.adapter;
+    if (!trainJob || trainJob.status !== 'succeeded' || !/^[0-9a-f]{64}$/.test(adapter?.sha256 ?? '')) return { errors: { trainJobId: 'Choose a finished training run of this plan.' } };
+    source = { trainJobId: trainJob.id, adapterSha256: adapter.sha256, adapterLocation: adapter.location ?? null };
+  }
   return {
     values: {
+      ...(source && { source }),
       enhanceRunId: run.id,
       planVersion: run.updatedAt,
       plan: { name: run.name, steps: [...run.steps], datasets: structuredClone(run.datasets), spendCapUsd: run.spendCapUsd },

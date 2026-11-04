@@ -70,7 +70,7 @@ export function Compute() {
           <span className="ob-badge tile--green">Available · Sandbox check</span>
           <span className="ob-badge tile--green">Fine-tuning (LoRA) · runner 0.2 or later</span>
           <span className="ob-badge">Planned · Evaluation</span>
-          <span className="ob-badge">Planned · Export</span>
+          <span className="ob-badge">Export to Ollama · runner 0.3 or later</span>
         </div>
       </div>
       {notice && <p className={`ob-alert${notice.tone === 'ok' ? ' ob-alert--ok' : ''}`} role="status">{notice.text}</p>}
@@ -256,7 +256,7 @@ function JobsCard({ jobs, runners, manager, workspaceId, open, setOpen, onChange
           </table>
         </div>
       )}
-      {open && <JobDetail key={open} workspaceId={workspaceId} jobId={open} manager={manager} onChange={onChange} />}
+      {open && <JobDetail key={open} workspaceId={workspaceId} jobId={open} manager={manager} onChange={onChange} onOpen={setOpen} />}
     </section>
   );
 }
@@ -264,7 +264,7 @@ function JobsCard({ jobs, runners, manager, workspaceId, open, setOpen, onChange
 // Every stage, log and artifact; for each metric only its latest value, so a long training run stays readable.
 const visible = (events) => events.filter((e, i) => e.kind !== 'metric' || !events.slice(i + 1).some((n) => n.kind === 'metric' && n.data.name === e.data.name));
 
-function JobDetail({ workspaceId, jobId, manager, onChange }) {
+function JobDetail({ workspaceId, jobId, manager, onChange, onOpen }) {
   const [job, setJob] = useState(null);
   const [events, setEvents] = useState([]);
   const [pending, setPending] = useState(false);
@@ -293,6 +293,14 @@ function JobDetail({ workspaceId, jobId, manager, onChange }) {
     onChange();
   };
   const result = job.result ?? {};
+  const exportRun = async () => {
+    setPending(true);
+    const res = await api.createJob(workspaceId, { kind: 'export', runnerId: job.runnerId, enhanceRunId: job.enhanceRunId, trainJobId: job.id, idempotencyKey: crypto.randomUUID() }).catch(() => null);
+    setPending(false);
+    onChange();
+    if (res?.ok) onOpen(res.data.job.id);
+  };
+  const score = (s) => (s ? `${(s.f1 * 100).toFixed(1)}% token F1 · ${(s.exact * 100).toFixed(0)}% exact` : '—');
   return (
     <div className="dev-facts-col" style={{ marginTop: 12 }} aria-live="polite">
       <div className="row-between" style={{ flexWrap: 'wrap', gap: 10 }}>
@@ -310,6 +318,30 @@ function JobDetail({ workspaceId, jobId, manager, onChange }) {
           <div className="dev-fact"><dt>Examples</dt><dd>{result.trainExamples} trained · {result.heldOutExamples} held out</dd></div>
           <div className="dev-fact"><dt>Training</dt><dd>{result.steps} steps · {result.trainSeconds} s · {result.gpus?.join(', ')}</dd></div>
           <div className="dev-fact"><dt>Adapter</dt><dd><code>{result.adapter?.sha256?.slice(0, 16)}…</code> · {Math.round((result.adapter?.sizeBytes ?? 0) / 2 ** 20)} MB, on the runner</dd></div>
+        </dl>
+      )}
+      {job.kind === 'train' && job.status === 'succeeded' && result.evaluation && (
+        <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Answers on held-out examples">
+          <div className="dev-fact"><dt>Held-out answers, base</dt><dd>{score(result.evaluation.base)}</dd></div>
+          <div className="dev-fact"><dt>Held-out answers, tuned</dt><dd><strong>{score(result.evaluation.tuned)}</strong></dd></div>
+        </dl>
+      )}
+      {(result.samples ?? []).slice(0, 2).map((s, i) => (
+        <div key={i} className="dev-confirm" style={{ gap: 6 }}>
+          <span className="ob-muted" style={{ fontSize: 12 }}>Held-out example {i + 1} · never trained on</span>
+          <span><strong>Prompt:</strong> {s.prompt}</span>
+          <span><strong>Base:</strong> {s.base}</span>
+          <span><strong>Tuned:</strong> {s.tuned}</span>
+        </div>
+      ))}
+      {manager && job.kind === 'train' && job.status === 'succeeded' && <button type="button" className="btn-app" onClick={exportRun} disabled={pending} style={{ alignSelf: 'flex-start' }}>Export to Ollama on this runner</button>}
+      {job.kind === 'export' && job.status === 'succeeded' && (
+        <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Export">
+          <div className="dev-fact"><dt>In Ollama as</dt><dd><code>{result.ollamaModel}</code></dd></div>
+          <div className="dev-fact"><dt>GGUF</dt><dd><code>{result.gguf?.sha256?.slice(0, 16)}…</code> · {result.gguf?.quantization} · {Math.round((result.gguf?.sizeBytes ?? 0) / 2 ** 20)} MB</dd></div>
+          <div className="dev-fact"><dt>Speed, tuned</dt><dd>{result.loadTest?.tuned?.tokensPerSec?.toFixed(1)} tok/s</dd></div>
+          <div className="dev-fact"><dt>Speed, base</dt><dd>{result.loadTest?.base ? `${result.loadTest.base.tokensPerSec.toFixed(1)} tok/s (${result.loadTest.base.model})` : 'Base not installed in Ollama'}</dd></div>
+          <div className="dev-fact"><dt>Manifest</dt><dd><code>{result.manifestSha256?.slice(0, 16)}…</code> · with model card and license</dd></div>
         </dl>
       )}
       {job.kind === 'train' && <LossChart points={events.filter((e) => e.kind === 'metric' && e.data.name === 'train_loss').map((e) => e.data)} />}

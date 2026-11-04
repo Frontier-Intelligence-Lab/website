@@ -271,6 +271,31 @@ test('a runner gets a training job’s frozen dataset files only while it holds 
   assert.ok(actions.includes('job.inputs_released'));
 });
 
+test('export and evaluation name one finished training run of the same plan on the same runner', async () => {
+  const { store, owner, ws, base, link, queue } = await setup();
+  const { runner, runnerApi } = await link();
+  const other = await link('Second box');
+  const approve = async () => {
+    const r = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId: '00000000-0000-4000-8000-000000000002', version: 1 }], steps: ['sft'], compute: 'runner', spendCapUsd: 1 } });
+    return store.requestEnhanceRun({ workspaceId: ws.id, runId: r.id, requestedBy: owner.id, expectedUpdatedAt: r.updatedAt });
+  };
+  const plan = await approve();
+  const otherPlan = await approve();
+  assert.equal((await queue(runner.id, { kind: 'export', enhanceRunId: plan.id })).json().errors.trainJobId, 'Choose a finished training run of this plan.');
+  const train = (await queue(runner.id, { kind: 'train', enhanceRunId: plan.id })).json().job;
+  assert.ok((await queue(runner.id, { kind: 'export', enhanceRunId: plan.id, trainJobId: train.id })).json().errors.trainJobId, 'not before it succeeds');
+  const leased = (await runnerApi.post('/api/runner/lease')).json().job;
+  const sha = 'c'.repeat(64);
+  await runnerApi.post(`/api/runner/jobs/${train.id}/finish`, { leaseToken: leased.leaseToken, outcome: 'succeeded', result: { adapter: { sha256: sha, sizeBytes: 1, location: 'jobs/x/out/adapter' } } });
+
+  assert.ok((await queue(other.runner.id, { kind: 'export', enhanceRunId: plan.id, trainJobId: train.id })).json().errors.trainJobId, 'the adapter is on the runner that trained it');
+  assert.ok((await queue(runner.id, { kind: 'export', enhanceRunId: otherPlan.id, trainJobId: train.id })).json().errors.trainJobId, 'a run of another plan does not count');
+  const res = await queue(runner.id, { kind: 'export', enhanceRunId: plan.id, trainJobId: train.id });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.deepEqual(res.json().job.spec.source, { trainJobId: train.id, adapterSha256: sha, adapterLocation: 'jobs/x/out/adapter' });
+  assert.equal((await owner.get(`${base}/jobs/${res.json().job.id}`)).json().job.kind, 'export');
+});
+
 test('runner input validation', () => {
   assert.equal(bearerKey('Bearer vrk_' + 'a'.repeat(43)), 'vrk_' + 'a'.repeat(43));
   for (const bad of [undefined, '', 'vrk_x', 'Basic abc', `Bearer vrk_${'a'.repeat(42)}`, `bearer vrk_${'a'.repeat(43)}`]) assert.equal(bearerKey(bad), null);
