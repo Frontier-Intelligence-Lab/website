@@ -70,6 +70,7 @@ export const api = {
   updateEnhanceRun: (id, runId, plan) => request(`/api/workspaces/${id}/enhance-runs/${runId}`, plan),
   requestEnhanceRun: (id, runId, expectedUpdatedAt) => request(`/api/workspaces/${id}/enhance-runs/${runId}/request`, { expectedUpdatedAt }),
   localModels: () => load('/api/local-models'),
+  localMemory: () => load('/api/local-memory'),
   devices: (id) => load(`/api/workspaces/${id}/devices`),
   device: (id, deviceId) => request(`/api/workspaces/${id}/devices/${deviceId}`),
   createDevice: (id, label) => request(`/api/workspaces/${id}/devices`, { label }),

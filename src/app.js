@@ -72,8 +72,9 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
         'media-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'font-src': ["'self'"],
         // Sample uploads go straight to the ingest service, so the browser may also connect to it. Run on this device
-        // talks to a runtime on the visitor's own loopback address; the server never proxies it.
-        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : []), ...config.localRuntimeOrigins],
+        // and Memory talk to a runtime and a memory gateway on the visitor's own loopback address; the server never
+        // proxies either.
+        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : []), ...config.localRuntimeOrigins, ...config.localMemoryOrigins],
         'form-action': ["'self'"],
         'base-uri': ["'self'"],
         'frame-ancestors': ["'none'"],
