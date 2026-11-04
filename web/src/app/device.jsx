@@ -374,7 +374,8 @@ function InstalledRow({ ctx, model, loaded }) {
       <td><span className={`ob-badge ${STATE_TONE[state] ?? ''}`}>{STATE_LABEL[state]}</span></td>
       <td>
         <div className="row-wrap gap-10" style={{ justifyContent: 'flex-end' }}>
-          {chat ? <button type="button" className="btn-small" onClick={() => setSelected(model.name)} aria-label={`Use ${model.name}`}>Use</button> : <span className="ob-muted" style={{ fontSize: 12 }}>Embeddings only</span>}
+          {/* Same rule as the Run and Test selectors: the model cannot change while a reply or test is in progress. */}
+          {chat ? <button type="button" className="btn-small" onClick={() => setSelected(model.name)} disabled={Boolean(ctx.busy)} aria-describedby={ctx.busy ? 'run-busy' : undefined} aria-label={`Use ${model.name}`}>Use</button> : <span className="ob-muted" style={{ fontSize: 12 }}>Embeddings only</span>}
           {chat && !['verified', 'ready'].includes(state) && <button type="button" className="btn-small" onClick={verify} disabled={Boolean(busy)}>{busy === 'verify' ? 'Verifying…' : 'Verify'}</button>}
           {loaded && <button type="button" className="btn-small" onClick={unload} disabled={Boolean(busy)}>{busy === 'unload' ? 'Unloading…' : 'Unload'}</button>}
           {confirmRemove ? (
@@ -573,9 +574,13 @@ function RunCard({ ctx, localModels }) {
   const opRef = useRef(0); // identity of the current chat; late callbacks from an older one are ignored
 
   useEffect(() => {
-    // A new model is a new conversation: stop any reply still streaming from the old one.
+    // A new model is a new conversation: stop any reply still streaming from the old one and drop its partial text
+    // here. The stopped request still returns to send(), which records it under the model that produced it.
     opRef.current += 1;
     abortRef.current?.abort();
+    abortRef.current = null;
+    liveRef.current = null;
+    setLive(null);
     setInfo(null); setMessages([]); setLast(null); setError(null);
     if (!model) return undefined;
     const controller = new AbortController();
@@ -612,7 +617,11 @@ function RunCard({ ctx, localModels }) {
     setBusy(null);
     const stopped = !out.ok && out.error.kind === 'aborted';
     const outcome = { kind: 'chat', warm: out.warm, status: out.ok ? 'completed' : stopped ? 'stopped' : 'failed', settings: out.settings, metrics: out.metrics, failure: out.ok || stopped ? null : savedFailure(out.error) };
-    if (opRef.current !== op) { await recordRun(ctx, model.name, outcome); return; } // the conversation moved on
+    if (opRef.current !== op) { // the conversation moved on: the reset already cleared the screen, so only record the run
+      const retry = await recordRun(ctx, model.name, outcome);
+      if (retry) setUnsaved((u) => [...u, retry]);
+      return;
+    }
     abortRef.current = null;
     const reply = liveRef.current?.content ?? '';
     if (reply || stopped) setMessages((m) => [...m, { role: 'assistant', content: reply, stopped }]);
