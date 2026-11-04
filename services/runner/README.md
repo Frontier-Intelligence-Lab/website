@@ -50,7 +50,12 @@ VALCAIRN_URL=https://your-valcairn-site VALCAIRN_RUNNER_KEY_FILE=~/.valcairn-run
 
 Each step runs with `docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 65534:65534`, limits on processes, memory, CPU and time, and a small `noexec` `/tmp`. Inputs are bind-mounted read-only, and only `/out` is writable. GPUs are passed in (`--gpus all`) only for steps that need them.
 
-Cancelling in Valcairn stops the container within one heartbeat (15 seconds). If Valcairn reports that the Runner no longer holds the job (an expired lease, or the runner was revoked), the Runner stops the container and reports nothing more.
+## Stopping, cancelling and lost authority
+
+- **Cancellation.** The runner learns of a cancel on its next heartbeat or event upload, at most every 15 seconds. It then stops the container within about a second, even if the container prints nothing. A job that was already cancelled before a step starts launches nothing. Once the runner has seen the cancel, it reports the job as cancelled, even if the work had finished. Valcairn records the same (`docs/RUNNERS.md`, *Cancellation*).
+- **Confirmed stops.** A stop counts only when Docker itself reports the container gone or not running (`docker inspect`). A failed `docker kill`, or a Docker client that exited, is not proof. A Docker client that has to be killed never counts as success. If a container cannot be confirmed stopped after three attempts, the runner reports `sandbox_error`, keeps the container's name and takes no more work. It exits with status 3 until a person checks the machine.
+- **Lost authority.** If Valcairn says the runner no longer holds the job (an expired lease, or a cancel that has completed), the runner stops the container and reports nothing more for that job. If Valcairn refuses the key itself (revoked, or its linker no longer manages the workspace), the runner also stops heartbeats, event uploads and the finish report under that key. It then exits with status 2.
+- **Redirects.** Requests that carry the key never follow a redirect. Python's default handler would re-send the `Authorization` header to the new location, including another origin or plain `http`. The runner API never redirects, so any redirect is refused as an error.
 
 Failures are reported as a category only (for example `sandbox_unavailable`, `timeout`, `runtime_error`). Raw output stays on this machine.
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .api import Api, AuthError
 from .machine import capabilities
-from .runner import Settings, serve
+from .runner import RunnerHalted, Settings, serve
 
 
 def read_key() -> str:
@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
         serve(Api(url, read_key()), settings)
     except AuthError:
         return 2
+    except RunnerHalted as err:
+        logging.getLogger("valcairn_runner").error("%s", err)
+        return 3
     except KeyboardInterrupt:
         return 130
     return 0

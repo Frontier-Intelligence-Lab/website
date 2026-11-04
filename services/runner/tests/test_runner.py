@@ -195,7 +195,13 @@ class SandboxLifetimeTests(unittest.TestCase):
     def make(self, proc):
         from valcairn_runner.sandbox import Sandbox
         kills = []
-        box = Sandbox(popen=lambda *a, **k: proc, run=lambda args, **k: kills.append(args))
+        from types import SimpleNamespace
+
+        def docker(args, **k):
+            kills.append(args)
+            # After a kill, Docker reports the container gone.
+            return SimpleNamespace(returncode=1 if args[1] == "inspect" else 0, stdout="", stderr="No such object")
+        box = Sandbox(popen=lambda *a, **k: proc, run=docker, sleep=lambda s: None)
         return box, kills
 
     def test_a_failing_line_handler_stops_the_container(self):
@@ -211,7 +217,7 @@ class SandboxLifetimeTests(unittest.TestCase):
     def test_a_docker_client_that_will_not_exit_is_killed(self):
         proc = self.Proc([], hang=True)
         box, kills = self.make(proc)
-        self.assertEqual(box.run(Step(image="img", command=["x"]), lambda line: None, threading.Event()), 0)
+        self.assertNotEqual(box.run(Step(image="img", command=["x"]), lambda line: None, threading.Event()), 0, "a killed client is never success")
         self.assertTrue(proc.killed)
         self.assertTrue(kills)
 

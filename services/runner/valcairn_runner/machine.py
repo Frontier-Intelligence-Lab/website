@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import shutil
 import subprocess
 import urllib.request
@@ -47,11 +48,20 @@ def sandbox() -> dict:
     return {"available": True, "engine": "docker", "version": version.strip()[:40], "gpu": has_gpu}
 
 
+CLOUD_NAME = re.compile(r"(^|[:-])cloud$")
+
+
+def is_remote(m: dict) -> bool:
+    """Ollama marks models that run on its cloud in several ways; the same rule as src/lib/devices.js isRemoteModel
+    and web/src/app/runtime.js isRemote: remote, remote_host or remote_model set, or a name ending in cloud."""
+    return bool(m.get("remote") or m.get("remote_host") or m.get("remote_model")) or bool(CLOUD_NAME.search(str(m.get("name") or m.get("model") or "")))
+
+
 def local_models(tags: dict) -> list[dict]:
-    """Installed models from Ollama's /api/tags. Cloud models (remote_host) run elsewhere, so they are left out."""
+    """Installed models from Ollama's /api/tags. Cloud models run elsewhere, so they are left out."""
     models = []
     for m in tags.get("models", []):
-        if m.get("remote_host") or m.get("remote_model"):
+        if not isinstance(m, dict) or is_remote(m):
             continue
         models.append({"name": str(m.get("name", ""))[:200], "digest": (m.get("digest") or None), "sizeBytes": m.get("size")})
     return [m for m in models if m["name"]][:200]
