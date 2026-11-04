@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
+import { checkAnnotation, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
-const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model', 'labelSet'];
+const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
 
 /**
  * In-process store for development and tests. Same contract as the Postgres store
@@ -205,7 +206,6 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       if (!project || project.workspaceId !== workspaceId) return null;
       if (CONTENT_FIELDS.some((key) => key in patch) && !EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
       for (const key of [...CONTENT_FIELDS, 'setupStep']) if (key in patch) project[key] = copy(patch[key]);
-      if (project.labelSet == null) project.labelSet = [];
       project.updatedAt = stamp();
       return copy(project);
     },
@@ -255,21 +255,43 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       return copy(removed);
     },
 
+    // Each method checks and writes without awaiting in between, so it is atomic like the Postgres version under its project lock.
+    async setLabelSet({ workspaceId, projectId, labelSet }) {
+      const project = editableProject(workspaceId, projectId);
+      const used = new Set(annotations.filter((a) => a.projectId === projectId).map((a) => a.labelId));
+      const conflict = labelSetConflict(project.labelSet ?? [], labelSet, used);
+      if (conflict) throw new StoreError('label_in_use', conflict.name);
+      project.labelSet = copy(labelSet);
+      project.updatedAt = stamp();
+      return copy(project);
+    },
     async updateUpload({ workspaceId, projectId, uploadId, patch }) {
       const project = editableProject(workspaceId, projectId);
       const upload = uploads.find((u) => u.id === uploadId && u.projectId === project.id);
       if (!upload) throw new StoreError('not_found');
+      if ('kind' in patch && !kindFitsAnnotations(kindOf({ ...upload, kind: patch.kind }), annotations.filter((a) => a.uploadId === uploadId))) throw new StoreError('label_in_use', upload.filename);
       for (const key of ['kind', 'offsetMs']) if (key in patch) upload[key] = patch[key] ?? null;
       return copy(upload);
     },
     async listAnnotations({ workspaceId, projectId }) {
       return annotations.filter((a) => a.workspaceId === workspaceId && a.projectId === projectId).map(copy);
     },
-    async createAnnotation({ workspaceId, projectId, uploadId, labelId, startMs = null, endMs = null, createdBy }) {
+    async createAnnotation({ workspaceId, projectId, uploadId, labelId, startMs = null, endMs = null, box = null, createdBy }) {
       const project = editableProject(workspaceId, projectId);
-      if (!uploads.some((u) => u.id === uploadId && u.projectId === project.id)) throw new StoreError('not_found');
-      const annotation = { id: randomUUID(), workspaceId, projectId, uploadId, labelId, startMs, endMs, createdBy, createdAt: stamp() };
+      const upload = uploads.find((u) => u.id === uploadId && u.projectId === project.id);
+      if (!upload) throw new StoreError('not_found');
+      const fit = checkAnnotation({ label: (project.labelSet ?? []).find((l) => l.id === labelId), upload, startMs, endMs, box });
+      const annotation = { id: randomUUID(), workspaceId, projectId, uploadId, labelId, ...fit, createdBy, createdAt: stamp() };
       annotations.push(annotation);
+      return copy(annotation);
+    },
+    async updateAnnotation({ workspaceId, projectId, annotationId, patch }) {
+      const project = editableProject(workspaceId, projectId);
+      const annotation = annotations.find((a) => a.id === annotationId && a.projectId === projectId);
+      if (!annotation) throw new StoreError('not_found');
+      const upload = uploads.find((u) => u.id === annotation.uploadId);
+      const fit = checkAnnotation({ label: (project.labelSet ?? []).find((l) => l.id === annotation.labelId), upload, startMs: patch.startMs ?? annotation.startMs, endMs: patch.endMs ?? annotation.endMs, box: patch.box ?? annotation.box });
+      Object.assign(annotation, fit);
       return copy(annotation);
     },
     async deleteAnnotation({ workspaceId, projectId, annotationId }) {
@@ -297,10 +319,15 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       issueNotes.splice(i, 1);
     },
 
-    async submitForReview({ workspaceId, projectId, submittedBy }) {
+    async submitForReview({ workspaceId, projectId, submittedBy, requireResolved = false }) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
       if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
+      if (requireResolved && project.dataSource?.mode === 'upload') {
+        const where = (x) => x.projectId === projectId;
+        const open = computeIssues({ project, uploads: uploads.filter(where), annotations: annotations.filter(where), notes: issueNotes.filter(where) }).filter((i) => i.open).length;
+        if (open) throw Object.assign(new StoreError('issues_open'), { open });
+      }
       // The reviewer decides on this snapshot, and a dataset version is made only from an approved snapshot.
       const snapshot = {
         task: project.task, modalities: copy(project.modalities), startingPoint: project.startingPoint,
@@ -311,7 +338,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       };
       const fileIds = new Set(snapshot.files.map((f) => f.id));
       snapshot.annotations = annotations.filter((a) => a.projectId === projectId && fileIds.has(a.uploadId))
-        .map(({ id, uploadId, labelId, startMs, endMs }) => ({ id, uploadId, labelId, startMs, endMs }));
+        .map(({ id, uploadId, labelId, startMs, endMs, box }) => ({ id, uploadId, labelId, startMs, endMs, box }));
       snapshot.issueNotes = issueNotes.filter((n) => n.projectId === projectId).sort((a, b) => (a.key < b.key ? -1 : 1)).map(({ key, note }) => ({ key, note }));
       const review = { id: randomUUID(), workspaceId, projectId, submittedBy, status: 'pending', reviewerId: null, notes: null, checks: {}, snapshot, decidedAt: null, createdAt: stamp() };
       reviews.push(review);

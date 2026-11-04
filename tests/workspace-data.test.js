@@ -69,8 +69,10 @@ test('the dataset lists items by type with signed previews; viewers see previews
   assert.match(grant.key, /\/uploads\//);
   assert.equal(data.items[1].previewUrl, null, 'MCAP is not rendered inline');
   const csp = (await app.inject({ method: 'GET', url: '/' })).headers['content-security-policy'];
-  assert.match(csp, /media-src 'self' http:\/\/localhost:4100/);
-  assert.match(csp, /img-src 'self' http:\/\/localhost:4100/);
+  assert.match(csp, /media-src 'self' blob: http:\/\/localhost:4100;/);
+  assert.match(csp, /img-src 'self' blob: http:\/\/localhost:4100;/);
+  assert.match(csp, /script-src 'self';/, 'scripts never get blob:, inline or eval');
+  assert.doesNotMatch(csp, /unsafe-/);
 
   const viewer = await person(app, 'v@acme-robotics.com');
   const token = (await owner.post(`/api/workspaces/${ws.id}/invitations`, { invites: [{ email: 'v@acme-robotics.com', role: 'viewer' }] })).json().devLinks[0].link.split('/invite/')[1];
@@ -154,5 +156,108 @@ test('open issues block review until fixed or noted; the version carries labels 
   assert.equal(body.annotations[0].startMs, 1000);
   assert.equal(body.issueNotes[0].key, dup.key);
   assert.equal((await owner.get(`${base}/dataset-versions/9/manifest`)).statusCode, 404);
+  await app.close();
+});
+
+const ALL_CHECKS = { rights: true, consent: true, labels: true, duplicates: true, format: true };
+
+async function approvedVersion({ app, owner, base, add }, afterFirstFile = async () => {}) {
+  const video = await add({ contentType: 'video/mp4', filename: 'dock.mp4', sha256: '1'.repeat(64) });
+  await afterFirstFile();
+  const { labelSet } = (await owner.post(`${base}/label-set`, { labels: [{ name: 'belt jam', scope: 'span' }] })).json();
+  await owner.post(`${base}/items/${video.id}/annotations`, { labelId: labelSet[0].id, startMs: 1000, endMs: 2000 });
+  // Note whatever is still open, as a person would on Resolve.
+  const { issues } = (await owner.get(`${base}/dataset`)).json();
+  for (const i of issues.filter((x) => x.open && !x.blocking)) await owner.post(`${base}/issues/note`, { key: i.key, note: 'Recorded twice on purpose.' });
+  const submitted = await owner.post(`${base}/submit`);
+  assert.equal(submitted.statusCode, 200, submitted.body);
+  const staff = await person(app, 'reviewer@valcairn.test');
+  const [review] = (await staff.get('/api/staff/reviews')).json().reviews;
+  return { video, labelSet, staff, review };
+}
+
+test('staff see the frozen label set, labels, notes and previews from the snapshot, not the live project', async () => {
+  const ctx = await setup();
+  const { owner, base, add, app } = ctx;
+  const { video, labelSet, staff, review } = await approvedVersion(ctx, () => add({ contentType: 'video/mp4', filename: 'dock copy.mp4', sha256: '1'.repeat(64) }));
+  const detail = (await staff.get(`/api/staff/reviews/${review.id}`)).json();
+  assert.deepEqual(detail.labelSet.map((l) => l.name), ['belt jam']);
+  assert.equal(detail.annotations.length, 1);
+  assert.equal(detail.annotations[0].startMs, 1000);
+  assert.ok(detail.issueNotes.some((n) => n.note === 'Recorded twice on purpose.'));
+  const file = detail.uploads.find((u) => u.id === video.id);
+  assert.equal(file.kind, 'video');
+  assert.equal(verifyToken(SECRET, new URL(file.previewUrl).searchParams.get('token'), 'preview').type, 'video/mp4');
+
+  // Withdraw and change the live project: the open review keeps showing what was submitted.
+  await owner.post(`${base}/reopen`);
+  await owner.post(`${base}/label-set`, { labels: [{ ...labelSet[0], name: 'renamed live' }, { name: 'new live label', scope: 'file' }] });
+  const after = (await staff.get(`/api/staff/reviews/${review.id}`)).json();
+  assert.deepEqual(after.labelSet.map((l) => l.name), ['belt jam'], 'staff never see mutable current labels for a snapshot');
+  await app.close();
+});
+
+test('files in a frozen version stay downloadable after reopening and removing them from the working set', async () => {
+  const ctx = await setup();
+  const { owner, base, app, ws } = ctx;
+  const { video, staff, review } = await approvedVersion(ctx);
+  await staff.post(`/api/staff/reviews/${review.id}/decision`, { decision: 'approved', checks: ALL_CHECKS });
+  await owner.post(`${base}/dataset-versions`);
+  const key = verifyToken(SECRET, new URL((await owner.get(`${base}/items/${video.id}/download`)).json().url).searchParams.get('token'), 'download').key;
+
+  assert.equal((await owner.post(`${base}/reopen`)).statusCode, 200);
+  assert.equal((await owner.post(`${base}/uploads/${video.id}/delete`)).statusCode, 200);
+  assert.equal((await owner.get(`${base}/items/${video.id}/download`)).statusCode, 404, 'gone from the working set');
+
+  const res = await owner.get(`${base}/dataset-versions/1/files/${video.id}/download`);
+  assert.equal(res.statusCode, 200, res.body);
+  const grant = verifyToken(SECRET, new URL(res.json().url).searchParams.get('token'), 'download');
+  assert.equal(grant.key, key, 'the same committed bytes the version froze');
+  assert.equal(grant.filename, 'dock.mp4');
+  assert.equal((await owner.get(`${base}/dataset-versions/1/files/00000000-0000-4000-8000-000000000000/download`)).statusCode, 404);
+  assert.equal((await owner.get(`${base}/dataset-versions/2/files/${video.id}/download`)).statusCode, 404);
+
+  // Viewers can see versions but not take the bytes; other workspaces cannot reach them at all.
+  const viewer = await person(app, 'v@acme-robotics.com');
+  const token = (await owner.post(`/api/workspaces/${ws.id}/invitations`, { invites: [{ email: 'v@acme-robotics.com', role: 'viewer' }] })).json().devLinks[0].link.split('/invite/')[1];
+  await viewer.post(`/api/invitations/${token}/accept`);
+  assert.equal((await viewer.get(`${base}/dataset-versions/1/files/${video.id}/download`)).statusCode, 403);
+  const outsider = await person(app, 'x@other-company.com');
+  const theirs = (await outsider.post('/api/workspaces', { name: 'Other Co' })).json().workspace;
+  assert.equal((await outsider.get(`${base}/dataset-versions/1/files/${video.id}/download`)).statusCode, 404, 'non-members are told nothing exists');
+  assert.equal((await outsider.get(`/api/workspaces/${theirs.id}/projects/${base.split('/').pop()}/dataset-versions/1/files/${video.id}/download`)).statusCode, 404, 'a project id from another workspace is not found');
+  assert.equal((await outsider.get(`${base}/dataset`)).statusCode, 404);
+  await app.close();
+});
+
+test('box labels only on images and inside them; spans edit in place; renames keep labels; type changes keep labels valid', async () => {
+  const { app, owner, base, add } = await setup();
+  const image = await add({ contentType: 'image/png', filename: 'carton.png', sha256: '2'.repeat(64) });
+  const video = await add({ contentType: 'video/mp4', filename: 'dock.mp4', sha256: '3'.repeat(64) });
+  const { labelSet } = (await owner.post(`${base}/label-set`, { labels: [{ name: 'tear', scope: 'box', tone: 'orange' }, { name: 'jam', scope: 'span' }] })).json();
+  const [tear, jam] = labelSet;
+  assert.equal((await owner.post(`${base}/items/${video.id}/annotations`, { labelId: tear.id, box: { x: 0.1, y: 0.1, w: 0.2, h: 0.2 } })).statusCode, 400, 'boxes need an image');
+  assert.equal((await owner.post(`${base}/items/${image.id}/annotations`, { labelId: tear.id, box: { x: 0.9, y: 0.1, w: 0.2, h: 0.2 } })).statusCode, 400, 'box must stay inside');
+  assert.equal((await owner.post(`${base}/items/${image.id}/annotations`, { labelId: tear.id })).statusCode, 400, 'box needs coordinates');
+  const box = (await owner.post(`${base}/items/${image.id}/annotations`, { labelId: tear.id, box: { x: 0.25, y: 0.5, w: 0.5, h: 0.25 } })).json().annotation;
+  assert.deepEqual(box.box, { x: 0.25, y: 0.5, w: 0.5, h: 0.25 });
+  assert.equal((await owner.post(`${base}/items/${image.id}/annotations`, { labelId: 'not-a-label' })).statusCode, 400);
+
+  const span = (await owner.post(`${base}/items/${video.id}/annotations`, { labelId: jam.id, startMs: 1000, endMs: 2000 })).json().annotation;
+  const edited = await owner.post(`${base}/annotations/${span.id}`, { startMs: 1500, endMs: 4000 });
+  assert.equal(edited.statusCode, 200, edited.body);
+  assert.deepEqual([edited.json().annotation.startMs, edited.json().annotation.endMs], [1500, 4000]);
+  assert.equal((await owner.post(`${base}/annotations/${span.id}`, { startMs: 5000 })).statusCode, 400, 'start after end');
+  assert.equal((await owner.post(`${base}/annotations/${span.id}`, {})).statusCode, 400);
+
+  const renamed = (await owner.post(`${base}/label-set`, { labels: [{ ...tear, name: 'torn carton' }, jam] })).json().labelSet;
+  assert.equal(renamed[0].id, tear.id);
+  const { annotations, labelSet: live } = (await owner.get(`${base}/dataset`)).json();
+  assert.equal(annotations.length, 2, 'renaming kept both labels');
+  assert.equal(live[0].name, 'torn carton');
+
+  assert.equal((await owner.post(`${base}/items/${video.id}`, { kind: 'image' })).json().code, 'label_in_use', 'a video with spans cannot become an image');
+  assert.equal((await owner.post(`${base}/items/${image.id}`, { kind: 'text' })).json().code, 'label_in_use', 'an image with boxes cannot become text');
+  assert.equal((await owner.post(`${base}/items/${video.id}`, { kind: 'audio' })).statusCode, 200, 'still timed, so spans stay valid');
   await app.close();
 });

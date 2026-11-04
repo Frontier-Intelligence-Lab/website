@@ -252,7 +252,7 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal(video.kind, null);
     assert.equal(video.offsetMs, null);
     const labelSet = [{ id: 'l_jam', name: 'belt jam', scope: 'span', tone: 'green' }];
-    assert.deepEqual((await store.updateProject({ ...where, patch: { labelSet } })).labelSet, labelSet);
+    assert.deepEqual((await store.setLabelSet({ ...where, labelSet })).labelSet, labelSet);
 
     const moved = await store.updateUpload({ ...where, uploadId: video.id, patch: { kind: 'sensor', offsetMs: -800 } });
     assert.equal(moved.kind, 'sensor');
@@ -262,7 +262,10 @@ export function runStoreContract(test, makeStore, label) {
 
     const span = await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', startMs: 41000, endMs: 72000, createdBy: owner.id });
     assert.equal(span.startMs, 41000);
-    const whole = await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', createdBy: owner.id });
+    await assert.rejects(store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', createdBy: owner.id }), { code: 'invalid_label' }, 'a span label needs times');
+    const fullSet = [...labelSet, { id: 'l_ok', name: 'ok', scope: 'file', tone: 'plain' }];
+    await store.setLabelSet({ ...where, labelSet: fullSet });
+    const whole = await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_ok', createdBy: owner.id });
     assert.equal(whole.startMs, null);
     await assert.rejects(store.createAnnotation({ workspaceId: other.id, projectId: p.id, uploadId: video.id, labelId: 'l_jam', createdBy: owner.id }), { code: 'not_found' });
     await store.deleteAnnotation({ ...where, annotationId: whole.id });
@@ -279,12 +282,12 @@ export function runStoreContract(test, makeStore, label) {
 
     await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'ours' } } });
     const review = await store.submitForReview({ ...where, submittedBy: owner.id });
-    assert.deepEqual(review.snapshot.labelSet, labelSet);
+    assert.deepEqual(review.snapshot.labelSet, fullSet);
     assert.deepEqual(review.snapshot.annotations.map((a) => [a.uploadId, a.labelId, a.startMs, a.endMs]), [[video.id, 'l_jam', 41000, 72000]]);
     assert.deepEqual(review.snapshot.issueNotes, [{ key: 'labels:none', note: 'second' }]);
     assert.equal(review.snapshot.files[0].offsetMs, -800);
 
-    await assert.rejects(store.updateProject({ ...where, patch: { labelSet: [] } }), { code: 'invalid_state' });
+    await assert.rejects(store.setLabelSet({ ...where, labelSet: [] }), { code: 'invalid_state' });
     await assert.rejects(store.updateUpload({ ...where, uploadId: video.id, patch: { kind: 'audio' } }), { code: 'invalid_state' });
     await assert.rejects(store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', createdBy: owner.id }), { code: 'invalid_state' });
     await assert.rejects(store.deleteAnnotation({ ...where, annotationId: span.id }), { code: 'invalid_state' });
@@ -295,6 +298,49 @@ export function runStoreContract(test, makeStore, label) {
     await store.reopenProject({ ...where, actorId: owner.id });
     await store.deleteUpload({ ...where, uploadId: video.id, actorId: owner.id });
     assert.deepEqual(await store.listAnnotations(where), []);
+  });
+
+  withStore('the store enforces the Resolve gate and label rules itself, so racing writes cannot slip past them', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const fresh = async (name) => {
+      const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name, task: 'Spot jams', modalities: ['Video'], startingPoint: 'own' });
+      const where = { workspaceId: ws.id, projectId: p.id };
+      await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'ours' } } });
+      await store.setLabelSet({ ...where, labelSet: [{ id: 'l_jam', name: 'jam', scope: 'span', tone: 'green' }, { id: 'l_ok', name: 'ok', scope: 'file', tone: 'plain' }, { id: 'l_box', name: 'tear', scope: 'box', tone: 'orange' }] });
+      const video = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: `${name}-v`, sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'video/mp4', filename: 'dock.mp4' });
+      await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', startMs: 0, endMs: 10, createdBy: owner.id });
+      return { where, video };
+    };
+    const image = (where, key) => store.createUpload({ ...where, uploadedBy: owner.id, objectKey: key, sha256: 'c'.repeat(64), sizeBytes: 10, contentType: 'image/png', filename: 'carton.png' });
+
+    const a = await fresh('a');
+    const img = await image(a.where, 'a-img');
+    await assert.rejects(store.submitForReview({ ...a.where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open === 1);
+    await assert.rejects(store.createAnnotation({ ...a.where, uploadId: img.id, labelId: 'l_jam', startMs: 0, endMs: 5, createdBy: owner.id }), { code: 'invalid_label' }, 'no spans on images');
+    await assert.rejects(store.createAnnotation({ ...a.where, uploadId: img.id, labelId: 'l_box', box: { x: 0.5, y: 0.5, w: 0.6, h: 0.1 }, createdBy: owner.id }), { code: 'invalid_label' }, 'box inside the image');
+    await assert.rejects(store.createAnnotation({ ...a.where, uploadId: img.id, labelId: 'gone', createdBy: owner.id }), { code: 'invalid_label' });
+    const box = await store.createAnnotation({ ...a.where, uploadId: img.id, labelId: 'l_box', box: { x: 0.1, y: 0.2, w: 0.3, h: 0.4 }, createdBy: owner.id });
+    assert.deepEqual(box.box, { x: 0.1, y: 0.2, w: 0.3, h: 0.4 });
+    assert.deepEqual((await store.updateAnnotation({ ...a.where, annotationId: box.id, patch: { box: { x: 0, y: 0, w: 1, h: 1 } } })).box, { x: 0, y: 0, w: 1, h: 1 });
+    await assert.rejects(store.updateUpload({ ...a.where, uploadId: img.id, patch: { kind: 'text' } }), { code: 'label_in_use' });
+    await assert.rejects(store.setLabelSet({ ...a.where, labelSet: [{ id: 'l_jam', name: 'jam', scope: 'span', tone: 'green' }] }), (err) => err.code === 'label_in_use' && err.message === 'tear');
+    await assert.rejects(store.setLabelSet({ ...a.where, labelSet: [{ id: 'l_jam', name: 'jam', scope: 'file', tone: 'green' }, { id: 'l_box', name: 'tear', scope: 'box', tone: 'orange' }] }), { code: 'label_in_use' }, 'a used label cannot change scope');
+    const review = await store.submitForReview({ ...a.where, submittedBy: owner.id, requireResolved: true });
+    assert.deepEqual(review.snapshot.annotations.find((x) => x.id === box.id).box, { x: 0, y: 0, w: 1, h: 1 });
+
+    // Racing a new unlabelled file against submit: never both succeed.
+    const b = await fresh('b');
+    const [upload, submit] = await Promise.allSettled([image(b.where, 'b-img'), store.submitForReview({ ...b.where, submittedBy: owner.id, requireResolved: true })]);
+    assert.ok(!(upload.status === 'fulfilled' && submit.status === 'fulfilled'), 'an unlabelled file and a passing submit cannot both land');
+
+    // Racing label removal against its first use: never both succeed.
+    const c = await fresh('c');
+    const [remove, use] = await Promise.allSettled([
+      store.setLabelSet({ ...c.where, labelSet: [{ id: 'l_jam', name: 'jam', scope: 'span', tone: 'green' }] }),
+      store.createAnnotation({ ...c.where, uploadId: c.video.id, labelId: 'l_ok', createdBy: owner.id }),
+    ]);
+    assert.ok(!(remove.status === 'fulfilled' && use.status === 'fulfilled'), 'a label cannot be removed and used at once');
   });
 
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {

@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { StoreError } from './store/index.js';
 import { signToken } from './lib/tokens.js';
-import { KINDS, TIMED, TONES, computeIssues, detectKind, kindOf, previewType } from './lib/dataset.js';
+import { KINDS, SCOPES, TONES, computeIssues, detectKind, kindOf, previewType } from './lib/dataset.js';
 
 const PREVIEW_TTL_S = 30 * 60;
 const DOWNLOAD_TTL_S = 5 * 60;
@@ -9,7 +9,6 @@ const MAX_LABELS = 40;
 const MAX_OFFSET_MS = 31622400000;
 const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
 const nowS = () => Math.floor(Date.now() / 1000);
-const isMs = (n) => Number.isSafeInteger(n) && n >= 0 && n <= MAX_OFFSET_MS;
 
 /**
  * The dataset workspace for a project: its files by data type with previews, a label set and labels,
@@ -31,6 +30,8 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
   const locked = (reply) => problem(reply, 409, 'This project is locked while it is in review or approved. Withdraw or reopen it to make changes.', { code: 'project_locked' });
   const storeFail = (reply, err) => {
     if (err instanceof StoreError && err.code === 'invalid_state') return locked(reply);
+    if (err instanceof StoreError && err.code === 'invalid_label') return problem(reply, 400, err.message);
+    if (err instanceof StoreError && err.code === 'label_in_use') return problem(reply, 409, `“${err.message}” has labels that would no longer fit. Delete or move those labels first.`, { code: 'label_in_use' });
     if (err instanceof StoreError && err.code === 'not_found') return problem(reply, 404, 'Not found.');
     return fail(reply, err);
   };
@@ -91,18 +92,14 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
       const name = text(item?.name, 60);
       if (!name) return problem(reply, 400, 'Every label needs a name.');
       if (labels.some((l) => l.name.toLowerCase() === name.toLowerCase())) return problem(reply, 400, `“${name}” is listed twice.`);
-      const scope = item?.scope === 'file' ? 'file' : 'span';
+      const scope = SCOPES.includes(item?.scope) ? item.scope : 'span';
       const tone = TONES.includes(item?.tone) ? item.tone : 'plain';
       const known = current.find((l) => l.id === item?.id);
       labels.push({ id: known?.id ?? `l_${randomBytes(6).toString('base64url')}`, name, scope, tone });
     }
-    const used = new Set((await store.listAnnotations(where(request))).map((a) => a.labelId));
-    const removed = current.filter((l) => used.has(l.id) && !labels.some((n) => n.id === l.id));
-    if (removed.length) return problem(reply, 409, `“${removed[0].name}” is used on files. Delete those labels first.`, { code: 'label_in_use' });
-    const changedScope = current.find((l) => used.has(l.id) && labels.find((n) => n.id === l.id)?.scope !== l.scope);
-    if (changedScope) return problem(reply, 409, `“${changedScope.name}” is in use, so its kind cannot change.`, { code: 'label_in_use' });
     try {
-      const project = await store.updateProject({ ...where(request), patch: { labelSet: labels } });
+      // The store refuses, under the project lock, to drop or re-scope a label that is in use.
+      const project = await store.setLabelSet({ ...where(request), labelSet: labels });
       await store.recordAudit({ workspaceId: project.workspaceId, actorId: request.user.id, action: 'label_set.updated', targetType: 'project', targetId: project.id, metadata: { labels: labels.length } });
       return { labelSet: project.labelSet };
     } catch (err) { return storeFail(reply, err); }
@@ -127,21 +124,25 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
     } catch (err) { return storeFail(reply, err); }
   });
 
+  // The label's scope, the file's type and the freeze are all checked by the store under the project lock.
   app.post(`${path}/items/:uploadId/annotations`, post([signedIn, member('writeProjects'), loadProject]), async (request, reply) => {
-    const label = (request.project.labelSet ?? []).find((l) => l.id === request.body?.labelId);
-    if (!label) return problem(reply, 400, 'Choose a label from the label set.');
-    const upload = (await store.listUploads(where(request))).find((u) => u.id === request.params.uploadId);
-    if (!upload) return problem(reply, 404, 'Not found.');
-    let startMs = null;
-    let endMs = null;
-    if (label.scope === 'span') {
-      if (!TIMED.includes(kindOf(upload))) return problem(reply, 400, `“${label.name}” marks a span of time, and this file has no timeline. Use a whole-file label.`);
-      ({ startMs, endMs } = request.body);
-      if (!isMs(startMs) || !isMs(endMs) || endMs < startMs) return problem(reply, 400, 'Set a start and an end, with the end after the start.');
-    }
+    const body = request.body ?? {};
     try {
-      const annotation = await store.createAnnotation({ ...where(request), uploadId: upload.id, labelId: label.id, startMs, endMs, createdBy: request.user.id });
+      const annotation = await store.createAnnotation({
+        ...where(request), uploadId: request.params.uploadId, labelId: text(body.labelId, 64),
+        startMs: body.startMs ?? null, endMs: body.endMs ?? null, box: body.box ?? null, createdBy: request.user.id,
+      });
       const { workspaceId, projectId, ...shown } = annotation;
+      return { annotation: shown };
+    } catch (err) { return storeFail(reply, err); }
+  });
+
+  app.post(`${path}/annotations/:annotationId`, post([signedIn, member('writeProjects'), loadProject]), async (request, reply) => {
+    const body = request.body ?? {};
+    const patch = Object.fromEntries(['startMs', 'endMs', 'box'].filter((k) => k in body).map((k) => [k, body[k]]));
+    if (!Object.keys(patch).length) return problem(reply, 400, 'Nothing to change.');
+    try {
+      const { workspaceId, projectId, ...shown } = await store.updateAnnotation({ ...where(request), annotationId: request.params.annotationId, patch });
       return { annotation: shown };
     } catch (err) { return storeFail(reply, err); }
   });
@@ -182,6 +183,17 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
     if (!upload) return problem(reply, 404, 'Not found.');
     await store.recordAudit({ workspaceId: upload.workspaceId, actorId: request.user.id, action: 'upload.downloaded', targetType: 'upload', targetId: upload.id, metadata: {} });
     return { url: objectUrl('objects', { kind: 'download', key: upload.objectKey, filename: upload.filename }, DOWNLOAD_TTL_S) };
+  });
+
+  // Original bytes of a file in a frozen version, resolved only through that version's manifest, so they stay
+  // retrievable after the working set changes or the file is removed from it.
+  app.get(`${path}/dataset-versions/:number/files/:fileId/download`, get([signedIn, member('writeProjects'), loadProject]), async (request, reply) => {
+    if (!ingest) return problem(reply, 503, 'File storage is not configured on this server.');
+    const version = (await store.listDatasetVersions(where(request))).find((v) => String(v.number) === String(request.params.number));
+    const file = version?.manifest.files?.find((f) => f.id === request.params.fileId);
+    if (!file?.objectKey) return problem(reply, 404, 'Not found.');
+    await store.recordAudit({ workspaceId: request.project.workspaceId, actorId: request.user.id, action: 'dataset_version.file_downloaded', targetType: 'project', targetId: request.project.id, metadata: { version: version.number, fileId: file.id } });
+    return { url: objectUrl('objects', { kind: 'download', key: file.objectKey, filename: file.filename }, DOWNLOAD_TTL_S) };
   });
 
   // The manifest of a frozen version: paths, types, checksums, labels and notes. Storage keys stay private.

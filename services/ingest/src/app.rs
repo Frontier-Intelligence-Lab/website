@@ -588,21 +588,55 @@ fn previewable(content_type: &str) -> bool {
     media || content_type == "text/plain; charset=utf-8"
 }
 
-/// Parses a single `bytes=` range. Multiple ranges are not supported and fall back to the whole object.
-fn parse_range(value: &str) -> Option<GetRange> {
-    let spec = value.strip_prefix("bytes=")?;
+/// A `Range` header that names bytes no object can have.
+#[derive(Debug, PartialEq)]
+struct Unsatisfiable;
+
+/// Parses a single `bytes=` range. Headers we do not understand (multiple ranges, other units, garbage) are
+/// ignored and the whole object is served; a well-formed range that cannot be represented is unsatisfiable.
+fn parse_range(value: &str) -> Result<Option<GetRange>, Unsatisfiable> {
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
     if spec.contains(',') {
-        return None;
+        return Ok(None);
     }
-    let (start, end) = spec.split_once('-')?;
-    match (start.trim(), end.trim()) {
-        ("", n) => n.parse().ok().filter(|n| *n > 0).map(GetRange::Suffix),
-        (a, "") => a.parse().ok().map(GetRange::Offset),
-        (a, b) => {
-            let (a, b): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
-            (b >= a).then(|| GetRange::Bounded(a..b + 1))
+    let Some((start, end)) = spec.split_once('-') else {
+        return Ok(None);
+    };
+    let number = |s: &str| -> Option<Result<u64, Unsatisfiable>> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
+        // All digits but too large for u64: a valid header for bytes that cannot exist.
+        Some(s.parse().map_err(|_| Unsatisfiable))
+    };
+    match (start.trim(), end.trim()) {
+        ("", n) => match number(n) {
+            Some(Ok(0)) | None => Ok(None),
+            Some(n) => n.map(|n| Some(GetRange::Suffix(n))),
+        },
+        (a, "") => number(a).transpose().map(|a| a.map(GetRange::Offset)),
+        (a, b) => match (number(a), number(b)) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (a?, b?);
+                if b < a {
+                    return Ok(None);
+                }
+                let end = b.checked_add(1).ok_or(Unsatisfiable)?;
+                Ok(Some(GetRange::Bounded(a..end)))
+            }
+            _ => Ok(None),
+        },
     }
+}
+
+fn unsatisfiable() -> Response {
+    let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
 }
 
 async fn preview(
@@ -623,10 +657,15 @@ async fn preview(
     let Ok(key) = Path::parse(&grant.key) else {
         return problem(StatusCode::BAD_REQUEST, "This preview link is not valid.");
     };
-    let range = headers
+    let range = match headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_range);
+        .map(parse_range)
+    {
+        None => None,
+        Some(Ok(range)) => range,
+        Some(Err(Unsatisfiable)) => return unsatisfiable(),
+    };
     let partial = range.is_some();
     let result = match st
         .store
@@ -645,11 +684,7 @@ async fn preview(
         }
         Err(err) if partial => {
             tracing::warn!(%err, "preview range rejected");
-            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
-            response
-                .headers_mut()
-                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            return response;
+            return unsatisfiable();
         }
         Err(err) => {
             tracing::error!(%err, "preview failed");
@@ -704,17 +739,37 @@ async fn preview(
 
 #[cfg(test)]
 mod preview_tests {
-    use super::{parse_range, previewable};
+    use super::{Unsatisfiable, parse_range, previewable};
     use object_store::GetRange;
 
     #[test]
     fn parses_single_byte_ranges() {
-        assert_eq!(parse_range("bytes=0-99"), Some(GetRange::Bounded(0..100)));
-        assert_eq!(parse_range("bytes=100-"), Some(GetRange::Offset(100)));
-        assert_eq!(parse_range("bytes=-500"), Some(GetRange::Suffix(500)));
-        assert_eq!(parse_range("bytes=5-1"), None);
-        assert_eq!(parse_range("bytes=0-1,4-5"), None);
-        assert_eq!(parse_range("items=0-1"), None);
+        assert_eq!(
+            parse_range("bytes=0-99"),
+            Ok(Some(GetRange::Bounded(0..100)))
+        );
+        assert_eq!(parse_range("bytes=100-"), Ok(Some(GetRange::Offset(100))));
+        assert_eq!(parse_range("bytes=-500"), Ok(Some(GetRange::Suffix(500))));
+        assert_eq!(parse_range("bytes=5-1"), Ok(None));
+        assert_eq!(parse_range("bytes=0-1,4-5"), Ok(None));
+        assert_eq!(parse_range("items=0-1"), Ok(None));
+        assert_eq!(parse_range("bytes=a-b"), Ok(None));
+    }
+
+    #[test]
+    fn ranges_past_u64_are_unsatisfiable_not_a_panic() {
+        assert_eq!(
+            parse_range("bytes=0-18446744073709551615"),
+            Err(Unsatisfiable)
+        );
+        assert_eq!(
+            parse_range("bytes=0-99999999999999999999999"),
+            Err(Unsatisfiable)
+        );
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999-"),
+            Err(Unsatisfiable)
+        );
     }
 
     #[test]

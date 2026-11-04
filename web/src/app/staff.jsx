@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, redirect, useLoaderData, useNavigate, useSearchParams } from 'react-router';
 import { api } from '../api.js';
 import { SetupShell, Tile, requireVerified } from './ui.jsx';
+import { KIND_ONE, Preview, fmtTime, formatName } from './preview.jsx';
 
 const CHECKS = [
   ['rights', 'The provider may license or use this data for the stated purpose'],
@@ -11,6 +12,18 @@ const CHECKS = [
   ['format', 'Files open and match the declared kind of input'],
 ];
 const PROVENANCE = { ours: 'Collected by the customer', licensed: 'Licensed from a third party', users: "Provided by the customer's users" };
+const SCOPE = { span: 'time span', file: 'whole file', box: 'box' };
+// Names the issue a note was written against, from its key in src/lib/dataset.js.
+function describeIssue(key, uploads) {
+  const [kind, rest] = key.split(':');
+  const file = uploads.find((u) => u.id === rest)?.filename;
+  if (kind === 'duplicate') return `Duplicate kept: ${file ?? 'a file'}`;
+  if (kind === 'empty') return `Empty file kept: ${file ?? 'a file'}`;
+  if (kind === 'archive') return `Archive not opened: ${file ?? 'a file'}`;
+  if (key === 'labels:none') return 'Released without a label set';
+  if (kind === 'unlabelled') return `Unlabelled ${rest} files kept`;
+  return key;
+}
 const fmtBytes = (n) => (n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
 async function requireStaff() {
@@ -64,7 +77,8 @@ export async function reviewLoader({ params }) {
 }
 
 export function StaffReview() {
-  const { review, workspace, project, uploads } = useLoaderData();
+  const { review, workspace, project, uploads, labelSet = [], annotations = [], issueNotes = [] } = useLoaderData();
+  const labelOf = (id) => labelSet.find((l) => l.id === id);
   const navigate = useNavigate();
   const [checks, setChecks] = useState(review.checks ?? {});
   const [message, setMessage] = useState(null);
@@ -100,19 +114,49 @@ export function StaffReview() {
               <li><div><strong>Acceptance rule</strong><span className="ob-muted">{project.success ? `${project.success.measure} ≥ ${project.success.target ?? '—'} vs ${project.success.baseline}` : 'Not set'}</span></div></li>
             </ul>
           </section>
+          {issueNotes.length > 0 && (
+            <section className="ob-card">
+              <h2>Kept with a note · {issueNotes.length}</h2>
+              <p className="ob-muted">The customer chose to keep these as they are. Each note is part of the snapshot you are deciding on.</p>
+              <ul className="ob-list">
+                {issueNotes.map((n) => <li key={n.key}><div><strong>{describeIssue(n.key, uploads)}</strong><span className="ob-muted">“{n.note}”</span></div></li>)}
+              </ul>
+            </section>
+          )}
+          <section className="ob-card">
+            <h2>Label set · {labelSet.length}</h2>
+            {labelSet.length === 0 ? <p className="ob-muted">No labels were defined for this snapshot.</p> : (
+              <div className="ob-chips" style={{ gap: 6 }}>
+                {labelSet.map((l) => <span key={l.id} className={`ds-badge k-${l.tone}`}>{l.name} · {SCOPE[l.scope] ?? l.scope} · {annotations.filter((a) => a.labelId === l.id).length}</span>)}
+              </div>
+            )}
+          </section>
           <section className="ob-card">
             <h2>Sample files · {uploads.length}</h2>
             {uploads.length === 0 ? <p className="ob-muted">No files. This is a license or collection request.</p> : (
-              <ul className="ob-list">
-                {uploads.map((u) => (
-                  <li key={u.id}>
-                    <div><strong>{u.filename}</strong><span className="ob-muted">{fmtBytes(u.sizeBytes)} · {u.contentType}{u.duplicateOf ? ' · duplicate of an earlier file' : ''} · sha256 {u.sha256.slice(0, 16)}…</span></div>
-                    {u.downloadUrl ? <a className="btn-ghost" href={u.downloadUrl} rel="noreferrer">Download</a> : <span className="ob-badge">Storage off</span>}
-                  </li>
-                ))}
-              </ul>
+              <div className="ds-grid">
+                {uploads.map((u) => {
+                  const mine = annotations.filter((a) => a.uploadId === u.id);
+                  return (
+                    <div key={u.id} className={`ds-card k-${u.kind}`} style={{ cursor: 'default' }}>
+                      <Preview item={u} h={150} controls contain boxes={mine.filter((a) => a.box).map((a) => ({ ...a.box, id: a.id, label: labelOf(a.labelId) }))} />
+                      <div className="ds-card-body">
+                        <span className="ds-card-name"><span className="ds-dot" aria-hidden="true" /><span>{u.filename}</span></span>
+                        <span className="ob-muted" style={{ fontSize: 12.5 }}>{KIND_ONE[u.kind]} · {formatName(u.contentType)} · {fmtBytes(u.sizeBytes)} · sha256 {u.sha256.slice(0, 12)}…</span>
+                        <div className="ob-chips" style={{ gap: 4 }}>
+                          {mine.length === 0 ? <span className="ob-badge">no labels</span> : mine.map((a) => {
+                            const l = labelOf(a.labelId);
+                            return <span key={a.id} className={`ds-badge k-${l?.tone ?? 'plain'}`}>{l?.name ?? 'removed label'}{a.startMs != null ? ` ${fmtTime(a.startMs, true)}–${fmtTime(a.endMs, true)}` : ''}{a.box ? ' · box' : ''}</span>;
+                          })}
+                        </div>
+                        {u.downloadUrl ? <a className="btn-small" href={u.downloadUrl} rel="noreferrer" style={{ alignSelf: 'flex-start' }}>Download original</a> : <span className="ob-badge">Storage off</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             )}
-            <p className="ob-muted">Download links expire after 5 minutes. Reload the page for fresh ones.</p>
+            <p className="ob-muted">Previews and labels are the frozen snapshot. Download links expire after 5 minutes and previews after 30; reload the page for fresh ones.</p>
           </section>
         </section>
         <aside className="ob-aside">

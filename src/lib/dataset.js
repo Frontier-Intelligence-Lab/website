@@ -1,9 +1,17 @@
-// Data types, preview rules and the issue list for a project's dataset. Shared by the API routes and tests.
+import { StoreError } from '../store/errors.js';
+
+// Data types, preview rules, label rules and the issue list for a project's dataset.
+// Shared by the stores (which apply them under the project lock), the API routes and tests.
 
 export const KINDS = ['video', 'audio', 'image', 'text', 'sensor', 'robot', 'table', 'logs', 'file'];
 // Kinds that live on a timeline, so they can carry span labels and a sync offset.
 export const TIMED = ['video', 'audio', 'sensor', 'robot', 'logs'];
 export const TONES = ['orange', 'blue', 'violet', 'green', 'amber', 'teal', 'plain'];
+export const SCOPES = ['span', 'file', 'box'];
+const MAX_MS = 31622400000;
+const isMs = (n) => Number.isSafeInteger(n) && n >= 0 && n <= MAX_MS;
+const unit = (n) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
+const invalid = (message) => new StoreError('invalid_label', message);
 
 const TEXT_TYPES = ['text/plain', 'text/csv', 'text/tab-separated-values', 'text/markdown', 'application/json', 'application/x-ndjson'];
 const ARCHIVES = ['application/zip', 'application/gzip', 'application/x-tar', 'application/x-7z-compressed', 'application/x-bzip2', 'application/zstd'];
@@ -26,6 +34,40 @@ export function detectKind({ contentType = '', filename = '' }) {
 }
 
 export const kindOf = (upload) => upload.kind ?? detectKind(upload);
+
+/**
+ * The stored form of one label on one file, or an `invalid_label` StoreError saying why it does not fit.
+ * Spans need a timeline, boxes need an image, and whole-file labels carry neither.
+ */
+export function checkAnnotation({ label, upload, startMs = null, endMs = null, box = null }) {
+  if (!label) throw invalid('Choose a label from the label set.');
+  const kind = kindOf(upload);
+  if (label.scope === 'span') {
+    if (!TIMED.includes(kind)) throw invalid(`“${label.name}” marks a span of time, and this file has no timeline. Use a whole-file label.`);
+    if (!isMs(startMs) || !isMs(endMs) || endMs < startMs) throw invalid('Set a start and an end, with the end after the start.');
+    return { startMs, endMs, box: null };
+  }
+  if (label.scope === 'box') {
+    if (kind !== 'image') throw invalid(`“${label.name}” is a box on an image, and this file is not an image.`);
+    const b = box ?? {};
+    if (![b.x, b.y, b.w, b.h].every(unit) || b.w <= 0 || b.h <= 0 || b.x + b.w > 1.000001 || b.y + b.h > 1.000001) throw invalid('Draw the box inside the image.');
+    const round = (n) => Math.round(n * 1e6) / 1e6;
+    return { startMs: null, endMs: null, box: { x: round(b.x), y: round(b.y), w: round(b.w), h: round(b.h) } };
+  }
+  return { startMs: null, endMs: null, box: null };
+}
+
+/** A label in use cannot be removed or change what it marks. Returns the first label that would break, or null. */
+export function labelSetConflict(current, next, usedIds) {
+  return current.find((l) => usedIds.has(l.id) && next.find((n) => n.id === l.id)?.scope !== l.scope) ?? null;
+}
+
+/** Whether a file can keep its labels after its data type changes to `kind`. */
+export function kindFitsAnnotations(kind, annotations) {
+  if (annotations.some((a) => a.startMs != null) && !TIMED.includes(kind)) return false;
+  if (annotations.some((a) => a.box) && kind !== 'image') return false;
+  return true;
+}
 
 /** What the browser may render inline, and as which type. Anything else is download only. */
 export function previewType(contentType = '') {

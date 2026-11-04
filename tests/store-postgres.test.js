@@ -611,3 +611,139 @@ withStore('sessions, accounts and onboarding progress survive a server restart w
     assert.equal((await app.inject({ method: 'GET', url: '/api/account', cookies })).json().user, null);
   } finally { await app.close(); }
 });
+
+// ---------- Dataset workspace races: the freeze and the Resolve gate hold across concurrent transactions ----------
+
+// Tracks whether a promise has settled, so a test can prove a statement is waiting on a lock.
+const watch = (promise) => {
+  const w = { done: false };
+  w.result = promise.then((value) => { w.done = true; return { ok: true, value }; }, (error) => { w.done = true; return { ok: false, error }; });
+  return w;
+};
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function labelledProject(store) {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Line 2', task: 'Spot jams', modalities: ['Video'], startingPoint: 'own' });
+  const where = { workspaceId: ws.id, projectId: p.id };
+  await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'ours' } } });
+  await store.setLabelSet({ ...where, labelSet: [{ id: 'l_jam', name: 'belt jam', scope: 'span', tone: 'green' }, { id: 'l_ok', name: 'ok', scope: 'file', tone: 'plain' }] });
+  const video = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'v1', sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'video/mp4', filename: 'dock.mp4' });
+  const label = await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', startMs: 0, endMs: 1000, createdBy: owner.id });
+  return { owner, ws, p, where, video, label };
+}
+
+// Holds the project row the way submit does, runs `during` inside that transaction, then commits.
+async function holdingProject(pool, projectId, during) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT 1 FROM projects WHERE id = $1 FOR UPDATE', [projectId]);
+    return await during(client);
+  } finally {
+    await client.query('COMMIT').catch(() => {});
+    client.release();
+  }
+}
+
+withStore('freeze triggers wait for an in-flight freeze, then refuse labels, notes and file metadata', async (store, pool) => {
+  const { owner, ws, p, video } = await labelledProject(store);
+  const writes = [
+    ['annotation', 'INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, created_by) VALUES ($1, $2, $3, \'l_ok\', $4)', [ws.id, p.id, video.id, owner.id]],
+    ['issue note', 'INSERT INTO issue_notes (workspace_id, project_id, issue_key, note, created_by) VALUES ($1, $2, \'k\', \'n\', $3)', [ws.id, p.id, owner.id]],
+    ['file type', "UPDATE uploads SET kind = 'audio' WHERE id = $1", [video.id]],
+  ];
+  for (const [name, sql, values] of writes) {
+    await pool.query("UPDATE projects SET status = 'draft' WHERE id = $1", [p.id]);
+    const freezer = await pool.connect();
+    const writer = await pool.connect();
+    try {
+      await freezer.query('BEGIN');
+      await freezer.query("UPDATE projects SET status = 'in_review' WHERE id = $1", [p.id]);
+      await writer.query('BEGIN');
+      const write = watch(writer.query(sql, values));
+      await pause(150);
+      assert.equal(write.done, false, `${name}: waits for the freeze instead of reading the old draft status`);
+      await freezer.query('COMMIT');
+      const outcome = await write.result;
+      assert.equal(outcome.ok, false, `${name}: refused once the freeze committed`);
+      assert.match(outcome.error.message, /project_frozen/);
+    } finally {
+      await writer.query('ROLLBACK').catch(() => {});
+      writer.release();
+      freezer.release();
+    }
+  }
+});
+
+withStore('a freeze waits for a label write already in flight, so the write lands before it', async (store, pool) => {
+  const { owner, ws, p, video } = await labelledProject(store);
+  const writer = await pool.connect();
+  const freezer = await pool.connect();
+  try {
+    await writer.query('BEGIN');
+    await writer.query("INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, created_by) VALUES ($1, $2, $3, 'l_ok', $4)", [ws.id, p.id, video.id, owner.id]);
+    const freeze = watch(freezer.query("UPDATE projects SET status = 'in_review' WHERE id = $1", [p.id]));
+    await pause(150);
+    assert.equal(freeze.done, false, 'the freeze waits for the in-flight write');
+    await writer.query('COMMIT');
+    assert.equal((await freeze.result).ok, true);
+  } finally { writer.release(); freezer.release(); }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM annotations WHERE project_id = $1', [p.id])).rows[0].n, 2);
+});
+
+withStore('the Resolve gate is checked inside the submit lock: a late unlabelled file, removed note or removed label blocks it', async (store, pool) => {
+  const races = [
+    ['unlabelled upload', async ({ owner, ws, p }, client) => {
+      await client.query(`INSERT INTO uploads (workspace_id, project_id, uploaded_by, object_key, sha256, size_bytes, content_type, filename)
+        VALUES ($1, $2, $3, 'late', $4, 5, 'image/png', 'late.png')`, [ws.id, p.id, owner.id, 'b'.repeat(64)]);
+    }],
+    ['removed label', async ({ label }, client) => { await client.query('DELETE FROM annotations WHERE id = $1', [label.id]); }],
+    ['removed note', async ({ p }, client) => { await client.query('DELETE FROM issue_notes WHERE project_id = $1', [p.id]); }],
+  ];
+  for (const [name, change] of races) {
+    await pool.query('TRUNCATE TABLE audit_events, dataset_versions, reviews, uploads, projects, memberships, workspaces, users RESTART IDENTITY CASCADE');
+    const ctx = await labelledProject(store);
+    if (name === 'removed note') {
+      // A duplicate is open until noted; the note is what lets this project through.
+      await store.createUpload({ ...ctx.where, uploadedBy: ctx.owner.id, objectKey: 'copy', sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'video/mp4', filename: 'copy.mp4' });
+      const copy = (await store.listUploads(ctx.where)).find((u) => u.duplicateOf);
+      await store.setIssueNote({ ...ctx.where, key: `duplicate:${copy.id}`, note: 'kept on purpose', createdBy: ctx.owner.id });
+    }
+    const submit = await holdingProject(pool, ctx.p.id, async (client) => {
+      const pending = watch(store.submitForReview({ ...ctx.where, submittedBy: ctx.owner.id, requireResolved: true }));
+      await pause(100);
+      assert.equal(pending.done, false, `${name}: submit waits for the project lock`);
+      await change(ctx, client);
+      return pending;
+    });
+    const outcome = await submit.result;
+    assert.equal(outcome.ok, false, `${name}: submit must see the change made before it got the lock`);
+    assert.equal(outcome.error.code, 'issues_open', name);
+    assert.equal((await store.getProject(ctx.where)).status, 'draft');
+  }
+});
+
+withStore('label set edits and labelling serialize: no orphan label ids', async (store, pool) => {
+  const { owner, where, p, video } = await labelledProject(store);
+  // Labelling waits on the lock, and meanwhile the label is removed from the set.
+  const add = await holdingProject(pool, p.id, async (client) => {
+    const pending = watch(store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_ok', createdBy: owner.id }));
+    await pause(100);
+    await client.query(`UPDATE projects SET label_set = '[{"id":"l_jam","name":"belt jam","scope":"span","tone":"green"}]'::jsonb WHERE id = $1`, [p.id]);
+    return pending;
+  });
+  assert.equal((await add.result).error?.code, 'invalid_label');
+  // Removing a label waits on the lock, and meanwhile it gets used.
+  await store.setLabelSet({ ...where, labelSet: [{ id: 'l_jam', name: 'belt jam', scope: 'span', tone: 'green' }, { id: 'l_ok', name: 'ok', scope: 'file', tone: 'plain' }] });
+  const remove = await holdingProject(pool, p.id, async (client) => {
+    const pending = watch(store.setLabelSet({ ...where, labelSet: [{ id: 'l_jam', name: 'belt jam', scope: 'span', tone: 'green' }] }));
+    await pause(100);
+    await client.query("INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, created_by) VALUES ($1, $2, $3, 'l_ok', $4)", [where.workspaceId, p.id, video.id, owner.id]);
+    return pending;
+  });
+  assert.equal((await remove.result).error?.code, 'label_in_use');
+  const set = new Set((await store.getProject(where)).labelSet.map((l) => l.id));
+  for (const a of await store.listAnnotations(where)) assert.ok(set.has(a.labelId), `annotation ${a.id} points at a label in the set`);
+});

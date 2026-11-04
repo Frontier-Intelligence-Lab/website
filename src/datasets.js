@@ -2,10 +2,11 @@ import { randomBytes } from 'node:crypto';
 import { StoreError } from './store/index.js';
 import { signToken, verifyToken } from './lib/tokens.js';
 import { createIngestClient } from './lib/ingest-client.js';
-import { computeIssues } from './lib/dataset.js';
+import { detectKind, kindOf, previewType } from './lib/dataset.js';
 
 const GRANT_TTL_S = 10 * 60;
 const DOWNLOAD_TTL_S = 5 * 60;
+const PREVIEW_TTL_S = 30 * 60;
 const CHECKS = ['rights', 'consent', 'labels', 'duplicates', 'format'];
 const EDITABLE = ['draft', 'changes_requested'];
 const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
@@ -99,18 +100,13 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
     if (!project.dataSource) return problem(reply, 400, 'Record where the data came from first.');
     const uploads = await store.listUploads({ workspaceId: project.workspaceId, projectId: project.id });
     if (project.dataSource.mode === 'upload' && uploads.length === 0) return problem(reply, 400, 'Upload at least one sample file first.');
-    if (project.dataSource.mode === 'upload') {
-      // Every open issue is either fixed or carries a note before staff see the snapshot.
-      const where = { workspaceId: project.workspaceId, projectId: project.id };
-      const [annotations, notes] = await Promise.all([store.listAnnotations(where), store.listIssueNotes(where)]);
-      const open = computeIssues({ project, uploads, annotations, notes }).filter((i) => i.open).length;
-      if (open) return problem(reply, 409, `Resolve ${open} open issue${open === 1 ? '' : 's'} before sending for review: fix ${open === 1 ? 'it' : 'each one'} or note why it stays.`, { code: 'issues_open', open });
-    }
     try {
-      const review = await store.submitForReview({ workspaceId: project.workspaceId, projectId: project.id, submittedBy: request.user.id });
+      // The store re-checks open issues under the project lock, in the transaction that takes the snapshot.
+      const review = await store.submitForReview({ workspaceId: project.workspaceId, projectId: project.id, submittedBy: request.user.id, requireResolved: true });
       return { review: { id: review.id, status: review.status, files: review.snapshot.files.length } };
     } catch (err) {
       if (err instanceof StoreError && err.code === 'invalid_state') return problem(reply, 409, 'This project is already in review or approved.');
+      if (err instanceof StoreError && err.code === 'issues_open') return problem(reply, 409, `Resolve ${err.open} open issue${err.open === 1 ? '' : 's'} before sending for review: fix ${err.open === 1 ? 'it' : 'each one'} or note why it stays.`, { code: 'issues_open', open: err.open });
       return fail(reply, err);
     }
   });
@@ -160,10 +156,19 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
       workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
       project: { ...project, task: reviewed.task, success: reviewed.success, dataSource: reviewed.dataSource },
       duplicatesExcluded: review.snapshot ? duplicates : 0,
-      uploads: reviewed.files.map(({ objectKey, ...u }) => ({
-        ...u,
-        downloadUrl: ingest ? `${ingest.publicUrl}/v1/objects?token=${encodeURIComponent(signToken(ingest.secret, { v: 1, kind: 'download', key: objectKey, filename: u.filename, exp: nowS() + DOWNLOAD_TTL_S }))}` : null,
-      })),
+      // Everything below comes from the frozen snapshot, never from the live, editable project.
+      labelSet: reviewed.labelSet ?? [],
+      annotations: reviewed.annotations ?? [],
+      issueNotes: reviewed.issueNotes ?? [],
+      uploads: reviewed.files.map(({ objectKey, ...u }) => {
+        const type = previewType(u.contentType);
+        return {
+          ...u,
+          kind: kindOf(u), detectedKind: detectKind(u),
+          downloadUrl: ingest ? `${ingest.publicUrl}/v1/objects?token=${encodeURIComponent(signToken(ingest.secret, { v: 1, kind: 'download', key: objectKey, filename: u.filename, exp: nowS() + DOWNLOAD_TTL_S }))}` : null,
+          previewUrl: ingest && type && u.sizeBytes > 0 ? `${ingest.publicUrl}/v1/preview?token=${encodeURIComponent(signToken(ingest.secret, { v: 1, kind: 'preview', key: objectKey, type, exp: nowS() + PREVIEW_TTL_S }))}` : null,
+        };
+      }),
     };
   });
 

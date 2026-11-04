@@ -23,6 +23,10 @@ New web configuration (all as runtime secrets or Coolify environment, never buil
 
 Ingest needs `INGEST_SHARED_SECRET`, `INGEST_STORAGE=s3://…`, `INGEST_ALLOWED_ORIGINS=https://frontierintelligencelab.com`, `INGEST_BIND=0.0.0.0:4100` and the `AWS_*` storage credentials. Set a bucket lifecycle rule that aborts incomplete multipart uploads after 1 day. Pending uploads that were never committed are swept every hour (`INGEST_PENDING_TTL_SECONDS`, default 24 h).
 
+**Dataset workspace (migrations 007 and 008).** Both must be applied before the matching web build; 008 corrects 007's freeze guard and must never be skipped, even where 007 is already applied. Neither needs new environment variables. Migrations create tables as the migrator role, so confirm the app role can `SELECT, INSERT, UPDATE, DELETE` on `annotations` and `issue_notes` (grant it explicitly if your database does not use default privileges). Ingest must be rebuilt for `/v1/preview` (inline, sandboxed previews with byte ranges) before web links to it. The web CSP now allows `blob:` for images and media only, to preview files a person has picked before upload.
+
+Previews give viewers the original bytes: anyone who can preview a file can save it. Hiding Download from viewer and finance roles is not access control over the content. If some roles must see less than the original, that needs deliberately designed derivatives (for example thumbnails or redacted copies), which do not exist yet.
+
 Committed object bytes are retained when an upload registration fails or a file is removed from the editable working set. This protects receipt retries and historical review/version downloads. Current project quotas count working-set records, so they do not bound retained storage after repeated upload/remove operations. Keep usage controlled until reference-aware garbage collection or a physical-storage limit is in place; do not add a blanket committed-object deletion lifecycle that would break historical manifests.
 
 ## Order of operations

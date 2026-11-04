@@ -63,8 +63,9 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
         'script-src': ["'self'"],
         'style-src': ["'self'"],
         // Dataset previews (images, audio, video) load from the ingest service with short-lived signed links.
-        'img-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
-        'media-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
+        // blob: is only for previewing a file the person just picked, before it is uploaded. Scripts stay 'self'.
+        'img-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
+        'media-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'font-src': ["'self'"],
         // Sample uploads go straight to the ingest service, so the browser may also connect to it.
         'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],

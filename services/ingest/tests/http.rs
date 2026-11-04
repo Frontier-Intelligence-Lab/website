@@ -600,6 +600,24 @@ async fn previews_render_inline_with_ranges_only_for_inert_types() {
         .unwrap();
     assert_eq!(past_end.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 
+    // The largest u64 end would overflow `end + 1`: a controlled 416, never a dropped connection.
+    for header in [
+        "bytes=0-18446744073709551615",
+        "bytes=0-99999999999999999999999",
+    ] {
+        let huge = r
+            .clone()
+            .oneshot(
+                Request::get(preview(&key, "preview", "image/png"))
+                    .header(header::RANGE, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(huge.status(), StatusCode::RANGE_NOT_SATISFIABLE, "{header}");
+    }
+
     // A preview token cannot download, a download token cannot preview, and scriptable types are never served inline.
     assert_eq!(
         get(r.clone(), &preview(&key, "download", "image/png"))

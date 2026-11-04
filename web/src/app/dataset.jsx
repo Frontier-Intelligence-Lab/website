@@ -3,10 +3,11 @@ import { Link, redirect, useLoaderData, useNavigate, useParams, useRevalidator }
 import { api, uploadFile } from '../api.js';
 import { Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural, roleName } from './shell.jsx';
-import { KINDS, KIND_LABEL, KIND_ONE, TIMED, Preview, detectKind, fmtBytes, fmtTime, formatName } from './preview.jsx';
+import { BoxedImage, KINDS, KIND_LABEL, KIND_ONE, TIMED, Preview, detectKind, fmtBytes, fmtTime, formatName } from './preview.jsx';
 
 const STATUS = { draft: 'Working set · editable', changes_requested: 'Changes requested · editable', in_review: 'In review · locked', approved: 'Approved · locked', versioned: 'Version approved · locked' };
-const TONES = ['violet', 'teal', 'blue', 'green', 'amber', 'orange', 'plain'];
+const TONES = ['blue', 'orange', 'plain', 'violet', 'teal', 'green', 'amber'];
+const SCOPE_NAME = { span: 'time span', file: 'whole file', box: 'box on image' };
 
 // Preview links are signed for 30 minutes. Reusing a file's link while it is fresh keeps players and images
 // from reloading every time the page data refreshes after a save.
@@ -258,14 +259,22 @@ function LabelSetEditor({ d }) {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10, paddingBottom: 16 }}>
         {d.labelSet.map((l) => (
           <div key={l.id} className={`row-between k-${l.tone}`} style={{ gap: 10 }}>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}><span className="ds-swatch" aria-hidden="true" /><strong style={{ fontSize: 14 }}>{l.name}</strong><span className="ob-muted" style={{ fontSize: 12 }}>{l.scope === 'span' ? 'time span' : 'whole file'}</span></span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1 }}>
+              <span className="ds-swatch" aria-hidden="true" />
+              <input type="text" aria-label={`Rename ${l.name}`} defaultValue={l.name} maxLength={60} disabled={d.pending} key={`${l.id}:${l.name}`}
+                onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+                onBlur={(e) => { const name = e.target.value.trim(); if (name && name !== l.name) save(d.labelSet.map((x) => (x.id === l.id ? { ...x, name } : x))); else e.target.value = l.name; }}
+                style={{ flex: '1 1 120px', minWidth: 0, minHeight: 34, fontWeight: 600 }} />
+              <span className="ob-muted" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{SCOPE_NAME[l.scope]}</span>
+            </span>
             {used.has(l.id) ? <span className="ob-muted" style={{ fontSize: 12 }}>in use</span>
               : <button type="button" className="btn-text" disabled={d.pending} onClick={() => save(d.labelSet.filter((x) => x.id !== l.id))} aria-label={`Remove label ${l.name}`}>Remove</button>}
           </div>
         ))}
+        {d.labelSet.length > 0 && <p className="ob-muted" style={{ fontSize: 12.5 }}>Renaming keeps every label already placed. A label in use cannot be removed or change what it marks.</p>}
         <form onSubmit={add} style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <input type="text" aria-label="New label name" placeholder="New label, e.g. damaged pallet" value={name} maxLength={60} onChange={(e) => setName(e.target.value)} style={{ flex: '1 1 180px', minHeight: 38 }} />
-          <select className="ds-select" aria-label="What it marks" value={scope} onChange={(e) => setScope(e.target.value)}><option value="span">Time span</option><option value="file">Whole file</option></select>
+          <select className="ds-select" aria-label="What it marks" value={scope} onChange={(e) => setScope(e.target.value)}><option value="span">Time span</option><option value="file">Whole file</option><option value="box">Box on image</option></select>
           <select className="ds-select" aria-label="Colour" value={tone} onChange={(e) => setTone(e.target.value)}>{TONES.map((t) => <option key={t} value={t}>{t}</option>)}</select>
           <button type="submit" className="btn-small" disabled={d.pending || !name.trim()}>Add label</button>
         </form>
@@ -277,13 +286,19 @@ function LabelSetEditor({ d }) {
 // Real waveform from the decoded audio, computed in the browser. Skipped for large files rather than faked.
 const waveforms = new Map();
 function useWaveform(item) {
-  const [peaks, setPeaks] = useState(() => waveforms.get(item?.id) ?? null);
+  // Keyed by file id, like text snippets, so a slow decode for one track never lands on another.
+  const [state, setState] = useState(() => ({ id: item?.id, peaks: waveforms.get(item?.id) ?? null }));
   useEffect(() => {
-    if (!item?.previewUrl || item.kind !== 'audio' || item.sizeBytes > 40 * 1048576 || waveforms.has(item.id)) return undefined;
-    let live = true;
+    if (!item) return undefined;
+    if (waveforms.has(item.id)) { setState({ id: item.id, peaks: waveforms.get(item.id) }); return undefined; }
+    setState({ id: item.id, peaks: null });
+    if (!item.previewUrl || item.kind !== 'audio' || item.sizeBytes > 40 * 1048576) return undefined;
     const Ctx = window.AudioContext ?? window.webkitAudioContext;
     if (!Ctx) return undefined;
-    fetch(item.previewUrl).then((r) => r.arrayBuffer()).then((buf) => new Ctx().decodeAudioData(buf)).then((audio) => {
+    let live = true;
+    const id = item.id;
+    const ctx = new Ctx();
+    fetch(item.previewUrl).then((r) => r.arrayBuffer()).then((buf) => ctx.decodeAudioData(buf)).then((audio) => {
       const ch = audio.getChannelData(0);
       const n = 240;
       const step = Math.max(1, Math.floor(ch.length / n));
@@ -294,13 +309,13 @@ function useWaveform(item) {
         out.push(max);
       }
       const top = Math.max(...out, 0.0001);
-      const value = out.map((v) => v / top);
-      waveforms.set(item.id, value);
-      if (live) setPeaks(value);
-    }).catch(() => {});
+      const peaks = out.map((v) => v / top);
+      waveforms.set(id, peaks);
+      if (live) setState({ id, peaks });
+    }).catch(() => {}).finally(() => ctx.close?.());
     return () => { live = false; };
   }, [item?.id, item?.previewUrl, item?.kind, item?.sizeBytes]);
-  return peaks;
+  return state.id === item?.id ? state.peaks : null;
 }
 
 function Lane({ item, d, span, offset, duration, selected, onSelect, onSeek, time, draftFrom }) {
@@ -333,6 +348,56 @@ function Lane({ item, d, span, offset, duration, selected, onSelect, onSeek, tim
   );
 }
 
+function SpanFields({ d, a }) {
+  const [from, setFrom] = useState((a.startMs / 1000).toFixed(1));
+  const [to, setTo] = useState((a.endMs / 1000).toFixed(1));
+  useEffect(() => { setFrom((a.startMs / 1000).toFixed(1)); setTo((a.endMs / 1000).toFixed(1)); }, [a.startMs, a.endMs]);
+  const changed = Math.round(Number(from) * 1000) !== a.startMs || Math.round(Number(to) * 1000) !== a.endMs;
+  const save = (e) => {
+    e.preventDefault();
+    const startMs = Math.round(Number(from) * 1000);
+    const endMs = Math.round(Number(to) * 1000);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return d.setError('Enter the start and end in seconds.');
+    d.act(() => api.updateAnnotation(d.entry.id, d.project.id, a.id, { startMs, endMs }));
+  };
+  return (
+    <form onSubmit={save} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }}>
+      <input type="text" inputMode="decimal" aria-label="Start in seconds" value={from} onChange={(e) => setFrom(e.target.value)} style={{ width: 70, minHeight: 32 }} />
+      <span className="ob-muted">to</span>
+      <input type="text" inputMode="decimal" aria-label="End in seconds" value={to} onChange={(e) => setTo(e.target.value)} style={{ width: 70, minHeight: 32 }} />
+      <span className="ob-muted">s</span>
+      {changed && <button type="submit" className="btn-small" disabled={d.pending}>Save</button>}
+    </form>
+  );
+}
+
+/** Every label on the current file as a list: readable on any screen width and editable without the timeline. */
+function ItemLabels({ d, item, selected, onSelect, seek }) {
+  const list = d.annotations.filter((a) => a.uploadId === item.id).sort((a, b) => (a.startMs ?? -1) - (b.startMs ?? -1));
+  return (
+    <section className="ob-card" style={{ gap: 10 }} aria-label="Labels on this file">
+      <div className="row-between"><h2>Labels on this file</h2><span className="ob-muted">{list.length}</span></div>
+      {list.length === 0 && <p className="ob-muted">None yet.</p>}
+      <ul className="ob-list">
+        {list.map((a) => {
+          const l = d.labelSet.find((x) => x.id === a.labelId);
+          return (
+            <li key={a.id} className={`k-${l?.tone ?? 'plain'}`} aria-current={selected === a.id || undefined} style={{ alignItems: 'center', flexWrap: 'wrap', background: selected === a.id ? 'var(--surface-2)' : undefined }}>
+              <span className="ds-swatch" aria-hidden="true" />
+              <div style={{ flex: '1 1 160px' }}>
+                <button type="button" className="btn-text" style={{ fontWeight: 600, textDecoration: 'none', color: 'var(--text)' }} onClick={() => { onSelect(a.id); if (a.startMs != null) seek(a.startMs); }}>{l?.name ?? 'removed label'}</button>
+                <span className="ob-muted">{a.startMs != null ? `${fmtTime(a.startMs, true)} → ${fmtTime(a.endMs, true)}` : a.box ? `box at ${Math.round(a.box.x * 100)}%, ${Math.round(a.box.y * 100)}% · ${Math.round(a.box.w * 100)} × ${Math.round(a.box.h * 100)}%` : 'whole file'} · {memberName(d.members, a.createdBy)}</span>
+              </div>
+              {a.startMs != null && d.canEdit && <SpanFields d={d} a={a} />}
+              {d.canEdit && <button type="button" className="btn-text" disabled={d.pending} onClick={() => d.act(() => api.deleteAnnotation(d.entry.id, d.project.id, a.id))} aria-label={`Delete ${l?.name ?? 'label'}`}>Delete</button>}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 export function DatasetAnnotate() {
   const d = useDataset();
   const navigate = useNavigate();
@@ -341,8 +406,10 @@ export function DatasetAnnotate() {
   const playableItem = (it) => it.previewUrl && /^(video|audio)\//.test(it.contentType);
   const item = files.find((it) => it.id === params.uploadId) ?? files.find(playableItem) ?? files.find((it) => TIMED.includes(it.kind)) ?? files[0] ?? null;
   const spanLabels = d.labelSet.filter((l) => l.scope === 'span');
+  const boxLabels = d.labelSet.filter((l) => l.scope === 'box');
   const fileLabels = d.labelSet.filter((l) => l.scope === 'file');
-  const [tool, setTool] = useState(spanLabels[0]?.id ?? null);
+  const toolLabels = item && TIMED.includes(item.kind) ? spanLabels : item?.kind === 'image' ? boxLabels : [];
+  const [tool, setTool] = useState(toolLabels[0]?.id ?? null);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(null);
   const [playing, setPlaying] = useState(false);
@@ -361,10 +428,9 @@ export function DatasetAnnotate() {
   const lengthOf = (t) => (t.id === item?.id ? duration : lengths[t.id] ?? null);
   const ends = tracks.slice(1).map((t) => (lengthOf(t) != null ? lengthOf(t) + offsetOf(t) : null)).filter((v) => v != null);
   const span = Math.max(duration ?? 0, ...ends, ...d.annotations.filter((a) => tracks.some((t) => t.id === a.uploadId) && a.endMs != null).map((a) => a.endMs + offsetOf(tracks.find((t) => t.id === a.uploadId))), 10000);
-  const selectedAnn = d.annotations.find((a) => a.id === selected) ?? null;
 
   useEffect(() => { setTime(0); setDuration(null); setMarkIn(null); setSelected(null); setPlaying(false); }, [item?.id]);
-  useEffect(() => { if (!tool && spanLabels[0]) setTool(spanLabels[0].id); }, [tool, spanLabels]);
+  useEffect(() => { if (!toolLabels.some((l) => l.id === tool)) setTool(toolLabels[0]?.id ?? null); }, [tool, toolLabels]);
 
   const seek = useCallback((ms) => {
     const next = Math.max(0, duration != null ? Math.min(duration, ms) : ms);
@@ -397,7 +463,7 @@ export function DatasetAnnotate() {
   });
 
   useEffect(() => {
-    if (!d.canEdit && !playable) return undefined;
+    if (!d.canEdit && !playable && !toolLabels.length) return undefined;
     const onKey = (e) => {
       if (e.target.closest('input, select, textarea, [contenteditable]')) return;
       if (e.key === ' ' && playable) { e.preventDefault(); togglePlay(); }
@@ -405,12 +471,12 @@ export function DatasetAnnotate() {
       else if (e.key === '.' && playable) seek(time + FRAME_MS);
       else if ((e.key === 'i' || e.key === 'I') && d.canEdit && timed) setMarkIn(time);
       else if ((e.key === 'o' || e.key === 'O') && d.canEdit && timed && markIn != null) addSpan(markIn, time);
-      else if (/^[1-9]$/.test(e.key) && spanLabels[Number(e.key) - 1]) setTool(spanLabels[Number(e.key) - 1].id);
+      else if (/^[1-9]$/.test(e.key) && toolLabels[Number(e.key) - 1]) setTool(toolLabels[Number(e.key) - 1].id);
       else if (e.key === 'Escape') setMarkIn(null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [d.canEdit, playable, timed, time, markIn, spanLabels, togglePlay, seek, addSpan]);
+  }, [d.canEdit, playable, timed, time, markIn, toolLabels, togglePlay, seek, addSpan]);
 
   if (!item) {
     return (
@@ -449,9 +515,16 @@ export function DatasetAnnotate() {
                 ? <video ref={media} src={item.previewUrl} preload="auto" playsInline aria-label={item.filename} onLoadedMetadata={(e) => setDuration(e.currentTarget.duration * 1000)} onTimeUpdate={(e) => setTime(e.currentTarget.currentTime * 1000)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onClick={togglePlay} />
                 : <audio ref={media} src={item.previewUrl} preload="auto" controls onLoadedMetadata={(e) => setDuration(e.currentTarget.duration * 1000)} onTimeUpdate={(e) => setTime(e.currentTarget.currentTime * 1000)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} />}
             </div>
+          ) : item.kind === 'image' && item.previewUrl && item.contentType.startsWith('image/') ? (
+            <div className="ds-stage ds-image-stage">
+              <BoxedImage key={item.id} url={item.previewUrl} alt={item.filename} selected={selected} onSelect={setSelected}
+                boxes={d.annotations.filter((a) => a.uploadId === item.id && a.box).map((a) => ({ ...a.box, id: a.id, label: d.labelSet.find((l) => l.id === a.labelId) }))}
+                onDraw={d.canEdit && boxLabels.some((l) => l.id === tool) ? async (box) => { const res = await d.act(() => api.annotate(d.entry.id, d.project.id, item.id, { labelId: tool, box })); if (res) setSelected(res.annotation.id); } : undefined} />
+            </div>
           ) : (
             <div className="ob-card" style={{ padding: 0, overflow: 'hidden' }}><Preview item={item} h={320} contain controls /></div>
           )}
+          {item.kind === 'image' && d.canEdit && boxLabels.length > 0 && <p className="ds-kbd-help">Drag on the image to draw a “{d.labelSet.find((l) => l.id === tool)?.name ?? boxLabels[0].name}” box. 1–9 picks the label.</p>}
           {playable && (
             <div className="ds-transport">
               <button type="button" className="btn-small" onClick={() => seek(time - 5000)} aria-label="Back 5 seconds">−5s</button>
@@ -476,11 +549,11 @@ export function DatasetAnnotate() {
 
         <aside className="ds-side" aria-label="Labels">
           <section className="ob-card" style={{ gap: 10 }}>
-            <div className="row-between"><h2>Label set</h2>{spanLabels.length > 0 && timed && <span className="ob-muted">press a number to pick</span>}</div>
+            <div className="row-between"><h2>Label set</h2>{toolLabels.length > 0 && <span className="ob-muted">press a number to pick</span>}</div>
             {d.labelSet.length === 0 && <p className="ob-muted">No labels yet. {d.canEdit ? 'Add the labels this dataset uses below.' : 'An editor defines them.'}</p>}
-            {timed && spanLabels.map((l, n) => (
+            {toolLabels.map((l, n) => (
               <button key={l.id} type="button" className={`ds-palette-item k-${l.tone}`} aria-pressed={tool === l.id} onClick={() => setTool(l.id)}>
-                <span className="ds-swatch" aria-hidden="true" />{l.name}<span className="ob-muted" style={{ fontSize: 12, fontWeight: 500 }}>span</span>{n < 9 && <kbd>{n + 1}</kbd>}
+                <span className="ds-swatch" aria-hidden="true" />{l.name}<span className="ob-muted" style={{ fontSize: 12, fontWeight: 500 }}>{SCOPE_NAME[l.scope]}</span>{n < 9 && <kbd>{n + 1}</kbd>}
               </button>
             ))}
             {fileLabels.length > 0 && (
@@ -491,24 +564,11 @@ export function DatasetAnnotate() {
                 </div>
               </div>
             )}
-            {!timed && spanLabels.length > 0 && <p className="ob-muted">{KIND_ONE[item.kind]} files have no timeline, so only whole-file labels apply.</p>}
+            {!timed && spanLabels.length > 0 && <p className="ob-muted">{KIND_ONE[item.kind]} files have no timeline, so time-span labels do not apply here.</p>}
+            {item.kind !== 'image' && boxLabels.length > 0 && <p className="ob-muted">Box labels apply to images only.</p>}
           </section>
           {d.canEdit && <LabelSetEditor d={d} />}
-          {selectedAnn && (
-            <section className="ob-card" style={{ gap: 12 }}>
-              <span className="ob-muted" style={{ fontSize: 12, fontWeight: 600 }}>Selected</span>
-              <strong style={{ fontSize: 17 }}>{labelName(d.labelSet, selectedAnn.labelId)}</strong>
-              <dl className="ds-dl" style={{ gridTemplateColumns: '96px minmax(0, 1fr)' }}>
-                <dt>File</dt><dd>{d.items.find((it) => it.id === selectedAnn.uploadId)?.filename}</dd>
-                <dt>Span</dt><dd className="mono">{fmtTime(selectedAnn.startMs, true)} → {fmtTime(selectedAnn.endMs, true)} ({((selectedAnn.endMs - selectedAnn.startMs) / 1000).toFixed(1)} s)</dd>
-                <dt>Marked by</dt><dd>{memberName(d.members, selectedAnn.createdBy)}</dd>
-              </dl>
-              <div className="ob-row-actions">
-                <button type="button" className="btn-small" onClick={() => seek(selectedAnn.startMs + offsetOf(d.items.find((it) => it.id === selectedAnn.uploadId)))}>Jump to start</button>
-                {d.canEdit && selectedAnn.uploadId === item.id && <button type="button" className="btn-small" style={{ color: 'var(--t-orange)' }} disabled={d.pending} onClick={async () => { if (await d.act(() => api.deleteAnnotation(d.entry.id, d.project.id, selectedAnn.id))) setSelected(null); }}>Delete</button>}
-              </div>
-            </section>
-          )}
+          <ItemLabels d={d} item={item} selected={selected} onSelect={setSelected} seek={seek} />
         </aside>
       </div>
 
@@ -870,15 +930,29 @@ export function DatasetVersions() {
                 <span>JSON with every file’s name, type, size, SHA-256, labels, label set and notes.</span>
                 {shown ? <a className="btn-small" href={api.manifestUrl(d.entry.id, d.project.id, shown.number)} download style={{ alignSelf: 'flex-start' }}><Icon name="download" size={14} />Download</a> : <span className="ob-badge" style={{ alignSelf: 'flex-start' }}>Pick a version</span>}
               </div>
-              <div className="ob-option">
+              <div className="ob-option" aria-disabled={!shown}>
                 <strong>Original files</strong>
-                <span>{d.writer ? 'Download any file from the dataset view; links last five minutes.' : 'Your role can preview files but not download them.'}</span>
-                <span className="ob-badge tile--green" style={{ alignSelf: 'flex-start' }}>Available</span>
+                <span>{!d.writer ? 'Your role can see this version but not download its files.' : shown ? 'Every file exactly as approved, even if it has since left the working set. Listed below.' : 'Pick a version to download the files it froze.'}</span>
+                <span className={`ob-badge ${shown && d.writer ? 'tile--green' : ''}`} style={{ alignSelf: 'flex-start' }}>{shown && d.writer ? 'Available' : 'Pick a version'}</span>
               </div>
               <div className="ob-option" aria-disabled="true" style={{ borderStyle: 'dashed', background: 'var(--surface-2)' }}><strong>WebDataset shards</strong><span>Streaming tar shards for training jobs.</span><span className="ob-badge" style={{ alignSelf: 'flex-start' }}>Planned</span></div>
               <div className="ob-option" aria-disabled="true" style={{ borderStyle: 'dashed', background: 'var(--surface-2)' }}><strong>Hugging Face push</strong><span>Publish to a private Hub repository.</span><span className="ob-badge" style={{ alignSelf: 'flex-start' }}>Planned</span></div>
             </div>
           </div>
+          {shown && (
+            <div className="ob-card">
+              <h2>Files in v{shown.number} · {shown.files.length}</h2>
+              <ul className="ob-list">
+                {shown.files.map((f) => (
+                  <li key={f.id} style={{ alignItems: 'center' }}>
+                    <span className={`ds-badge k-${f.kind}`}>{KIND_ONE[f.kind]}</span>
+                    <div><strong style={{ overflowWrap: 'anywhere' }}>{f.filename}</strong><span className="ob-muted">{fmtBytes(f.sizeBytes)}{working.some((w) => w.id === f.id) ? '' : ' · no longer in the working set'}</span></div>
+                    {d.writer && d.uploadsEnabled && <button type="button" className="btn-small" disabled={d.pending} onClick={async () => { const res = await d.act(() => api.versionFileUrl(d.entry.id, d.project.id, shown.number, f.id)); if (res?.url) window.location.assign(res.url); }}><Icon name="download" size={14} />Download</button>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </section>
 
         <aside className="ds-side" aria-label="Access" style={{ flex: '1 1 300px' }}>

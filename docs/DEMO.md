@@ -19,12 +19,12 @@ A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace.
 | 1 | "A company describes the job, not our product menu." | `/w/northwind-demo` → **Start your first project**. Task: *Flag damaged boxes on packing line 2 from the overhead camera.* Inputs: **Images**. Start: **We have our own data**. |
 | 2 | "They set the bar before any training." | Measure **recall**, target **95%**, compared with **how you do it today**. Point at the acceptance-rule sentence. |
 | 3 | "Rights come with the data." | Data → **We collected it ourselves**, uses **training + testing**, personal data **Not sure**. |
-| 4 | "Files go straight to our Rust ingest service: checked, hashed, stored privately." | Drag all 8 files from `.local/demo-files/` onto the upload box. The copy is flagged *same content… won't be counted twice*. |
-| 5 | "Submitting freezes exactly what will be reviewed." | **Submit for review**. Show the **locked** status; *Edit setup* is gone. |
-| 6 | "Review is independent." | Profile B, `demo.reviewer@valcairn.example` → `/staff` → open the review. It shows 7 files (duplicate excluded) and a working **Download**. Note *Personal data: Not sure* → **Request changes**: *Confirm whether workers appear in frame.* |
-| 7 | "The customer fixes it; nothing changes silently." | Profile A sees the reviewer notes. **Remove** the copy, set personal data to **No**, **Submit for review**. |
-| 8 | "Approval is bound to that snapshot." | Profile B ticks all five checks → **Approve**. |
-| 9 | "Version 1 is the exact reviewed files and rights." | Profile A → **Approve version 1**. Show *Version 1 · 7 files* and **Reopen**, which voids approval for future versions. |
+| 4 | "Files go straight to our Rust ingest service: checked, hashed, stored privately." | **Open dataset** → **Import data**, drop all 8 files from `.local/demo-files/`. Each row shows the type read from its bytes; the copy is stored as a duplicate. **Dataset** shows the composition bar and real previews. |
+| 5 | "Labels are part of what gets reviewed." | **Annotate** → add labels *damaged* and *ok* (whole file) and *tear* (box on image). Tag a few images and drag a *tear* box on one. |
+| 6 | "Nothing goes to review with open questions." | **Resolve**: the duplicate and unlabelled images are listed. Remove the copy, note why the rest stay, then **Send snapshot for review**. Everything locks. |
+| 7 | "Review is independent, and sees exactly what was sent." | Profile B, `demo.reviewer@valcairn.example` → `/staff` → open the review: frozen label set, labels and boxes on the previews, the notes, working **Download**. Note *Personal data: Not sure* → **Request changes**: *Confirm whether workers appear in frame.* |
+| 8 | "The customer fixes it; nothing changes silently." | Profile A sees the reviewer notes. Set personal data to **No**, resend from **Resolve**. Profile B ticks all five checks → **Approve**. |
+| 9 | "Version 1 is the exact reviewed files, labels and rights." | Profile A → **Approve version 1**. **Versions** shows v1, its manifest and per-file downloads that keep working after **Reopen**, which voids approval for future versions. |
 | 10 | "Training, evaluation and deployment are next." | Point at the **Planned** labels. Nothing runs yet; say so. |
 
 ## Reset between runs
