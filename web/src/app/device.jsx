@@ -641,7 +641,7 @@ function RunCard({ ctx, localModels }) {
     <section className="ob-card" aria-labelledby="run-h">
       <div className="row-between" style={{ flexWrap: 'wrap' }}>
         <h2 id="run-h">Run</h2>
-        <span className="ob-badge tile--green" aria-label="Execution location"><Icon name="lock" size={12} stroke={2.2} /> Running on: this computer · Ollama at {runtime.origin}</span>
+        <span className="ob-badge tile--green dev-location" aria-label="Execution location"><Icon name="lock" size={12} stroke={2.2} /> Running on: this computer · Ollama at {runtime.origin}</span>
       </div>
       <div className="dev-run-settings">
         <div className="ob-field">
