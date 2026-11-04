@@ -430,6 +430,35 @@ export function runStoreContract(test, makeStore, label) {
     }
   });
 
+  withStore('model pulls are one per workspace and model; enhance runs freeze once requested', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: owner.id });
+    const first = await store.requestModelPull({ workspaceId: ws.id, modelId: 'qwen3-8b', requestedBy: owner.id });
+    assert.equal(first.status, 'requested');
+    assert.equal((await store.requestModelPull({ workspaceId: ws.id, modelId: 'qwen3-8b', requestedBy: owner.id })).id, first.id);
+    assert.equal((await store.listModelPulls(ws.id)).length, 1);
+    assert.equal((await store.listModelPulls(other.id)).length, 0);
+
+    const plan = { name: 'returns-assistant', baseModelId: 'qwen3-8b', datasets: [], steps: ['sft'], compute: null, spendCapUsd: null };
+    const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: plan });
+    assert.equal(run.status, 'draft');
+    assert.equal(await store.getEnhanceRun({ workspaceId: other.id, runId: run.id }), null, 'scoped to its workspace');
+    await assert.rejects(store.updateEnhanceRun({ workspaceId: other.id, runId: run.id, run: plan }), { code: 'not_found' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id }), { code: 'invalid_state' }, 'an incomplete plan cannot be requested');
+    const complete = { ...plan, datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft', 'grpo'], compute: 'nebius', spendCapUsd: 250 };
+    assert.deepEqual((await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: complete })).steps, ['sft', 'grpo']);
+    const requested = await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id });
+    assert.equal(requested.status, 'requested');
+    assert.equal(requested.requestedBy, owner.id);
+    assert.ok(requested.requestedAt);
+    await assert.rejects(store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: { ...complete, spendCapUsd: 9999 } }), { code: 'invalid_state' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id }), { code: 'invalid_state' });
+    assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).spendCapUsd, 250);
+    assert.equal((await store.listEnhanceRuns(ws.id)).length, 1);
+    assert.ok((await store.listAudit(ws.id)).some((e) => e.action === 'enhance_run.requested'));
+  });
+
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {
     await store.upsertReviewer({ username: 'YCInsider', name: 'YC reviewer', role: 'viewer', passwordHash: 'scrypt$a' });
     await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'admin', passwordHash: 'scrypt$b' });

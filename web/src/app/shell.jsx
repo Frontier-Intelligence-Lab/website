@@ -21,6 +21,13 @@ const DATASET_PAGES = [
   ['versions', 'Versions', '/versions'],
 ];
 
+// Models pages, shown under Models while you are in one of them.
+const MODEL_PAGES = [
+  ['models-catalog', 'Catalog', ''],
+  ['models-mine', 'My models', '/mine'],
+  ['models-runs', 'Enhance runs', '/runs'],
+];
+
 /**
  * Sidebar and main column for every workspace page. The sidebar collapses to icons (remembered per browser);
  * on narrow screens it is a scrolling row instead.
@@ -68,7 +75,14 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
               ))}
             </div>
           )}
-          <a aria-disabled="true" title="Models: planned, not available yet"><Tile icon="layers" tone="blue" size="sm" /><span className="ob-side-label">Models</span> <span className="ob-badge">Planned</span></a>
+          <Link to={`/w/${entry.slug}/models`} title="Models"><Tile icon="layers" tone="blue" size="sm" /><span className="ob-side-label">Models</span></Link>
+          {current.startsWith('models') && (
+            <div className="ob-side-sub">
+              {MODEL_PAGES.map(([id, label, suffix]) => (
+                <Link key={id} to={`/w/${entry.slug}/models${suffix}`} aria-current={current === id ? 'page' : undefined}>{label}</Link>
+              ))}
+            </div>
+          )}
           {entry.kind === 'organization' && <a aria-disabled="true" title="Financing: planned, not available yet"><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Financing</span> <span className="ob-badge">Planned</span></a>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`} title="Team"><Tile icon="people" tone="violet" size="sm" /><span className="ob-side-label">Team</span></Link>}
           {account.isStaff && <Link to="/staff" title="Review queue"><Tile icon="shield" tone="green" size="sm" /><span className="ob-side-label">Review queue</span></Link>}

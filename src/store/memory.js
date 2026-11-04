@@ -26,7 +26,10 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const issueNotes = [];
   const audit = [];
   const reviewerAccounts = new Map();
-  const copy = (value) => (value == null ? null : structuredClone(value));
+  const modelPulls = [];
+  const enhanceRuns = [];
+  const pickRun = ({ name, baseModelId, datasets, steps, compute, spendCapUsd }) => ({ name, baseModelId, datasets: structuredClone(datasets), steps: [...steps], compute, spendCapUsd });
+  const copy =(value) => (value == null ? null : structuredClone(value));
   const stamp = () => now().toISOString();
   const publicUser = ({ passwordHash, ...user }) => copy(user);
   const publicReviewer = ({ passwordHash, ...account }) => copy(account);
@@ -404,6 +407,49 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     },
     async listDatasetVersions({ workspaceId, projectId }) {
       return versions.filter((v) => v.workspaceId === workspaceId && v.projectId === projectId).map(copy);
+    },
+
+    async listModelPulls(workspaceId) {
+      return modelPulls.filter((p) => p.workspaceId === workspaceId).map(copy);
+    },
+    // Asking twice returns the first request: one copy of a model per workspace.
+    async requestModelPull({ workspaceId, modelId, requestedBy }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const existing = modelPulls.find((p) => p.workspaceId === workspaceId && p.modelId === modelId);
+      if (existing) return copy(existing);
+      const pull = { id: randomUUID(), workspaceId, modelId, status: 'requested', requestedBy, createdAt: stamp() };
+      modelPulls.push(pull);
+      return copy(pull);
+    },
+    async listEnhanceRuns(workspaceId) {
+      return enhanceRuns.filter((r) => r.workspaceId === workspaceId).map(copy);
+    },
+    async getEnhanceRun({ workspaceId, runId }) {
+      const run = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
+      return run ? copy(run) : null;
+    },
+    async createEnhanceRun({ workspaceId, createdBy, run }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const at = stamp();
+      const row = { id: randomUUID(), workspaceId, ...pickRun(run), status: 'draft', createdBy, requestedBy: null, requestedAt: null, createdAt: at, updatedAt: at };
+      enhanceRuns.push(row);
+      return copy(row);
+    },
+    async updateEnhanceRun({ workspaceId, runId, run }) {
+      const row = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status !== 'draft') throw new StoreError('invalid_state');
+      Object.assign(row, pickRun(run), { updatedAt: stamp() });
+      return copy(row);
+    },
+    async requestEnhanceRun({ workspaceId, runId, requestedBy }) {
+      const row = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status !== 'draft') throw new StoreError('invalid_state');
+      if (!row.datasets.length || !row.steps.length || !row.compute || row.spendCapUsd == null) throw new StoreError('invalid_state');
+      Object.assign(row, { status: 'requested', requestedBy, requestedAt: stamp(), updatedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId: requestedBy, action: 'enhance_run.requested', targetType: 'enhance_run', targetId: runId, metadata: { spendCapUsd: row.spendCapUsd }, createdAt: stamp() });
+      return copy(row);
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {

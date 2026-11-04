@@ -23,6 +23,8 @@ New web configuration (all as runtime secrets or Coolify environment, never buil
 
 Ingest needs `INGEST_SHARED_SECRET`, `INGEST_STORAGE=s3://…`, `INGEST_ALLOWED_ORIGINS=https://frontierintelligencelab.com`, `INGEST_BIND=0.0.0.0:4100` and the `AWS_*` storage credentials. Set a bucket lifecycle rule that aborts incomplete multipart uploads after 1 day. Pending uploads that were never committed are swept every hour (`INGEST_PENDING_TTL_SECONDS`, default 24 h).
 
+**Models (migration 011).** `011_models.sql` adds `model_pulls` and `enhance_runs`. It only creates new tables, so it is safe on a database that already has 001–010, and the previous web build ignores them. Apply it before the web build that shows Models, and confirm the app role can `SELECT, INSERT, UPDATE` on both tables (and `DELETE` on `enhance_runs`, which the freeze trigger limits to drafts). No new environment variables.
+
 **Dataset workspace (migrations 007 to 010).** All four must be applied, in order, before the matching web build. 008 and 009 each correct the freeze guard before them (008 adds the parent lock, 009 covers every upload column), and 010 adds the stored-form box constraint, so none may be skipped, even where 007 is already applied.
 
 010 is installed `NOT VALID`. Installing it checks every box that is written or changed from then on, but leaves rows already stored alone, so the upgrade cannot fail on, delete or rewrite existing data, including frozen, approved history. Validating it is a separate, later step that checks every existing row too, and it fails while any non-conforming box remains.

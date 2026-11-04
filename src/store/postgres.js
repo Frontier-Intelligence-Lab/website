@@ -41,6 +41,8 @@ function databaseError(error) {
   if (error.code === '23503') return new StoreError('not_found');
   // Raised by the freeze triggers in migrations/005_review_integrity.sql.
   if (error.code === 'P0001' && error.message === 'project_frozen') return new StoreError('invalid_state');
+  // Raised by migrations/011_models.sql once an enhance run is requested.
+  if (error.code === 'P0001' && error.message === 'run_frozen') return new StoreError('invalid_state');
   // PostgreSQL details can contain complete rows, including hashes or private data.
   const safe = new Error('Postgres operation failed');
   if (typeof error.code === 'string') safe.code = error.code;
@@ -108,6 +110,13 @@ const versionRow = (r) => ({
   createdBy: r.created_by, manifest: r.manifest, createdAt: iso(r.created_at),
   ...(r.raw_invalid_box_ids ? { rawInvalidBoxIds: r.raw_invalid_box_ids } : {}),
 });
+
+const pullRow = (r) => ({ id: r.id, workspaceId: r.workspace_id, modelId: r.model_id, status: r.status, requestedBy: r.requested_by, createdAt: iso(r.created_at) });
+const runRow = (r) => r ? {
+  id: r.id, workspaceId: r.workspace_id, name: r.name, baseModelId: r.base_model_id, datasets: r.datasets, steps: r.steps,
+  compute: r.compute, spendCapUsd: r.spend_cap_usd, status: r.status, createdBy: r.created_by,
+  requestedBy: r.requested_by, requestedAt: iso(r.requested_at), createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
+} : null;
 
 // Reads that feed Resolve, the submit gate and history warnings ask Postgres for 010's verdict on the raw jsonb,
 // before node-postgres turns its numbers into JavaScript numbers and can hide digits a double cannot hold.
@@ -623,6 +632,55 @@ export function createPostgresStore(options) {
     async listDatasetVersions({ workspaceId, projectId }) {
       if (!isId(workspaceId) || !isId(projectId)) return [];
       return (await query(`SELECT *, ${frozenBoxViolations('manifest')} AS raw_invalid_box_ids FROM dataset_versions WHERE workspace_id = $1 AND project_id = $2 ORDER BY number`, [workspaceId, projectId])).rows.map(versionRow);
+    },
+
+    async listModelPulls(workspaceId) {
+      if (!isId(workspaceId)) return [];
+      return (await query('SELECT * FROM model_pulls WHERE workspace_id = $1 ORDER BY created_at, id', [workspaceId])).rows.map(pullRow);
+    },
+    // Asking twice returns the first request: one copy of a model per workspace.
+    async requestModelPull({ workspaceId, modelId, requestedBy }) {
+      if (!isId(workspaceId)) throw new StoreError('not_found');
+      const inserted = (await query(`INSERT INTO model_pulls (workspace_id, model_id, requested_by) VALUES ($1, $2, $3)
+        ON CONFLICT (workspace_id, model_id) DO NOTHING RETURNING *`, [workspaceId, modelId, requestedBy])).rows[0];
+      return pullRow(inserted ?? (await query('SELECT * FROM model_pulls WHERE workspace_id = $1 AND model_id = $2', [workspaceId, modelId])).rows[0]);
+    },
+    async listEnhanceRuns(workspaceId) {
+      if (!isId(workspaceId)) return [];
+      return (await query('SELECT * FROM enhance_runs WHERE workspace_id = $1 ORDER BY created_at, id', [workspaceId])).rows.map(runRow);
+    },
+    async getEnhanceRun({ workspaceId, runId }) {
+      if (!isId(workspaceId) || !isId(runId)) return null;
+      return runRow((await query('SELECT * FROM enhance_runs WHERE workspace_id = $1 AND id = $2', [workspaceId, runId])).rows[0]);
+    },
+    async createEnhanceRun({ workspaceId, createdBy, run }) {
+      if (!isId(workspaceId)) throw new StoreError('not_found');
+      return runRow((await query(`INSERT INTO enhance_runs (workspace_id, name, base_model_id, datasets, steps, compute, spend_cap_usd, created_by)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8) RETURNING *`,
+      [workspaceId, run.name, run.baseModelId, JSON.stringify(run.datasets), JSON.stringify(run.steps), run.compute, run.spendCapUsd, createdBy])).rows[0]);
+    },
+    async updateEnhanceRun({ workspaceId, runId, run }) {
+      if (!isId(workspaceId) || !isId(runId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const current = (await query('SELECT status FROM enhance_runs WHERE workspace_id = $1 AND id = $2 FOR UPDATE', [workspaceId, runId], client)).rows[0];
+        if (!current) throw new StoreError('not_found');
+        if (current.status !== 'draft') throw new StoreError('invalid_state');
+        return runRow((await query(`UPDATE enhance_runs SET name = $3, base_model_id = $4, datasets = $5::jsonb, steps = $6::jsonb, compute = $7,
+          spend_cap_usd = $8, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 RETURNING *`,
+        [workspaceId, runId, run.name, run.baseModelId, JSON.stringify(run.datasets), JSON.stringify(run.steps), run.compute, run.spendCapUsd], client)).rows[0]);
+      });
+    },
+    async requestEnhanceRun({ workspaceId, runId, requestedBy }) {
+      if (!isId(workspaceId) || !isId(runId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const current = (await query('SELECT * FROM enhance_runs WHERE workspace_id = $1 AND id = $2 FOR UPDATE', [workspaceId, runId], client)).rows[0];
+        if (!current) throw new StoreError('not_found');
+        if (current.status !== 'draft' || !current.datasets.length || !current.steps.length || !current.compute || current.spend_cap_usd == null) throw new StoreError('invalid_state');
+        const row = (await query(`UPDATE enhance_runs SET status = 'requested', requested_by = $3, requested_at = clock_timestamp(), updated_at = clock_timestamp()
+          WHERE workspace_id = $1 AND id = $2 RETURNING *`, [workspaceId, runId, requestedBy], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId: requestedBy, action: 'enhance_run.requested', targetType: 'enhance_run', targetId: runId, metadata: { spendCapUsd: row.spend_cap_usd } });
+        return runRow(row);
+      });
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {

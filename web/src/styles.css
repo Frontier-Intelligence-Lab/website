@@ -805,3 +805,50 @@ html:has(.ob), html:has(.ob-split) { background: var(--bg); }
 
 .ds-box--pending > span { display: block; background: #ffffff; color: #141416; }
 .ds-box-layer.is-busy { cursor: progress; }
+
+/* ---------------- Models: catalog, model page, my models, enhance runs ---------------- */
+.mdl-glyph { flex: none; display: grid; place-items: center; border-radius: 10px; font-weight: 700; background: var(--tile-bg); color: var(--tile); }
+.mdl-grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.mdl-plate { display: flex; flex-direction: column; justify-content: space-between; gap: 14px; height: 128px; box-sizing: border-box; padding: 14px; background: var(--surface-2); }
+.mdl-size { display: flex; flex-direction: column; align-items: flex-end; font-size: 11.5px; }
+.mdl-size strong { font-size: 28px; line-height: 1; letter-spacing: -0.02em; color: var(--text); }
+.mdl-size--lg strong { font-size: 36px; letter-spacing: -0.03em; }
+.mdl-plate-mem { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; }
+.mdl-meter { display: block; height: 6px; border-radius: 999px; background: var(--divider); overflow: hidden; }
+.mdl-meter > span { display: block; height: 100%; border-radius: 999px; background: var(--tone, var(--t-blue)); }
+.mdl-mem { display: flex; flex-direction: column; gap: 8px; }
+.mdl-mem-row { display: grid; grid-template-columns: 110px minmax(0, 1fr) 64px; gap: 10px; align-items: center; font-size: 12.5px; }
+.mdl-mem-row .mdl-meter { height: 8px; }
+.mdl-panel { padding: 0; gap: 16px; overflow: hidden; }
+.mdl-panel > :not(.mdl-panel-top) { margin: 0 20px; }
+.mdl-panel > :last-child { margin-bottom: 20px; }
+.mdl-panel-top { display: flex; flex-direction: column; gap: 14px; padding: 18px 20px; background: var(--surface-2); }
+.mdl-actions { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--divider); padding-top: 14px; }
+.mdl-actions .btn-app, .mdl-actions .btn-ghost { width: 100%; justify-content: center; gap: 8px; }
+.mdl-requested { font-weight: 600; color: var(--t-orange); }
+.mdl-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; padding: 0; }
+.mdl-stats > div { display: flex; flex-direction: column; gap: 4px; padding: 16px 18px; font-size: 12.5px; }
+.mdl-stats > div + div { border-left: 1px solid var(--border); }
+.mdl-stats strong { font-size: 24px; letter-spacing: -0.02em; }
+.mdl-method { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+.mdl-list > li { align-items: center; }
+.mdl-step-head { display: flex; gap: 14px; align-items: center; }
+.mdl-option-row { min-height: 52px; }
+.mdl-option-row span:not(.mdl-glyph) { font-size: 13px; }
+.mdl-data > li { padding: 0; }
+.mdl-data-row { display: flex; gap: 12px; align-items: center; width: 100%; padding: 12px 0; cursor: pointer; }
+.mdl-data-row .ob-muted { font-size: 12.5px; }
+.mdl-steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.mdl-compute { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.mdl-pipe { display: flex; flex-direction: column; }
+.mdl-pipe-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 12px; align-items: center; font-size: 14px; }
+.mdl-pipe-line { display: block; width: 2px; height: 14px; margin: 2px 0 2px 13px; background: var(--control); }
+.mdl-pipe-num { width: 28px; height: 28px; border-radius: 999px; display: grid; place-items: center; font-size: 12px; font-weight: 700; background: var(--tile-bg); color: var(--tile); }
+.mdl-pipe-out { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; background: var(--solid); color: var(--on-solid); }
+.mdl-progress { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+@media (max-width: 820px) {
+  .mdl-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mdl-stats > div:nth-child(3) { border-left: 0; }
+  .mdl-stats > div:nth-child(n + 3) { border-top: 1px solid var(--border); }
+  .mdl-mem-row { grid-template-columns: 80px minmax(0, 1fr) 56px; }
+}

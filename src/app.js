@@ -17,6 +17,7 @@ import { createStore } from './store/index.js';
 import { registerAccountRoutes } from './accounts.js';
 import { registerDatasetRoutes } from './datasets.js';
 import { registerWorkspaceDataRoutes } from './workspace-data.js';
+import { registerModelRoutes } from './models.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -150,6 +151,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   const { guards } = await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers });
   registerDatasetRoutes(app, { config, store: accountStore, helpers, guards, ingestClient });
   registerWorkspaceDataRoutes(app, { config, store: accountStore, helpers, guards });
+  registerModelRoutes(app, { store: accountStore, helpers, guards });
 
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,
