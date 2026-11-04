@@ -14,6 +14,8 @@ Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, co
 | Onboarding: accounts, organizations, personal workspaces, invitations, join requests, roles | Implemented and tested against Postgres. Not yet deployed. |
 | Projects: goal, acceptance rule, rights record, existing-model intake, scoping call | Implemented. |
 | Sample uploads (Rust `services/ingest`), staff review, dataset versions | Implemented. Submitted content is frozen; versions contain exactly the approved snapshot. |
+| Run on this device (`/w/:slug/device`): connect a local Ollama, download, verify, run, measure | Implemented and tested against a real local Ollama 0.40.13. The browser talks to Ollama on the visitor's own loopback address; the server stores only client-reported records (devices, model installs with digests, measured runs). Not yet deployed. |
+| In-browser (WebGPU) and remote-GPU execution | **Planned.** Labelled planned on the device screen. |
 | Provider onboarding, training, evaluation, deployment, financing | **Planned.** Shown as planned in the app; nothing executes. |
 | `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
 | Light / dark mode | Follows the system setting; a toggle stores the visitor's choice in `localStorage`. |
@@ -76,7 +78,14 @@ See `.env.example`. Key values:
 | `CONTACT_DELIVERY` | `disabled` (default) or `smtp`. With `smtp`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `CONTACT_TO`, `CONTACT_FROM` apply. |
 | `CONTACT_PUBLIC_EMAIL`, `BOOKING_URL` | Returned by `/api/config` and shown on the contact page. |
 | `REVIEWERS_FILE` or `REVIEWERS_JSON` | Reviewer accounts. Unset means sign-in is disabled. |
+| `MODEL_CATALOG_FILE` | JSON array of the open-weight models offered on the Models pages (see [Model catalog](#model-catalog)). Unset means an empty catalog: nothing to pull and no new enhance plans, while recorded pulls and runs stay readable. An unreadable or invalid file stops startup with the reason. |
 | `SIGNIN_LOG_FILE` | Where the sign-in log is appended (JSON Lines). Unset keeps only the latest 200 events in memory, lost on restart. |
+| `LOCAL_MODEL_CATALOG_FILE` | JSON catalog of models offered for download on Run on this device, validated at startup. Example: `docs/local-models.example.json`. Unset means no downloads are offered; installed models still work. |
+| `LOCAL_RUNTIME_ORIGINS` | Loopback origins of the visitor's own model runtime, added to the CSP `connect-src`. Default `http://127.0.0.1:11434,http://localhost:11434`. Non-loopback values are refused at startup. |
+
+### Run on this device
+
+The browser, not the server, connects to Ollama on the visitor's computer, and the server never accepts or proxies a runtime URL. Ollama answers only origins it allows. `http://localhost:*` and `http://127.0.0.1:*` are allowed by default, so local development works as is. For a deployed site each user adds that exact origin to their own Ollama, for example `setx OLLAMA_ORIGINS "https://frontierintelligencelab.com"` on Windows, then restarts Ollama. Never use `*`, and keep Ollama bound to 127.0.0.1. Chrome may ask whether the site may reach apps on this device (local network access); the screen explains it. Models that Ollama marks as cloud, for example `glm-5:cloud`, run on ollama.com, so local mode lists them as excluded and never calls them, not even `/api/show`. Prompts and replies never go to Valcairn; the screen's "What leaves this computer" section lists exactly what does.
 
 ### Sign-in accounts
 
@@ -89,6 +98,12 @@ Create an entry for a chosen password (read from stdin, at least 8 characters; a
 ```
 
 Or let the script generate a strong password with `--generate`. Add `--admin` for accounts that may read the sign-in log; everyone else is a `viewer`. Put each entry in the JSON array referenced by `REVIEWERS_FILE` and restart the server to load changes. Duplicate usernames are rejected at startup.
+
+### Model catalog
+
+The open-weight models offered on the Models pages are deployment data, not source. Point `MODEL_CATALOG_FILE` at a JSON array of models and the server reads and checks it once at startup; `docs/model-catalog.example.json` shows every field with six illustrative entries. Each entry needs a unique `id` (lower-case letters, digits, dots and dashes, the same rule the database applies to `model_pulls` and `enhance_runs`), `name`, `maker`, `monogram` (up to three characters), `tone` (`blue`, `violet`, `teal`, `orange` or `plain`), `source`, `params`, `architecture` (`dense`, or `moe` with `active`), `contextK`, `modalities` (`text`, `vision`), `tags` (`reasoning`, or empty), `license`, `commercial`, `licenseNote`, `formats` (one to eight `{ "format", "gb" }` pairs), `loraGpus` and `summary`; `contextNote` is optional. An unknown field, a repeated id or a value out of range is refused and the server does not start. Figures are approximate: check each model's card before you list it, and keep the file read-only in production.
+
+For a local preview set `MODEL_CATALOG_FILE=docs/model-catalog.example.json` in `.env` (relative to where you run `npm start`). Without it the site still runs: public pages and reviewer sign-in are unaffected, the catalog page says no models are available, new pulls and enhance plans are refused, and pulls or runs recorded earlier stay listed. A model removed from the file later keeps its recorded pulls and frozen plans readable, labelled as not in the current catalog; a draft that started from it must move to another pulled model before it can be saved or approved.
 
 ### Who viewed the demo
 
@@ -109,10 +124,12 @@ Give each invited person their own account: a shared login only shows that *some
 
 ```powershell
 docker build -t valcairn-site .
-docker run --rm -p 3000:3000 --env-file .env -e NODE_ENV=production valcairn-site
+docker run --rm -p 3000:3000 --env-file .env -e NODE_ENV=production `
+  -v "${PWD}/docs/model-catalog.example.json:/config/model-catalog.json:ro" -e MODEL_CATALOG_FILE=/config/model-catalog.json `
+  valcairn-site
 ```
 
-The image builds the React app in a first stage and ships only `src/`, `dist/` and production dependencies (React is build-time only). It listens on `PORT` (default 3000) as the `node` user. Mount the reviewer file read-only and point `REVIEWERS_FILE` at it.
+The image builds the React app in a first stage and ships only `src/`, `dist/` and production dependencies (React is build-time only). It listens on `PORT` (default 3000) as the `node` user. The image carries no model catalog: mount yours read-only and point `MODEL_CATALOG_FILE` at it, as above with the example file. Mount the reviewer file the same way and point `REVIEWERS_FILE` at it.
 
 ## Deployment
 
@@ -120,7 +137,7 @@ This is a long-running Node server (sessions, SMTP, rate limits), not a static o
 
 1. Build the image from this repository (`docker build`); the first stage runs `vite build`, the second ships `src/`, `dist/` and production dependencies.
 2. Provide runtime configuration outside Git: `NODE_ENV=production`, `SESSION_SECRET` (32+ chars), `COOKIE_SECURE=true`, `TRUST_PROXY` set to the reverse proxy's IP/CIDR, and, for contact delivery, `CONTACT_DELIVERY=smtp` with the `SMTP_*` and `CONTACT_*` values.
-3. Mount a reviewer file read-only and set `REVIEWERS_FILE` to enable `/demo` sign-in. Mount a writable volume (the container runs as the `node` user) and set `SIGNIN_LOG_FILE`, for example `/data/signins.jsonl`, so the sign-in log survives restarts.
+3. Mount a reviewer file read-only and set `REVIEWERS_FILE` to enable `/demo` sign-in. Mount the model catalog JSON read-only and set `MODEL_CATALOG_FILE`; without it the Models pages offer nothing to pull. Mount a writable volume (the container runs as the `node` user) and set `SIGNIN_LOG_FILE`, for example `/data/signins.jsonl`, so the sign-in log survives restarts.
 4. Health check: `GET /healthz`. Run one instance (sessions are in memory).
 
 ## Development versus production
@@ -217,8 +234,9 @@ With `TEST_DATABASE_URL` unset, the Postgres suite skips cleanly and `npm run ch
 - `005_review_integrity.sql`: review snapshots, the `withdrawn` review status, and triggers that refuse content or file changes on submitted projects.
 - `006_reviewer_accounts.sql`: external demo reviewer accounts, separate from customer users.
 - `004_onboarding_v3.sql`: uploads, staff reviews and numbered dataset versions, plus the v3 project statuses. Legacy `submitted` projects return to `draft` because the old status did not record a staff review. Other project data is retained.
+- `013_capital.sql`: capital cases, frozen submissions, append-only credit records and evidence references. Amounts are checked in SQL (whole, non-negative cents up to 10¹²), submissions and credit records are frozen by triggers, and links to projects and enhance runs use composite foreign keys so they stay inside one workspace. No lender, credit-decision or funding table exists.
 
-Relative to the starting schema, the migrations explicitly constrain lower-case email/domain/slug storage, nonnegative code attempts, object-shaped JSON, valid project statuses, and verified domains having a domain value. They add relationship/expiry indexes and foreign keys. `audit_events.target_id` is text because audit targets are generic identifiers. PostgreSQL 17 provides `gen_random_uuid()` directly, so no extension is needed. No provider, listing or financing tables are added.
+Relative to the starting schema, the migrations explicitly constrain lower-case email/domain/slug storage, nonnegative code attempts, object-shaped JSON, valid project statuses, and verified domains having a domain value. They add relationship/expiry indexes and foreign keys. `audit_events.target_id` is text because audit targets are generic identifiers. PostgreSQL 17 provides `gen_random_uuid()` directly, so no extension is needed. No provider or listing tables are added; financing stops at planning evidence and Valcairn's internal review.
 
 The v3 tables use composite foreign keys to keep each upload, review and version in its project's workspace. Duplicate uploads reference an original in that same project; SHA-256 strings are lowercase hex and file sizes are nonnegative safe JavaScript integers. A partial unique index permits one pending review per project. Dataset numbers are unique per project and assigned while its row is locked. Invitation acceptance/revocation, review transitions and version creation include their audit entries in the same transaction. The nine shared contract tests and additional Postgres concurrency/rollback tests cover these operations.
 

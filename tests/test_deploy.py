@@ -3,12 +3,17 @@ import importlib.util
 import io
 import json
 import copy
+import os
 from pathlib import Path
+import re
+import secrets
+import subprocess
 import tarfile
 import tempfile
 import types
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit, urlunsplit
 
 SPEC = importlib.util.spec_from_file_location("deploy", Path(__file__).resolve().parents[1] / "scripts/ops/deploy.py")
 deploy = importlib.util.module_from_spec(SPEC)
@@ -84,14 +89,17 @@ class RuntimePreservation(unittest.TestCase):
             release.backup_dir = Path(directory)
             calls = []
             release.preflight = lambda: calls.append("preflight")
+            release.free_space = lambda: calls.append("free_space")
             release.backup = lambda: calls.append("backup")
             release.build = lambda: calls.append("build")
+            release.validate_catalogs = lambda: calls.append("catalogs")
             release.migrate = lambda: calls.append("migrate")
             with patch.object(deploy, "already_running", return_value=False), patch.object(deploy, "verify_release", side_effect=deploy.ReleaseError("Master changed")):
                 with self.assertRaises(deploy.ReleaseError):
                     release.execute()
-            self.assertEqual(calls, ["preflight", "backup", "build"])
-            self.assertFalse(json.loads((Path(directory) / "receipt.json").read_text())["live"])
+            self.assertEqual(calls, ["preflight", "free_space", "backup", "build"])
+            receipt = json.loads((Path(directory) / "receipt.json").read_text())
+            self.assertEqual((receipt["live"], receipt["failure"]), (False, "Master changed"))
 
     def test_termination_becomes_a_controlled_failure_only_once(self):
         handler = deploy.termination_handler()
@@ -108,7 +116,8 @@ class RuntimePreservation(unittest.TestCase):
             release.images = {"web": "web", "ingest": "ingest"}
             release.receipt, release.swaps = {}, []
             release.backup_dir = Path(directory)
-            release.preflight = release.backup = release.build = release.migrate = lambda: None
+            release.preflight = release.free_space = release.backup = release.build = release.migrate = lambda: None
+            release.validate_catalogs = release.ensure_grants = release.verify_catalogs_unchanged = lambda: None
             release.protected_snapshot = lambda: {}
             restored = []
             release.rollback = lambda: restored.append(True)
@@ -164,12 +173,17 @@ class RuntimePreservation(unittest.TestCase):
                 deploy.verify_runtime(original, changed, "new", SHA, "sha256:new")
 
     def test_partial_grants_are_not_mistaken_for_complete_access(self):
-        privileges = ["SELECT", "INSERT", "UPDATE", "DELETE"]
-        rows = [{"privilege": p, "ok": p == "SELECT"} for p in privileges]
-        self.assertEqual(deploy.missing_privileges(rows), ["DELETE", "INSERT", "UPDATE"])
-        self.assertEqual(deploy.missing_privileges([{"privilege": p, "ok": True} for p in privileges]), [])
-        with self.assertRaises(deploy.ReleaseError):
-            deploy.missing_privileges(rows[:1])
+        rows = [{"privilege": p, "ok": p == "SELECT"} for p in deploy.TABLE_PRIVILEGES]
+        self.assertEqual(deploy.privilege_gap(rows, deploy.ROW_PRIVILEGES), (["DELETE", "INSERT", "UPDATE"], []))
+        self.assertEqual(deploy.privilege_gap(rows, ("SELECT", "INSERT")), (["INSERT"], []))
+        crud = [{"privilege": p, "ok": p in deploy.ROW_PRIVILEGES} for p in deploy.TABLE_PRIVILEGES]
+        self.assertEqual(deploy.privilege_gap(crud, deploy.ROW_PRIVILEGES), ([], []))
+        everything = [{"privilege": p, "ok": True} for p in deploy.TABLE_PRIVILEGES + ("MAINTAIN",)]
+        self.assertEqual(deploy.privilege_gap(everything, deploy.ROW_PRIVILEGES), ([], ["MAINTAIN", "REFERENCES", "TRIGGER", "TRUNCATE"]))
+        # Only the four row statements reported (the old query), a duplicated row, or a contract outside table privileges.
+        for rows, required in ((crud[:4], deploy.ROW_PRIVILEGES), (crud + crud[:1], deploy.ROW_PRIVILEGES), (crud, ("SELECT", "CONNECT"))):
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.privilege_gap(rows, required)
 
     def test_noop_requires_both_exact_images_and_revision_labels(self):
         web = {"Config": {"Image": "valcairn-site:" + SHA, "Labels": {deploy.REVISION_LABEL: SHA}}}
@@ -277,9 +291,551 @@ class SourcePaths(unittest.TestCase):
             self.assertEqual((result / "src/file.txt").read_bytes(), b"abc")
 
     def test_manifest_only_uses_fixed_table_allowlist(self):
-        sql = deploy.manifest_sql(["users", "users; DROP DATABASE valcairn"])
+        sql = deploy.manifest_sql(["users", "capital_submissions", "users; DROP DATABASE valcairn", "pg_authid"])
         self.assertIn("FROM users t", sql)
+        self.assertIn("FROM capital_submissions t", sql)
         self.assertNotIn("DROP", sql)
+        self.assertNotIn("pg_authid", sql)
+
+
+MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
+FEATURE_NUMBERS = ("011", "012", "013")
+ALL_PRIVILEGES = deploy.TABLE_PRIVILEGES + ("MAINTAIN",)
+
+
+def tables_through(number):
+    """The tables a database holds once migrations up to `number` are applied, per the ledger-aware groups."""
+    return (deploy.LEDGER_TABLE,) + sum((tables for n, tables in deploy.TABLE_GROUPS.items() if n <= number), ())
+
+
+def ledger_through(number):
+    """Real migration filenames from migrations/ up to `number`, as the ledger would list them."""
+    return sorted(file.name for file in MIGRATIONS.glob("*.sql") if file.name[:3] <= number)
+
+
+class FeatureGuards(unittest.TestCase):
+    """Production may sit anywhere from the documented 001-006 baseline to the Capital schema; the ledger decides."""
+
+    def test_table_groups_match_the_migration_files(self):
+        created = {}
+        for file in sorted(MIGRATIONS.glob("*.sql")):
+            created[file.name[:3]] = set(re.findall(r"^CREATE TABLE (?:IF NOT EXISTS )?([a-z_]+)", file.read_text(), re.MULTILINE))
+        self.assertLessEqual({"%03d" % n for n in range(1, 11)}, set(created))
+        # Every migration file present must agree with its group: an unknown new table or a renamed one fails here,
+        # whether the branch carries 001-010 only or, once synced with master, 011 and 012 as well.
+        for number, tables in created.items():
+            self.assertEqual(set(deploy.TABLE_GROUPS.get(number, ())), tables, number)
+        # Only the reviewed feature groups may lack a file on this branch; nothing else is declared without a migration.
+        self.assertLessEqual(set(deploy.TABLE_GROUPS) - set(created), set(FEATURE_NUMBERS))
+        self.assertNotIn(deploy.LEDGER_TABLE, sum(deploy.TABLE_GROUPS.values(), ()))
+        self.assertEqual(deploy.BASELINE, "006")
+
+    def test_documented_pre_007_production_reaches_backup_and_later_schemas_verify(self):
+        six = ledger_through("006")
+        self.assertEqual(len(six), 6)
+        verified, absent = deploy.verify_tables(six, tables_through("006"))
+        self.assertEqual(verified, sorted(tables_through("006")))
+        self.assertEqual(absent, sorted(set(deploy.KNOWN_TABLES) - set(tables_through("006"))))
+        self.assertIn("annotations", absent)
+        verified, absent = deploy.verify_tables(ledger_through("010"), tables_through("010"))
+        self.assertIn("annotations", verified)
+        self.assertEqual(absent, sorted(sum((deploy.TABLE_GROUPS[n] for n in FEATURE_NUMBERS), ())))
+        later = ledger_through("010") + ["011_models.sql", "012_devices.sql", "013_capital.sql"]
+        self.assertEqual(deploy.verify_tables(later, deploy.KNOWN_TABLES), (sorted(deploy.KNOWN_TABLES), []))
+
+    def test_ledger_and_tables_must_agree_from_the_baseline_up(self):
+        six, ten = ledger_through("006"), ledger_through("010")
+        cases = (("007 listed but its tables missing", ten, tables_through("006")),
+                 ("partial 007 group", ten, tables_through("006") + ("annotations",)),
+                 ("007 tables without their ledger entry", six, tables_through("006") + ("annotations", "issue_notes")),
+                 ("feature table without its migration", ten, tables_through("010") + ("devices",)),
+                 ("011 listed but its tables missing", ten + ["011_models.sql"], tables_through("010")),
+                 ("baseline table missing", six, tuple(t for t in tables_through("006") if t != "reviewer_accounts")),
+                 ("below the 006 baseline", ledger_through("005"), tables_through("005")),
+                 ("ledger table missing", six, tables_through("006")[1:]),
+                 ("empty ledger", [], tables_through("006")))
+        for name, ledger, present in cases:
+            with self.subTest(case=name), self.assertRaises(deploy.ReleaseError):
+                deploy.verify_tables(ledger, present)
+
+    def test_grant_contract_is_explicit_and_never_deletes_immutable_records(self):
+        self.assertEqual(set(deploy.GRANTS) - set(deploy.KNOWN_TABLES), set())
+        for table in ("enhance_runs", "device_reports", "execution_runs", "capital_submissions", "credit_records", "capital_review_marks"):
+            self.assertNotIn("DELETE", deploy.GRANTS[table], table)
+        for table in ("credit_records", "capital_review_marks", "device_reports", "execution_runs", "model_pulls"):
+            self.assertNotIn("UPDATE", deploy.GRANTS[table], table)
+        self.assertEqual(deploy.GRANTS["capital_evidence"], ("SELECT", "INSERT", "DELETE"))
+        self.assertFalse(any(set(required) & {"TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"} for required in deploy.GRANTS.values()))
+
+    def test_grant_programs_are_bounded_to_the_contract(self):
+        check = deploy.grant_check_program("app", "annotations")
+        for needle in ("has_table_privilege($1,$2,p)", "unnest($3::text[])", json.dumps(deploy.TABLE_PRIVILEGES), "server_version_num", "'MAINTAIN'",
+                       "pg_has_role($2,c.relowner,'USAGE') OR pg_has_role($2,c.relowner,'SET')", "rolsuper", "deptype IN ('a','i')"):
+            self.assertIn(needle, check)
+        role = deploy.role_check_program("app", "migrator")
+        for needle in ("rolcreatedb AS createdb", "rolcreaterole AS createrole", "rolbypassrls", "rolreplication", "pg_has_role($1,c.relowner,'SET')",
+                       "pg_has_role($1,datdba,'USAGE')", "pg_has_role($1,$2,'MEMBER')", "rolname ~ '^pg_'",
+                       "(r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls OR r.rolreplication) AND pg_has_role($1,r.oid,'SET')",
+                       "WHERE m.admin_option AND (pg_has_role($1,m.member,'SET') OR pg_has_role($1,m.member,'USAGE'))"):
+            self.assertIn(needle, role)
+
+    def test_app_role_contract_rejects_cluster_powers_direct_or_assumable_and_owner_like_membership(self):
+        safe = {"exists": True, "superuser": False, "createdb": False, "createrole": False, "bypassrls": False, "replication": False,
+                "owned_objects": 0, "database_owner": False, "migrator_member": False, "predefined": [], "settable_powers": [], "admin_memberships": [], "memberships": []}
+        self.assertEqual(deploy.verify_app_role(safe), {key: safe[key] for key in safe if key != "exists"})
+        # A membership that confers no cluster power, ownership or administration stays allowed and is only recorded.
+        self.assertEqual(deploy.verify_app_role({**safe, "memberships": ["readers"]})["memberships"], ["readers"])
+        for change in ({"exists": False}, {"superuser": True}, {"createdb": True}, {"createrole": True}, {"bypassrls": True}, {"replication": True},
+                       {"owned_objects": 1}, {"database_owner": True}, {"migrator_member": True}, {"predefined": ["pg_write_all_data"]},
+                       {"settable_powers": ["ops_admin"], "memberships": ["ops_admin"]},
+                       {"admin_memberships": [{"identity": "app", "granted": "readers"}], "memberships": ["readers"]},
+                       # The two-hop graph: a reachable powerless hop administers the powerful group; nothing is directly visible on the app.
+                       {"admin_memberships": [{"identity": "hop", "granted": "ops_admin"}], "memberships": ["hop"]}):
+            with self.subTest(change=change), self.assertRaises(deploy.ReleaseError):
+                deploy.verify_app_role({**safe, **change})
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_app_role({"exists": True, "superuser": False})
+        grant = deploy.grant_program("app", "credit_records", ["INSERT"])
+        self.assertIn("GRANT INSERT ON TABLE credit_records TO", grant)
+        for table, privileges in (("credit_records", ["DELETE"]), ("credit_records", ["SELECT", "TRUNCATE"]), ("users", ["SELECT"]), ("annotations", ["ALL"])):
+            with self.subTest(table=table, privileges=privileges), self.assertRaises(deploy.ReleaseError):
+                deploy.grant_program("app", table, privileges)
+
+    def grant_release(self, present):
+        release = object.__new__(deploy.Release)
+        release.web = {"Config": {"Env": ["DATABASE_URL=postgresql://app@database:5432/valcairn"]}}
+        release.images, release.receipt, release.programs = {"migrate": "migrate-image"}, {}, []
+        def node(code, image=None):
+            self.assertEqual(image, "migrate-image")
+            release.programs.append(code)
+            granted = re.search(r"GRANT ([A-Z,]+) ON TABLE ([a-z_]+) TO", code)
+            if granted:
+                present[granted.group(2)]["held"] |= set(granted.group(1).split(","))
+                return {"granted": True}
+            table = re.search(r'table="([a-z_]+)"', code).group(1)
+            if table not in present:
+                return {"present": False}
+            state = present[table]
+            return {"present": True, "sequences": state.get("sequences", []), "owner": state.get("owner", False), "superuser": state.get("superuser", False),
+                    "rows": [{"privilege": p, "ok": p in state["held"]} for p in ALL_PRIVILEGES]}
+        release.node = node
+        return release
+
+    def test_grants_cover_only_present_tables_and_only_missing_contract_statements(self):
+        present = {"annotations": {"held": set(deploy.ROW_PRIVILEGES)}, "issue_notes": {"held": set(deploy.ROW_PRIVILEGES)},
+                   "credit_records": {"held": {"SELECT"}}, "capital_evidence": {"held": {"SELECT", "INSERT", "DELETE"}}}
+        release = self.grant_release(present)
+        release.ensure_grants()
+        grants = [code for code in release.programs if "GRANT " in code]
+        self.assertEqual(len(grants), 1)
+        self.assertIn("GRANT INSERT ON TABLE credit_records TO", grants[0])
+        self.assertNotIn("DELETE", grants[0])
+        self.assertNotIn("ALL", grants[0])
+        self.assertEqual(release.receipt["grants"]["tables"]["credit_records"], ["SELECT", "INSERT"])
+        self.assertEqual(release.receipt["grants"]["tables"]["model_pulls"], "absent")
+        self.assertEqual(release.receipt["grants"]["tables"]["annotations"], list(deploy.ROW_PRIVILEGES))
+        self.assertEqual(release.receipt["grants"]["privileges_checked"], sorted(ALL_PRIVILEGES))
+
+    def test_expected_rights_plus_a_destructive_extra_stop_the_release_before_any_grant(self):
+        for extra in ("TRUNCATE", "TRIGGER", "REFERENCES", "MAINTAIN", "UPDATE", "DELETE"):
+            release = self.grant_release({"credit_records": {"held": {"SELECT", "INSERT", extra}}})
+            with self.subTest(extra=extra), self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("beyond the release contract", str(failure.exception))
+            self.assertFalse(any("GRANT " in code or "REVOKE" in code for code in release.programs))
+        # A required statement missing and a destructive extra present: still no grant is attempted.
+        release = self.grant_release({"capital_review_marks": {"held": {"SELECT", "TRUNCATE"}}})
+        with self.assertRaises(deploy.ReleaseError):
+            release.ensure_grants()
+        self.assertFalse(any("GRANT " in code for code in release.programs))
+        # An owner or superuser is refused on its own, even when its ACL has been trimmed to exactly the contract.
+        for flag, held in (("owner", set(ALL_PRIVILEGES)), ("owner", set(deploy.ROW_PRIVILEGES)), ("owner", {"SELECT"}),
+                           ("superuser", set(ALL_PRIVILEGES)), ("superuser", set(deploy.ROW_PRIVILEGES))):
+            release = self.grant_release({"annotations": {"held": held, flag: True}})
+            with self.subTest(flag=flag, held=sorted(held)), self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("can act as owner", str(failure.exception))
+            self.assertFalse(any("GRANT " in code for code in release.programs))
+        release = self.grant_release({"devices": {"held": {"SELECT", "INSERT", "UPDATE"}, "sequences": [{"name": "devices_id_seq"}]}})
+        with self.assertRaises(deploy.ReleaseError):
+            release.ensure_grants()
+
+    def test_frozen_feature_records_are_digested_only_when_present_and_never_recorded(self):
+        release = object.__new__(deploy.Release)
+        release.receipt, captured = {}, []
+        def node(code, image=None):
+            captured.append(code)
+            return {"reviewers": [], "capital_submissions": [{"id": "s1", "digest": "d1g3st0fsubmission"}]}
+        release.node = node
+        before = release.protected_snapshot()
+        for table in deploy.FROZEN_QUERIES:
+            self.assertIn("to_regclass($1) AS t',['public." + table + "'])", captured[0])
+        self.assertIn("FROM enhance_runs WHERE status='requested'", captured[0])
+        self.assertEqual(release.receipt["protected_records"], {"reviewers": 0, "capital_submissions": 1})
+        self.assertNotIn("d1g3st0fsubmission", json.dumps(release.receipt))
+        changed = {"reviewers": [], "capital_submissions": [{"id": "s1", "digest": "rewritten"}]}
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_protected_records(before, changed)
+        deploy.verify_protected_records(before, {**before, "credit_records": [{"id": "c1", "digest": "new-after-migration"}]})
+
+    def test_catalog_paths_must_be_distinct_read_only_mounts(self):
+        env = {"MODEL_CATALOG_FILE": "/run/catalogs/models.json", "LOCAL_MODEL_CATALOG_FILE": "/run/local-models.json"}
+        mounts = [{"Type": "bind", "Source": "/srv/valcairn/catalogs", "Destination": "/run/catalogs", "RW": False},
+                  {"Type": "bind", "Source": "/srv/valcairn/local-models.json", "Destination": "/run/local-models.json", "RW": False},
+                  {"Type": "bind", "Source": "/srv/valcairn/data", "Destination": "/data", "RW": True}]
+        found = deploy.catalog_mounts(env, mounts)
+        self.assertEqual(found["MODEL_CATALOG_FILE"], {"path": "/run/catalogs/models.json", "source": "/srv/valcairn/catalogs/models.json"})
+        self.assertEqual(found["LOCAL_MODEL_CATALOG_FILE"]["source"], "/srv/valcairn/local-models.json")
+        self.assertEqual(deploy.catalog_mounts({}, mounts), {})
+        writable = [{**mounts[0], "RW": True}, mounts[1]]
+        swapped = {**env, "LOCAL_MODEL_CATALOG_FILE": "/run/catalogs/models.json"}
+        for name, bad_env, bad_mounts in (("writable", env, writable), ("unmounted", env, mounts[1:]),
+                                          ("same file", swapped, mounts), ("in data dir", {"MODEL_CATALOG_FILE": "/data/models.json"}, mounts)):
+            with self.subTest(case=name), self.assertRaises(deploy.ReleaseError):
+                deploy.catalog_mounts(bad_env, bad_mounts)
+
+    def test_catalog_digest_records_no_contents_and_detects_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "models.json"
+            file.write_text('{"models":[{"id":"private-catalog-entry"}]}')
+            digest = deploy.catalog_digest(file)
+            self.assertEqual(set(digest), {"sha256", "bytes"})
+            self.assertNotIn("private-catalog-entry", json.dumps(digest))
+            release = object.__new__(deploy.Release)
+            release.catalogs = {"MODEL_CATALOG_FILE": {"path": "/run/models.json", "source": str(file), **digest}}
+            release.verify_catalogs_unchanged()
+            file.write_text('{"models":[]}')
+            with self.assertRaises(deploy.ReleaseError):
+                release.verify_catalogs_unchanged()
+            (Path(directory) / "broken.json").write_text("{not json")
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.catalog_digest(Path(directory) / "broken.json")
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.catalog_digest(Path(directory) / "missing.json")
+
+    def test_catalog_validation_uses_candidate_loader_offline_without_secrets(self):
+        release = object.__new__(deploy.Release)
+        release.images, release.receipt = {"web": "valcairn-site:" + SHA}, {}
+        release.catalogs = {"MODEL_CATALOG_FILE": {"path": "/run/catalogs/models.json", "source": "/srv/catalogs/models.json", "sha256": "a" * 64, "bytes": 40},
+                            "LOCAL_MODEL_CATALOG_FILE": {"path": "/run/local.json", "source": "/srv/local.json", "sha256": "b" * 64, "bytes": 20}}
+        with patch.object(deploy, "run", return_value=b'{"consumed":{"MODEL_CATALOG_FILE":3,"LOCAL_MODEL_CATALOG_FILE":null}}') as execute:
+            release.validate_catalogs()
+        command, program = execute.call_args[0][0], execute.call_args[1]["data"].decode()
+        self.assertEqual(command[:6], ["docker", "run", "--rm", "-i", "--network", "none"])
+        self.assertEqual(command[-3:], ["valcairn-site:" + SHA, "node", "--input-type=module"])
+        mounts = [command[i + 1] for i, item in enumerate(command) if item == "-v"]
+        self.assertEqual(mounts, ["/srv/catalogs/models.json:/run/catalogs/models.json:ro", "/srv/local.json:/run/local.json:ro"])
+        self.assertNotIn("--env-file", command)
+        self.assertIn("loadConfig", program)
+        self.assertIn("randomBytes(32)", program)
+        self.assertIn('"MODEL_CATALOG_FILE": "/run/catalogs/models.json"', program)
+        self.assertEqual(release.receipt["catalogs"]["MODEL_CATALOG_FILE"]["candidate_entries"], 3)
+        self.assertIsNone(release.receipt["catalogs"]["LOCAL_MODEL_CATALOG_FILE"]["candidate_entries"])
+        for raw in (b'{"error":"invalid_catalog"}', b"not json"):
+            with patch.object(deploy, "run", return_value=raw), self.assertRaises(deploy.ReleaseError) as failure:
+                release.validate_catalogs()
+            self.assertNotIn("/srv", str(failure.exception))
+        release.catalogs = {}
+        with patch.object(deploy, "run") as execute:
+            release.validate_catalogs()
+        execute.assert_not_called()
+        self.assertEqual(release.receipt["catalogs"], {})
+
+    def test_local_origins_stay_loopback_and_memory_keys_never_reach_the_server(self):
+        deploy.verify_local_origins({})
+        deploy.verify_local_origins({"LOCAL_RUNTIME_ORIGINS": "http://127.0.0.1:11434, http://localhost:11434",
+                                     "LOCAL_MEMORY_ORIGINS": "http://[::1]:8787", "MODEL_CATALOG_FILE": "/run/models.json"})
+        for env in ({"LOCAL_MEMORY_ORIGINS": "http://10.0.0.5:8787"}, {"LOCAL_RUNTIME_ORIGINS": "https://127.0.0.1:11434"},
+                    {"LOCAL_MEMORY_ORIGINS": "http://127.0.0.1:8787,http://memory.internal:8787"},
+                    {"PROVENA_API_KEY": "x"}, {"LOCAL_MEMORY_TOKEN": "x"}, {"MEMORY_GATEWAY_SECRET": "x"}):
+            with self.subTest(env=sorted(env)), self.assertRaises(deploy.ReleaseError):
+                deploy.verify_local_origins(env)
+
+    def test_free_space_guard_fails_closed_before_backup(self):
+        release = object.__new__(deploy.Release)
+        release.config = {"db_name": "valcairn", "postgres_container": "projects-db", "min_free_bytes": 10 * 1024 ** 3}
+        release.root, release.receipt = Path("/srv/valcairn"), {}
+        queries = []
+        release.psql = lambda database, sql: (queries.append((database, sql)), str(2 * 1024 ** 3))[1]
+        release.docker = types.SimpleNamespace(request=lambda *args: {"DockerRootDir": "/var/lib/docker"},
+                                               inspect=lambda name: {"Mounts": [{"Source": "/var/lib/docker/volumes/pg/_data"}]})
+        usage = lambda free: (lambda path: types.SimpleNamespace(total=free, used=0, free=free))
+        with patch.object(deploy.shutil, "disk_usage", usage(20 * 1024 ** 3)):
+            release.free_space()
+        self.assertEqual(queries, [("postgres", "SELECT pg_database_size('valcairn');")])
+        self.assertEqual(release.receipt["free_space"]["required_bytes"], 10 * 1024 ** 3)
+        self.assertEqual(release.receipt["free_space"]["checked"], sorted([str(release.root), "/var/lib/docker", "/var/lib/docker/volumes/pg/_data"]))
+        with patch.object(deploy.shutil, "disk_usage", usage(9 * 1024 ** 3)), self.assertRaises(deploy.ReleaseError):
+            release.free_space()
+        release.psql = lambda database, sql: str(4 * 1024 ** 3)
+        with patch.object(deploy.shutil, "disk_usage", usage(11 * 1024 ** 3)), self.assertRaises(deploy.ReleaseError):
+            release.free_space()
+        with patch.object(deploy.shutil, "disk_usage", side_effect=OSError), self.assertRaises(deploy.ReleaseError):
+            release.free_space()
+        self.assertEqual(deploy.free_space_floor({}), deploy.DEFAULT_FREE_BYTES)
+        for bad in ("5", True, -1, 1.5):
+            with self.subTest(value=bad), self.assertRaises(deploy.ReleaseError):
+                deploy.free_space_floor({"min_free_bytes": bad})
+
+
+PROOF_URL = os.environ.get("RELEASE_GUARDS_TEST_DATABASE_URL", "")
+
+
+@unittest.skipUnless(PROOF_URL, "set RELEASE_GUARDS_TEST_DATABASE_URL to a local, dedicated *_test database (superuser) for the PostgreSQL proof")
+class PostgresSemantics(unittest.TestCase):
+    """Runs the controller's real node programs against a local throwaway database: never production, never a QA database."""
+
+    @classmethod
+    def setUpClass(cls):
+        url = urlsplit(PROOF_URL)
+        if url.hostname not in {"127.0.0.1", "localhost"} or not re.search(r"(^|[_-])test($|[_-])", url.path.strip("/")) or url.query:
+            raise unittest.SkipTest("the proof database must be a local database whose name contains test")
+        cls.root, cls.admin = Path(__file__).resolve().parents[1], PROOF_URL
+        cls.roles = {name: "vg_" + name + "_" + secrets.token_hex(3) for name in ("migrator", "app")}
+        cls.urls, cls.extra_roles = {}, []
+        cls.statement(cls.admin, "DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+        for name, role in cls.roles.items():
+            password = secrets.token_hex(16)
+            cls.node(cls.admin, "const s=(await pool.query(\"SELECT format('CREATE ROLE %I LOGIN PASSWORD %L',$1::text,$2::text) AS s\",[" + json.dumps(role) + "," + json.dumps(password) + "])).rows[0].s;await pool.query(s);console.log('{}');")
+            cls.urls[name] = urlunsplit(url._replace(netloc=role + ":" + password + "@" + url.hostname + ":" + str(url.port or 5432)))
+        cls.statement(cls.admin, "GRANT ALL ON SCHEMA public TO " + cls.roles["migrator"] + "; GRANT USAGE ON SCHEMA public TO " + cls.roles["app"])
+
+    @classmethod
+    def tearDownClass(cls):
+        for role in list(cls.roles.values()) + cls.extra_roles:
+            cls.statement(cls.admin, "DROP OWNED BY " + role + " CASCADE; DROP ROLE " + role)
+        cls.statement(cls.admin, "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public")
+
+    @classmethod
+    def run_node(cls, url, program, stdin=None):
+        env = {**os.environ, "DATABASE_URL": url, "DATABASE_SSL": "disable"}
+        if stdin is None:
+            result = subprocess.run(["node", "--input-type=module"], input=program.encode(), cwd=cls.root, env=env, capture_output=True, timeout=120)
+            if not result.stdout.strip():
+                raise AssertionError("node program produced no output: " + result.stderr.decode(errors="replace")[-400:])
+            return json.loads(result.stdout)
+        proc = subprocess.Popen(["node", "--input-type=module", "-e", program], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cls.root, env=env)
+        first = proc.stdout.readline()
+        proc.communicate(stdin, timeout=60)
+        return json.loads(first)
+
+    @classmethod
+    def node(cls, url, code, allow_error=False):
+        result = cls.run_node(url, deploy.node_program(code).decode())
+        if "error" in result and not allow_error:
+            raise AssertionError("database program failed with code " + str(result["error"]))
+        return result
+
+    @classmethod
+    def statement(cls, url, sql):
+        return cls.node(url, "await pool.query(" + json.dumps(sql) + ");console.log('{}');")
+
+    def migrate(self, number):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ledger_through(number):
+                (Path(directory) / name).write_bytes((MIGRATIONS / name).read_bytes())
+            program = "import {applyMigrations} from './scripts/migrate.js';\nconsole.log(JSON.stringify({files:await applyMigrations({connectionString:process.env.DATABASE_URL,ssl:'disable',directory:" + json.dumps(directory) + "})}));\n"
+            return self.run_node(self.urls["migrator"], program)["files"]
+
+    def snapshot(self, url):
+        record = self.run_node(url, deploy.snapshot_program(), stdin=b"release\n")
+        self.assertRegex(record["snapshot"], r"^[0-9A-Fa-f-]+$")
+        self.assertEqual(sorted(record["manifest"]), sorted(record["tables"]))
+        return record
+
+    def release_as(self, role, via=None):
+        """A Release whose database programs run through `via` (the migrator connection by default), with `role` as the application role."""
+        release = object.__new__(deploy.Release)
+        release.web = {"Config": {"Env": ["DATABASE_URL=postgresql://" + role + "@127.0.0.1:5432/proof"]}}
+        release.images, release.receipt, release.programs = {"migrate": None}, {}, []
+        def node(code, image=None):
+            release.programs.append(code)
+            return self.node(via or self.urls["migrator"], code)
+        release.node = node
+        return release
+
+    def landed_feature_schema(self, app):
+        """With 011-013 applied as on master: every contract table exists, is granted for real, fingerprinted and frozen-checked."""
+        self.assertEqual(self.migrate("013"), [name for name in ledger_through("013") if name[:3] > "010"])
+        record = self.snapshot(self.urls["migrator"])
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(deploy.KNOWN_TABLES), []))
+        release = self.release_as(app)
+        release.ensure_grants()
+        self.assertEqual(set(release.receipt["grants"]["tables"]), set(deploy.GRANTS))
+        self.assertNotIn("absent", release.receipt["grants"]["tables"].values())
+        self.assertEqual(sum("GRANT " in code for code in release.programs), len(deploy.GRANTS) - 2)
+        # The frozen-record queries run as the app role against the landed schema, so every column they name must exist.
+        release = self.release_as(app, via=self.urls["app"])
+        before = release.protected_snapshot()
+        self.assertLessEqual(set(deploy.FROZEN_QUERIES), set(before))
+        self.assertEqual(release.receipt["protected_records"], {table: 0 for table in before})
+        deploy.verify_protected_records(before, release.protected_snapshot())
+
+    def role_contract(self, app, migrator):
+        admin = urlsplit(self.admin).username
+        check = lambda role: self.node(self.urls["migrator"], deploy.role_check_program(role, migrator))
+        self.assertEqual(deploy.verify_app_role(check(app)), {"superuser": False, "createdb": False, "createrole": False, "bypassrls": False, "replication": False,
+                                                              "owned_objects": 0, "database_owner": False, "migrator_member": False, "predefined": [],
+                                                              "settable_powers": [], "admin_memberships": [], "memberships": []})
+        self.assertGreater(check(migrator)["owned_objects"], 0)
+        self.assertTrue(check(admin)["superuser"])
+        for role in (migrator, admin):
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.verify_app_role(check(role))
+        self.assertEqual(check("vg_missing_" + secrets.token_hex(3)), {"exists": False})
+        for flag, on, off in (("createdb", "CREATEDB", "NOCREATEDB"), ("createrole", "CREATEROLE", "NOCREATEROLE"), ("bypassrls", "BYPASSRLS", "NOBYPASSRLS")):
+            self.statement(self.admin, "ALTER ROLE " + app + " " + on)
+            state = check(app)
+            self.assertTrue(state[flag], flag)
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.verify_app_role(state)
+            self.statement(self.admin, "ALTER ROLE " + app + " " + off)
+        # Membership in the owning role: inherited, SET-only, or bare membership all fail the role contract; the first
+        # two also make the member an effective owner of every contract table.
+        for membership, acts_as_owner in (("", True), (" WITH INHERIT FALSE, SET TRUE", True), (" WITH INHERIT FALSE, SET FALSE", False)):
+            self.statement(self.admin, "GRANT " + migrator + " TO " + app + membership)
+            state = check(app)
+            self.assertEqual((state["migrator_member"], state["owned_objects"] > 0), (True, acts_as_owner), membership)
+            self.assertEqual(self.node(self.urls["migrator"], deploy.grant_check_program(app, "annotations"))["owner"], acts_as_owner, membership)
+            with self.assertRaises(deploy.ReleaseError):
+                deploy.verify_app_role(state)
+            self.statement(self.admin, "REVOKE " + migrator + " FROM " + app)
+        self.assertTrue(check(app)["predefined"] == [] and not check(app)["migrator_member"])
+        self.statement(self.admin, "GRANT pg_write_all_data TO " + app)
+        self.assertEqual(check(app)["predefined"], ["pg_write_all_data"])
+        self.statement(self.admin, "REVOKE pg_write_all_data FROM " + app)
+        # Custom groups: attributes are never inherited, but SET ROLE (direct or through a chain) makes them usable.
+        tag = secrets.token_hex(3)
+        powers, hop, plain = "vg_powers_" + tag, "vg_hop_" + tag, "vg_plain_" + tag
+        self.extra_roles.extend([powers, hop, plain])
+        self.statement(self.admin, "CREATE ROLE " + powers + " NOLOGIN CREATEDB CREATEROLE; CREATE ROLE " + hop + " NOLOGIN; CREATE ROLE " + plain + " NOLOGIN")
+        assume = lambda: self.node(self.urls["app"], "await pool.query('SET ROLE " + powers + "');console.log(JSON.stringify((await pool.query('SELECT rolcreatedb AND rolcreaterole AS p FROM pg_roles WHERE rolname=current_user')).rows[0]));", allow_error=True)
+        create_database = lambda: self.node(self.urls["app"], "await pool.query('CREATE DATABASE vg_never_" + tag + "');console.log('{}');", allow_error=True)
+        cases = (("direct, non-inheriting, SET-capable (the review's case)", "GRANT " + powers + " TO " + app + " WITH INHERIT FALSE, SET TRUE", [powers], {"p": True}),
+                 ("indirect through a powerless group", "GRANT " + powers + " TO " + hop + "; GRANT " + hop + " TO " + app, [powers], {"p": True}),
+                 ("inheriting but SET-disabled", "GRANT " + powers + " TO " + app + " WITH INHERIT TRUE, SET FALSE", [], {"error": "42501"}),
+                 ("chain broken by SET FALSE", "GRANT " + powers + " TO " + hop + "; GRANT " + hop + " TO " + app + " WITH SET FALSE", [], {"error": "42501"}),
+                 ("powerless group", "GRANT " + plain + " TO " + app, [], {"error": "42501"}))
+        for name, grant, expected, assumed in cases:
+            self.statement(self.admin, grant)
+            state = check(app)
+            self.assertEqual((state["settable_powers"], state["createdb"], state["owned_objects"]), (expected, False, 0), name)
+            self.assertEqual(assume(), assumed, name)
+            self.assertEqual(create_database(), {"error": "42501"}, name)
+            if expected:
+                with self.assertRaises(deploy.ReleaseError):
+                    deploy.verify_app_role(state)
+            else:
+                self.assertEqual(deploy.verify_app_role(state)["settable_powers"], [], name)
+            self.statement(self.admin, "REVOKE " + powers + " FROM " + app + ", " + hop + "; REVOKE " + hop + " FROM " + app + "; REVOKE " + plain + " FROM " + app)
+        # An ADMIN option on any group lets the app enrol other roles into it, so it is refused even on a powerless group.
+        self.statement(self.admin, "GRANT " + plain + " TO " + app + " WITH ADMIN TRUE, INHERIT FALSE, SET FALSE")
+        state = check(app)
+        self.assertEqual((state["admin_memberships"], state["settable_powers"], state["memberships"]), ([{"identity": app, "granted": plain}], [], [plain]))
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_app_role(state)
+        self.assertEqual(self.node(self.urls["app"], "await pool.query('GRANT " + plain + " TO " + migrator + "');console.log('{}');", allow_error=True), {})
+        # That grant depends on the app's ADMIN membership, so the grantor undoes it first; then the membership itself goes.
+        self.statement(self.urls["app"], "REVOKE " + plain + " FROM " + migrator)
+        self.statement(self.admin, "REVOKE " + plain + " FROM " + app)
+        self.assertEqual(check(app)["memberships"], [])
+        # The capability graph from independent review 4: the app can SET to a powerless hop that administers the powerful
+        # group over a SET-disabled edge. Nothing is visible on the app itself, yet it can wire its own path to the powers.
+        self.statement(self.admin, "GRANT " + powers + " TO " + hop + " WITH ADMIN TRUE, INHERIT FALSE, SET FALSE; GRANT " + hop + " TO " + app + " WITH INHERIT FALSE, SET TRUE")
+        state = check(app)
+        self.assertEqual((state["settable_powers"], state["admin_memberships"], state["memberships"], state["createdb"]), ([], [{"identity": hop, "granted": powers}], [hop], False), "two-hop admin")
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_app_role(state)
+        escalate = ("await pool.query('SET ROLE " + hop + "');await pool.query('GRANT " + powers + " TO " + app + " WITH SET TRUE');await pool.query('RESET ROLE');"
+                    "await pool.query('SET ROLE " + powers + "');console.log(JSON.stringify((await pool.query('SELECT rolcreatedb AND rolcreaterole AS p FROM pg_roles WHERE rolname=current_user')).rows[0]));")
+        self.assertEqual(self.node(self.urls["app"], escalate, allow_error=True), {"p": True}, "the escalation the review described")
+        self.assertEqual(check(app)["settable_powers"], [powers])
+        self.statement(self.urls["app"], "SET ROLE " + hop + "; REVOKE " + powers + " FROM " + app)
+        self.statement(self.admin, "REVOKE " + hop + " FROM " + app)
+        # Inherited ADMIN: with the hop only inherited (SET FALSE) the app can still exercise the hop's ADMIN without SET ROLE,
+        # which is why reachability through USAGE is refused as well.
+        self.statement(self.admin, "GRANT " + hop + " TO " + app + " WITH INHERIT TRUE, SET FALSE")
+        state = check(app)
+        self.assertEqual((state["settable_powers"], state["admin_memberships"]), ([], [{"identity": hop, "granted": powers}]), "inherited admin")
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_app_role(state)
+        self.assertEqual(self.node(self.urls["app"], "await pool.query('GRANT " + powers + " TO " + app + " WITH SET TRUE');console.log('{}');", allow_error=True), {})
+        self.assertEqual(check(app)["settable_powers"], [powers])
+        self.statement(self.admin, "REVOKE " + powers + " FROM " + app + " GRANTED BY " + hop + "; REVOKE " + hop + " FROM " + app + "; REVOKE " + powers + " FROM " + hop)
+        # Control: the same SET-disabled hop without any ADMIN option is a harmless membership and stays allowed.
+        self.statement(self.admin, "GRANT " + hop + " TO " + app + " WITH INHERIT TRUE, SET FALSE")
+        state = check(app)
+        self.assertEqual((state["settable_powers"], state["admin_memberships"], deploy.verify_app_role(state)["memberships"]), ([], [], [hop]), "no-admin control")
+        self.statement(self.admin, "REVOKE " + hop + " FROM " + app)
+        # ADMIN on a powerless group held by a reachable hop is refused too: membership mutation itself breaks the contract.
+        self.statement(self.admin, "GRANT " + plain + " TO " + hop + " WITH ADMIN TRUE, INHERIT FALSE, SET FALSE; GRANT " + hop + " TO " + app + " WITH INHERIT FALSE, SET TRUE")
+        state = check(app)
+        self.assertEqual(state["admin_memberships"], [{"identity": hop, "granted": plain}], "powerless admin through a hop")
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_app_role(state)
+        self.statement(self.admin, "REVOKE " + hop + " FROM " + app + "; REVOKE " + plain + " FROM " + hop)
+        state = check(app)
+        self.assertEqual((state["memberships"], state["admin_memberships"], state["settable_powers"]), ([], [], []))
+        # The review's bypass: the owner trims its own ACL to exactly the contract and looks compliant on ACL alone.
+        self.statement(self.urls["migrator"], "REVOKE ALL ON annotations FROM " + migrator + "; GRANT SELECT,INSERT,UPDATE,DELETE ON annotations TO " + migrator)
+        state = self.node(self.urls["migrator"], deploy.grant_check_program(migrator, "annotations"))
+        self.assertEqual((state["owner"], deploy.privilege_gap(state["rows"], deploy.ROW_PRIVILEGES)), (True, ([], [])))
+        for role in (migrator, admin):
+            release = self.release_as(role)
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("can act as owner", str(failure.exception))
+            self.assertFalse(any("GRANT " in code for code in release.programs))
+        # The plain app role passes the real ensure_grants: annotations already exact, issue_notes granted now, feature tables absent.
+        release = self.release_as(app)
+        release.ensure_grants()
+        self.assertEqual(release.receipt["grants"]["tables"]["annotations"], list(deploy.ROW_PRIVILEGES))
+        self.assertEqual(release.receipt["grants"]["tables"]["issue_notes"], list(deploy.ROW_PRIVILEGES))
+        self.assertEqual(release.receipt["grants"]["tables"]["devices"], "absent")
+        self.assertEqual(sum("GRANT " in code for code in release.programs), 1)
+        self.assertIn("GRANT DELETE,INSERT,SELECT,UPDATE ON TABLE issue_notes TO", [code for code in release.programs if "GRANT " in code][0])
+
+    def test_ledger_presence_fingerprints_and_privileges_against_a_real_database(self):
+        app, migrator = self.roles["app"], self.roles["migrator"]
+        self.assertEqual(self.migrate("006"), ledger_through("006"))
+        self.statement(self.admin, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO " + app)
+        record = self.snapshot(self.urls["app"])
+        verified, absent = deploy.verify_tables(record["ledger"], record["tables"])
+        self.assertEqual((verified, record["ledger"]), (sorted(tables_through("006")), ledger_through("006")))
+        self.assertIn("annotations", absent)
+        self.assertEqual(self.migrate("010"), ledger_through("010")[6:])
+        record = self.snapshot(self.urls["migrator"])
+        self.assertIn("annotations", deploy.verify_tables(record["ledger"], record["tables"])[0])
+        self.statement(self.urls["migrator"], "CREATE TABLE devices (id int)")
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.verify_tables(record["ledger"], self.snapshot(self.urls["migrator"])["tables"])
+        self.statement(self.urls["migrator"], "DROP TABLE devices")
+        # Grants: the migrator owns annotations; the app role starts with nothing and gets exactly the contract.
+        state = self.node(self.urls["migrator"], deploy.grant_check_program(app, "annotations"))
+        self.assertEqual((state["present"], state["owner"], state["superuser"], state["sequences"]), (True, False, False, []))
+        self.assertEqual(sorted(row["privilege"] for row in state["rows"]), sorted(ALL_PRIVILEGES))
+        self.assertEqual(deploy.privilege_gap(state["rows"], deploy.ROW_PRIVILEGES), (sorted(deploy.ROW_PRIVILEGES), []))
+        self.node(self.urls["migrator"], deploy.grant_program(app, "annotations", deploy.ROW_PRIVILEGES))
+        state = self.node(self.urls["migrator"], deploy.grant_check_program(app, "annotations"))
+        self.assertEqual(deploy.privilege_gap(state["rows"], deploy.ROW_PRIVILEGES), ([], []))
+        for extra in ("TRUNCATE", "TRIGGER", "REFERENCES", "MAINTAIN"):
+            self.statement(self.admin, "GRANT " + extra + " ON annotations TO " + app)
+            state = self.node(self.urls["migrator"], deploy.grant_check_program(app, "annotations"))
+            self.assertEqual(deploy.privilege_gap(state["rows"], deploy.ROW_PRIVILEGES), ([], [extra]), extra)
+            self.statement(self.admin, "REVOKE " + extra + " ON annotations FROM " + app)
+        # Ownership and superuser status are effective privileges too.
+        state = self.node(self.urls["migrator"], deploy.grant_check_program(migrator, "annotations"))
+        self.assertEqual((state["owner"], state["superuser"]), (True, False))
+        self.assertEqual(deploy.privilege_gap(state["rows"], deploy.ROW_PRIVILEGES)[1], ["MAINTAIN", "REFERENCES", "TRIGGER", "TRUNCATE"])
+        self.assertTrue(self.node(self.urls["migrator"], deploy.grant_check_program(urlsplit(self.admin).username, "annotations"))["superuser"])
+        self.assertEqual(self.node(self.urls["migrator"], deploy.grant_check_program(app, "audit_events"))["sequences"], [{"name": "audit_events_id_seq"}])
+        self.assertEqual(self.node(self.urls["migrator"], deploy.grant_check_program(app, "devices")), {"present": False})
+        # A row lock needs UPDATE, which is why the contract carries UPDATE for every table the store locks.
+        self.assertEqual(self.node(self.urls["app"], "await pool.query('SELECT 1 FROM projects FOR UPDATE');console.log('{}');", allow_error=True), {"error": "42501"})
+        self.statement(self.admin, "GRANT UPDATE ON projects TO " + app)
+        self.assertEqual(self.node(self.urls["app"], "await pool.query('SELECT 1 FROM projects FOR UPDATE');console.log('{}');"), {})
+        self.role_contract(app, migrator)
+        self.landed_feature_schema(app)
 
 
 if __name__ == "__main__":

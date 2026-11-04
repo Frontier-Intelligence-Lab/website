@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { capitalSnapshot, emptyDraft } from '../src/lib/capital.js';
+import { snapshotHash } from '../src/lib/capital-hash.js';
 
 // Shared behaviour every store must have. tests/store-memory.test.js runs it against the
 // in-memory store; the Postgres store runs the same suite against a real database.
@@ -428,6 +430,209 @@ export function runStoreContract(test, makeStore, label) {
       await store.updateProject({ ...where, patch: { success: { measure: 'data_quality', target: null, criteria: 'Every image has a box for each tear' } } });
       assert.equal((await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true })).status, 'pending', `${dataSource.mode}: once complete`);
     }
+  });
+
+  withStore('model pulls are one per workspace and model; enhance runs freeze once requested', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: owner.id });
+    // The store records any well-formed model id; whether it is in the catalog is the route's concern.
+    const first = await store.requestModelPull({ workspaceId: ws.id, modelId: 'example-base', requestedBy: owner.id });
+    assert.equal(first.status, 'requested');
+    assert.equal((await store.requestModelPull({ workspaceId: ws.id, modelId: 'example-base', requestedBy: owner.id })).id, first.id);
+    assert.equal((await store.listModelPulls(ws.id)).length, 1);
+    assert.equal((await store.listModelPulls(other.id)).length, 0);
+
+    const plan = { name: 'returns-assistant', baseModelId: 'example-base', datasets: [], steps: ['sft'], compute: null, spendCapUsd: null };
+    const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: plan });
+    assert.equal(run.status, 'draft');
+    assert.equal(await store.getEnhanceRun({ workspaceId: other.id, runId: run.id }), null, 'scoped to its workspace');
+    await assert.rejects(store.updateEnhanceRun({ workspaceId: other.id, runId: run.id, run: plan }), { code: 'not_found' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: run.updatedAt }), { code: 'invalid_state' }, 'an incomplete plan cannot be requested');
+    const complete = { ...plan, datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft', 'grpo'], compute: 'nebius', spendCapUsd: 250 };
+    const reviewed = await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: complete });
+    assert.deepEqual(reviewed.steps, ['sft', 'grpo']);
+    // Someone raises the cap after the approver opened the plan: approving the old version must fail, not freeze the new cap.
+    const raised = await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: { ...complete, spendCapUsd: 9000 } });
+    assert.notEqual(raised.updatedAt, reviewed.updatedAt, 'every edit is a new version');
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: reviewed.updatedAt }), { code: 'stale_plan' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id }), { code: 'stale_plan' }, 'an approval must name the version it approves');
+    assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).status, 'draft');
+    const current = await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: complete });
+    const requested = await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: current.updatedAt });
+    assert.equal(requested.status, 'requested');
+    assert.equal(requested.requestedBy, owner.id);
+    assert.ok(requested.requestedAt);
+    await assert.rejects(store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: { ...complete, spendCapUsd: 9999 } }), { code: 'invalid_state' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: requested.updatedAt }), { code: 'invalid_state' });
+    assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).spendCapUsd, 250);
+    assert.equal((await store.listEnhanceRuns(ws.id)).length, 1);
+    assert.ok((await store.listAudit(ws.id)).some((e) => e.action === 'enhance_run.requested'));
+  });
+
+  withStore('devices belong to one person in one workspace; revoked devices accept no new records', async (store) => {
+    const alice = await store.createUser({ email: 'a@acme.com', name: 'A', passwordHash: 'h' });
+    const bob = await store.createUser({ email: 'b@acme.com', name: 'B', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: alice.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: alice.id });
+    const device = await store.createDevice({ workspaceId: ws.id, ownerId: alice.id, label: 'Work laptop' });
+    const mine = { workspaceId: ws.id, ownerId: alice.id, deviceId: device.id };
+    assert.equal(device.status, 'active');
+    assert.equal(device.latestReport, null);
+    // Another person, or the same person in another workspace, cannot see or use it.
+    for (const where of [{ ...mine, ownerId: bob.id }, { ...mine, workspaceId: other.id }]) {
+      assert.equal(await store.getDevice(where), null);
+      assert.deepEqual(await store.listModelInstalls(where), []);
+      assert.deepEqual(await store.listExecutionRuns(where), []);
+      await assert.rejects(store.recordDeviceReport({ ...where, report: { reachable: false, runtimeVersion: null, models: [], running: [], browser: {} } }), { code: 'not_found' });
+      await assert.rejects(store.revokeDevice(where), { code: 'not_found' });
+    }
+    assert.deepEqual(await store.listDevices({ workspaceId: ws.id, ownerId: bob.id }), []);
+
+    const report = await store.recordDeviceReport({ ...mine, report: { reachable: true, runtimeVersion: '0.40.13', models: [{ name: 'demo-chat:0.6b', digest: 'a'.repeat(64), sizeBytes: 522653767 }], running: [], browser: { hardwareConcurrency: 16 } } });
+    assert.equal(report.provenance, 'client_reported');
+    const listed = (await store.listDevices({ workspaceId: ws.id, ownerId: alice.id }))[0];
+    assert.equal(listed.latestReport.runtimeVersion, '0.40.13');
+    assert.equal(listed.lastSeenAt, report.createdAt);
+
+    const install = { runtimeRef: 'demo-chat:0.6b', catalogId: 'demo-chat-0.6b', digest: 'a'.repeat(64), sizeBytes: 522653767, details: { family: 'demo' }, failure: null };
+    const installed = await store.saveModelInstall({ ...mine, install: { ...install, state: 'installed' } });
+    assert.equal(installed.verifiedAt, null);
+    const verified = await store.saveModelInstall({ ...mine, install: { ...install, state: 'verified' } });
+    assert.equal(verified.id, installed.id, 'one row per model reference on a device');
+    assert.ok(verified.verifiedAt);
+    assert.equal((await store.saveModelInstall({ ...mine, install: { ...install, state: 'ready' } })).verifiedAt, verified.verifiedAt, 'the same digest keeps its verification');
+    const removed = await store.saveModelInstall({ ...mine, install: { ...install, state: 'removed' } });
+    assert.equal(removed.verifiedAt, null);
+    const actions = (await store.listAudit(ws.id)).map((e) => e.action);
+    for (const a of ['device.registered', 'model_install.installed', 'model_install.verified', 'model_install.ready', 'model_install.removed']) assert.ok(actions.includes(a), a);
+
+    const run = { installId: installed.id, modelRef: 'demo-chat:0.6b', modelDigest: 'a'.repeat(64), location: 'local_runtime', kind: 'compat_test', warm: false, status: 'completed', failure: null, settings: { numCtx: 2048 }, metrics: { wallMs: 812, outputTokens: 3, evalMs: 40 }, task: { id: 'arithmetic', passed: true }, promptSha256: null };
+    const recorded = await store.recordExecutionRun({ ...mine, run });
+    assert.equal(recorded.provenance, 'client_reported');
+    assert.deepEqual(recorded.task, { id: 'arithmetic', passed: true });
+    const foreign = await store.createDevice({ workspaceId: ws.id, ownerId: bob.id, label: 'Bob' });
+    const bobInstall = await store.saveModelInstall({ workspaceId: ws.id, ownerId: bob.id, deviceId: foreign.id, install: { ...install, state: 'installed' } });
+    await assert.rejects(store.recordExecutionRun({ ...mine, run: { ...run, installId: bobInstall.id } }), { code: 'not_found' }, 'a run cannot cite another device’s install');
+    assert.equal((await store.listExecutionRuns(mine)).length, 1);
+
+    const revoked = await store.revokeDevice(mine);
+    assert.equal(revoked.status, 'revoked');
+    assert.ok(revoked.revokedAt);
+    await assert.rejects(store.revokeDevice(mine), { code: 'invalid_state' });
+    await assert.rejects(store.recordExecutionRun({ ...mine, run }), { code: 'invalid_state' });
+    await assert.rejects(store.saveModelInstall({ ...mine, install: { ...install, state: 'installed' } }), { code: 'invalid_state' });
+    assert.equal((await store.listExecutionRuns(mine)).length, 1, 'history is kept after revocation');
+  });
+
+  withStore('capital cases: revisioned drafts, idempotent submission, frozen revisions, append-only credits, scoped evidence', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: owner.id });
+    const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Chats', task: 'Answer', modalities: ['Text'], startingPoint: 'own' });
+    const foreign = await store.createProject({ workspaceId: other.id, createdBy: owner.id, name: 'Theirs', task: 'Answer', modalities: ['Text'], startingPoint: 'own' });
+    await assert.rejects(store.createCapitalCase({ workspaceId: ws.id, createdBy: owner.id, title: 'Pilot', projectId: foreign.id, draft: emptyDraft() }), { code: 'not_found' }, 'a project of another workspace cannot be linked');
+    const kase = await store.createCapitalCase({ workspaceId: ws.id, createdBy: owner.id, title: 'Pilot', projectId: project.id, draft: emptyDraft() });
+    assert.deepEqual([kase.status, kase.revision, kase.submittedRevision, kase.projectId], ['draft', 1, null, project.id]);
+    const mine = { workspaceId: ws.id, caseId: kase.id };
+    assert.equal(await store.getCapitalCase({ workspaceId: other.id, caseId: kase.id }), null, 'scoped to its workspace');
+    await assert.rejects(store.updateCapitalCase({ workspaceId: other.id, caseId: kase.id, expectedRevision: 1, title: 'x', draft: emptyDraft() }), { code: 'not_found' });
+    await assert.rejects(store.updateCapitalCase({ ...mine, expectedRevision: 2, title: 'x', draft: emptyDraft() }), { code: 'stale_revision' });
+    const item = { id: 'ci_1', category: 'compute', label: 'GPU hours', amountCents: 250000, period: 'one_time', basis: 'estimated', source: 'Price list', observedAt: '2026-11-01', evidenceId: null };
+    const complete = { ...emptyDraft(), purpose: 'Pilot', requestedAmountCents: 5000000, costItems: [item] };
+    // The hash of exactly what sending would freeze, computed from the same reads a route makes.
+    const hashNow = async () => snapshotHash(capitalSnapshot(await store.getCapitalCase(mine), await store.listCreditRecords(ws.id), await store.listCapitalEvidence(mine)));
+    const edited = await store.updateCapitalCase({ ...mine, expectedRevision: 1, title: 'Pilot', projectId: project.id, draft: { ...emptyDraft(), costItems: [item] } });
+    assert.equal(edited.revision, 2);
+    await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash: await hashNow() }), { code: 'invalid_state' }, 'an incomplete draft cannot be sent');
+    assert.equal((await store.updateCapitalCase({ ...mine, expectedRevision: 2, title: 'Pilot', projectId: project.id, draft: complete })).revision, 3);
+    // References are checked on the locked row: an incurred item must cite evidence that exists, a link a version that exists.
+    const dangling = { ...complete, costItems: [{ ...item, basis: 'incurred', evidenceId: '00000000-0000-4000-8000-000000000000' }] };
+    await assert.rejects(store.updateCapitalCase({ ...mine, expectedRevision: 3, title: 'Pilot', projectId: project.id, draft: dangling }), { code: 'missing_reference' });
+    await assert.rejects(store.updateCapitalCase({ ...mine, expectedRevision: 3, title: 'Pilot', projectId: project.id, draft: { ...complete, datasetVersions: [{ projectId: project.id, version: 9 }] } }), { code: 'missing_reference' });
+    assert.equal((await store.getCapitalCase(mine)).revision, 3, 'a refused save changes nothing');
+    const credit = await store.createCreditRecord({ workspaceId: ws.id, createdBy: owner.id, record: { provider: 'Cloud', status: 'claimed', amountCents: 1000000, expiresOn: '2027-06-30', restrictions: 'Compute only', reference: '' } });
+    const evidence = await store.addCapitalEvidence({ ...mine, createdBy: owner.id, item: { kind: 'company_record', title: 'Statement', source: 'Held by the company', reference: {}, verification: 'unverified' } });
+    assert.deepEqual(await store.listCapitalEvidence({ workspaceId: other.id, caseId: kase.id }), []);
+    await assert.rejects(store.deleteCapitalEvidence({ workspaceId: other.id, caseId: kase.id, evidenceId: evidence.id }), { code: 'not_found' });
+    const cited = { ...complete, costItems: [item, { ...item, id: 'ci_2', basis: 'incurred', amountCents: 5, evidenceId: evidence.id }] };
+    assert.equal((await store.updateCapitalCase({ ...mine, expectedRevision: 3, title: 'Pilot', projectId: project.id, draft: cited })).revision, 4);
+    await assert.rejects(store.deleteCapitalEvidence({ ...mine, evidenceId: evidence.id }), { code: 'evidence_in_use' }, 'a cited record cannot be removed from under the plan');
+    assert.equal((await store.updateCapitalCase({ ...mine, expectedRevision: 4, title: 'Pilot', projectId: project.id, draft: complete })).revision, 5);
+
+    // Consent binds the revision and the content: a hash of anything else is stale, even for the right revision.
+    const consented = await hashNow();
+    await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 4, contentHash: consented }), { code: 'stale_revision' });
+    await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 5, contentHash: 'f'.repeat(64) }), (err) => err.code === 'stale_revision' && err.message === 'content');
+    await store.createCreditRecord({ workspaceId: ws.id, createdBy: owner.id, record: { provider: 'Other', status: 'claimed', amountCents: 1, expiresOn: null, restrictions: '', reference: '' } });
+    await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 5, contentHash: consented }), (err) => err.code === 'stale_revision' && err.message === 'content', 'a credit record added since the owner looked makes the send stale');
+    assert.equal((await store.listCapitalSubmissions(mine)).length, 0, 'nothing was sent');
+    const fresh = await hashNow();
+    const sub = await store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 5, contentHash: fresh });
+    assert.deepEqual([sub.revision, sub.decision, sub.caseId, sub.contentHash], [5, null, kase.id, fresh]);
+    assert.equal(sub.snapshot.draft.requestedAmountCents, 5000000);
+    assert.deepEqual(sub.snapshot.totals.estimated, { one_time: 250000, monthly: 0, annual: 0 });
+    assert.equal(sub.snapshot.credits.length, 2);
+    assert.deepEqual(sub.snapshot.evidence.map((e) => e.id), [evidence.id]);
+    assert.equal(snapshotHash(sub.snapshot), fresh, 'the frozen snapshot is exactly the consented content');
+    const submitted = await store.getCapitalCase(mine);
+    assert.deepEqual([submitted.status, submitted.submittedRevision], ['submitted', 5]);
+    assert.equal((await store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 5, contentHash: fresh })).id, sub.id, 'a retry returns the same submission');
+    await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 5, contentHash: consented }), { code: 'stale_revision' }, 'a retry with other content is not a retry');
+    assert.equal((await store.listCapitalSubmissions(mine)).length, 1);
+    assert.deepEqual(await store.listCapitalSubmissions({ workspaceId: other.id, caseId: kase.id }), []);
+    await assert.rejects(store.updateCapitalCase({ ...mine, expectedRevision: 5, title: 'x', draft: complete }), { code: 'invalid_state' });
+    await assert.rejects(store.addCapitalEvidence({ ...mine, createdBy: owner.id, item: { kind: 'company_record', title: 'Late', source: 'x', reference: {}, verification: 'unverified' } }), { code: 'invalid_state' });
+    await assert.rejects(store.deleteCapitalEvidence({ ...mine, evidenceId: evidence.id }), { code: 'invalid_state' });
+
+    // Staff see the frozen submission only, and act on the one they name.
+    const queued = await store.listCapitalCasesForReview({ status: 'submitted' });
+    assert.equal(queued.length, 1);
+    assert.deepEqual([queued[0].title, queued[0].draft, queued[0].latestSubmission.id], [undefined, undefined, sub.id]);
+    const found = await store.getCapitalCaseForReview(kase.id);
+    assert.equal(found.workspace.name, 'Acme');
+    assert.equal(found.submission.id, sub.id);
+    assert.deepEqual([found.case.title, found.case.draft, found.evidence, found.credits, found.marks], [undefined, undefined, undefined, undefined, []]);
+    await assert.rejects(store.decideCapitalSubmission({ caseId: kase.id, submissionId: sub.id, reviewerId: owner.id, decision: 'approved' }), { code: 'invalid_state' }, 'there is no approval');
+    await assert.rejects(store.decideCapitalSubmission({ caseId: kase.id, submissionId: kase.id, reviewerId: owner.id, decision: 'changes_requested', notes: 'x' }), { code: 'stale_revision' }, 'a decision names the submission seen');
+    await assert.rejects(store.markCapitalEvidenceReviewed({ caseId: kase.id, submissionId: kase.id, evidenceId: evidence.id, reviewerId: owner.id }), { code: 'stale_revision' });
+    await assert.rejects(store.markCapitalEvidenceReviewed({ caseId: kase.id, submissionId: sub.id, evidenceId: credit.id, reviewerId: owner.id }), { code: 'not_found' }, 'only evidence frozen in that submission can be marked');
+    const mark = await store.markCapitalEvidenceReviewed({ caseId: kase.id, submissionId: sub.id, evidenceId: evidence.id, reviewerId: owner.id });
+    assert.deepEqual([mark.submissionId, mark.evidenceId, mark.reviewerId], [sub.id, evidence.id, owner.id]);
+    assert.equal((await store.markCapitalEvidenceReviewed({ caseId: kase.id, submissionId: sub.id, evidenceId: evidence.id, reviewerId: owner.id })).id, mark.id, 'one mark per record and submission');
+    assert.deepEqual((await store.listCapitalReviewMarks(mine)).map((m) => m.id), [mark.id]);
+    assert.deepEqual(await store.listCapitalReviewMarks({ workspaceId: other.id, caseId: kase.id }), []);
+    assert.equal((await store.listCapitalEvidence(mine))[0].verification, 'unverified', 'the customer’s record is not edited by a mark');
+    const decided = await store.decideCapitalSubmission({ caseId: kase.id, submissionId: sub.id, reviewerId: owner.id, decision: 'changes_requested', notes: 'Add a quote.' });
+    assert.deepEqual([decided.decision, decided.notes, decided.decidedBy], ['changes_requested', 'Add a quote.', owner.id]);
+    assert.equal((await store.getCapitalCase(mine)).status, 'changes_requested');
+    await assert.rejects(store.decideCapitalSubmission({ caseId: kase.id, submissionId: sub.id, reviewerId: owner.id, decision: 'evidence_reviewed' }), { code: 'invalid_state' });
+    await assert.rejects(store.markCapitalEvidenceReviewed({ caseId: kase.id, submissionId: sub.id, evidenceId: evidence.id, reviewerId: owner.id }), { code: 'invalid_state' });
+    await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 5, contentHash: fresh }), { code: 'invalid_state' }, 'the same revision is sent once');
+    assert.equal((await store.updateCapitalCase({ ...mine, expectedRevision: 5, title: 'Pilot', projectId: project.id, draft: complete })).revision, 6);
+    const second = await store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 6, contentHash: await hashNow() });
+    assert.equal(second.revision, 6);
+    assert.deepEqual((await store.getCapitalCaseForReview(kase.id)).marks, [], 'marks stay with the submission they were made on');
+    await assert.rejects(store.withdrawCapitalCase({ workspaceId: other.id, caseId: kase.id, actorId: owner.id }), { code: 'not_found' });
+    const withdrawn = await store.withdrawCapitalCase({ ...mine, actorId: owner.id });
+    assert.deepEqual([withdrawn.status, withdrawn.revision, withdrawn.submittedRevision], ['draft', 7, 6]);
+    assert.deepEqual((await store.listCapitalSubmissions(mine)).map((s) => s.decision), ['changes_requested', 'withdrawn']);
+    await assert.rejects(store.withdrawCapitalCase({ ...mine, actorId: owner.id }), { code: 'invalid_state' });
+    await assert.rejects(store.decideCapitalSubmission({ caseId: kase.id, submissionId: second.id, reviewerId: owner.id, decision: 'evidence_reviewed' }), { code: 'invalid_state' }, 'a withdrawn submission is decided by nobody');
+    assert.equal((await store.listCapitalCasesForReview({ status: 'submitted' })).length, 0);
+    assert.equal((await store.deleteCapitalEvidence({ ...mine, evidenceId: evidence.id })).id, evidence.id);
+
+    const corrected = await store.createCreditRecord({ workspaceId: ws.id, createdBy: owner.id, record: { provider: 'Cloud', status: 'evidenced', amountCents: 900000, expiresOn: null, restrictions: '', reference: 'CONF-1' }, supersedes: credit.id });
+    assert.equal(corrected.supersedes, credit.id);
+    await assert.rejects(store.createCreditRecord({ workspaceId: ws.id, createdBy: owner.id, record: { provider: 'Cloud', status: 'withdrawn', amountCents: 0, expiresOn: null, restrictions: '', reference: '' }, supersedes: credit.id }), { code: 'invalid_state' }, 'one correction per record');
+    await assert.rejects(store.createCreditRecord({ workspaceId: other.id, createdBy: owner.id, record: { provider: 'Cloud', status: 'claimed', amountCents: 1, expiresOn: null, restrictions: '', reference: '' }, supersedes: credit.id }), { code: 'not_found' });
+    const credits = await store.listCreditRecords(ws.id);
+    assert.deepEqual(credits.map((c) => [c.amountCents, c.supersededBy]), [[1000000, corrected.id], [1, null], [900000, null]]);
+    assert.equal(credits[0].expiresOn, '2027-06-30');
+    assert.deepEqual(await store.listCreditRecords(other.id), []);
+    assert.equal((await store.listCapitalSubmissions(mine))[0].snapshot.credits.find((c) => c.id === credit.id).amountCents, 1000000, 'a frozen snapshot keeps the record as it was');
+    const actions = (await store.listAudit(ws.id)).map((e) => e.action);
+    for (const a of ['capital_case.created', 'capital.submitted', 'capital.changes_requested', 'capital.evidence_item_reviewed', 'capital.withdrawn', 'credit_record.created', 'credit_record.corrected']) assert.ok(actions.includes(a), a);
   });
 
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {

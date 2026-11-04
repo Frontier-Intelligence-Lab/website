@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import hashlib
 import http.client
 import json
 import os
@@ -24,10 +25,50 @@ from contextlib import contextmanager
 
 REPOSITORY = "Frontier-Intelligence-Lab/website"
 REQUIRED_JOBS = {"Web / no database", "Web / PostgreSQL 17", "Ingest / Rust 1.99.1"}
-TABLES = ("users", "email_codes", "workspaces", "memberships", "invitations",
-          "join_requests", "projects", "audit_events", "uploads", "reviews",
-          "dataset_versions", "sessions", "reviewer_accounts", "annotations",
-          "issue_notes", "schema_migrations")
+# Tables grouped by the numbered migration that creates them: 001-010 as in migrations/, 011-013 as in the
+# reviewed Models, Device and (still provisional) Capital branches. The migration ledger decides which groups
+# must exist: a listed migration requires its whole group, an unlisted one forbids it. 003, 005 and 008-010
+# add no tables. The ledger table itself comes from the migrator, and 006 is the baseline the preflight needs.
+TABLE_GROUPS = {
+    "001": ("users", "email_codes", "workspaces", "memberships", "invitations", "join_requests", "projects", "audit_events"),
+    "002": ("sessions",),
+    "004": ("uploads", "reviews", "dataset_versions"),
+    "006": ("reviewer_accounts",),
+    "007": ("annotations", "issue_notes"),
+    "011": ("model_pulls", "enhance_runs"),
+    "012": ("devices", "device_reports", "model_installs", "execution_runs"),
+    "013": ("capital_cases", "capital_submissions", "credit_records", "capital_evidence", "capital_review_marks"),
+}
+LEDGER_TABLE, BASELINE = "schema_migrations", "006"
+KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
+# Every PostgreSQL table privilege (17 adds MAINTAIN, queried when the server is 17 or newer). Anything the
+# application role holds beyond its contract, through a grant, role membership or ownership, stops the release.
+TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+ROW_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
+# Exactly the statements the application store issues per table (row locks need UPDATE). Append-only and
+# frozen records never get DELETE; new tables use uuid defaults, so no sequence is part of the contract.
+GRANTS = {
+    "annotations": ROW_PRIVILEGES, "issue_notes": ROW_PRIVILEGES,
+    "model_pulls": ("SELECT", "INSERT"), "enhance_runs": ("SELECT", "INSERT", "UPDATE"),
+    "devices": ("SELECT", "INSERT", "UPDATE"), "device_reports": ("SELECT", "INSERT"),
+    "model_installs": ("SELECT", "INSERT", "UPDATE"), "execution_runs": ("SELECT", "INSERT"),
+    "capital_cases": ("SELECT", "INSERT", "UPDATE"), "capital_submissions": ("SELECT", "INSERT", "UPDATE"),
+    "credit_records": ("SELECT", "INSERT"), "capital_evidence": ("SELECT", "INSERT", "DELETE"),
+    "capital_review_marks": ("SELECT", "INSERT"),
+}
+# Records a migration must leave byte-for-byte alone, digested per row; digests never leave the controller.
+FROZEN_QUERIES = {
+    "enhance_runs": "SELECT id::text,md5(jsonb_build_object('name',name,'base',base_model_id,'datasets',datasets,'steps',steps,'compute',compute,'cap',spend_cap_usd,'by',requested_by,'at',requested_at,'workspace',workspace_id)::text) AS digest FROM enhance_runs WHERE status='requested' ORDER BY id",
+    "capital_submissions": "SELECT id::text,md5(jsonb_build_object('case',case_id,'workspace',workspace_id,'revision',revision,'snapshot',snapshot,'hash',content_hash,'by',submitted_by,'at',submitted_at,'decision',decision,'decidedBy',decided_by,'decidedAt',decided_at,'notes',notes)::text) AS digest FROM capital_submissions ORDER BY id",
+    "credit_records": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'provider',provider,'status',status,'amount',amount_cents,'expires',expires_on,'restrictions',restrictions,'reference',reference,'supersedes',supersedes,'by',created_by,'at',created_at)::text) AS digest FROM credit_records ORDER BY id",
+    "capital_review_marks": "SELECT id::text,md5(jsonb_build_object('submission',submission_id,'evidence',evidence_id,'reviewer',reviewer_id,'at',created_at)::text) AS digest FROM capital_review_marks ORDER BY id",
+}
+CATALOG_VARIABLES = ("MODEL_CATALOG_FILE", "LOCAL_MODEL_CATALOG_FILE")
+LOOPBACK_VARIABLES = ("LOCAL_RUNTIME_ORIGINS", "LOCAL_MEMORY_ORIGINS")
+LOOPBACK_ORIGIN = r"http://(127\.0\.0\.1|localhost|\[::1\]):[0-9]{1,5}"
+MEMORY_SECRET_NAME = r"PROVENA_.*|.*MEMORY.*(KEY|TOKEN|SECRET|PASSWORD).*"
+CATALOG_LIMIT = 1024 * 1024
+DEFAULT_FREE_BYTES = 5 * 1024 ** 3
 REVISION_LABEL = "org.opencontainers.image.revision"
 
 
@@ -246,12 +287,144 @@ def validate_migrator(web_env, migrator, ca_file):
         raise ReleaseError("Migrator TLS configuration is incomplete")
 
 
-def missing_privileges(rows):
-    expected = {"SELECT", "INSERT", "UPDATE", "DELETE"}
+def privilege_gap(rows, required):
+    """Return (missing, excess) against the contract over every reported table privilege; both must end up empty."""
     values = {row["privilege"]: row["ok"] is True for row in rows}
-    if set(values) != expected or len(rows) != 4:
+    if not set(TABLE_PRIVILEGES) <= set(values) or len(rows) != len(values) or not set(required) <= set(TABLE_PRIVILEGES):
         raise ReleaseError("Incomplete privilege verification")
-    return sorted(name for name in expected if not values[name])
+    return sorted(p for p in required if not values[p]), sorted(p for p in values if values[p] and p not in required)
+
+
+def verify_tables(ledger, present):
+    """The ledger decides which table groups must exist: a listed migration requires its whole group, an unlisted one forbids it."""
+    present = set(present)
+    applied = {number for number in TABLE_GROUPS if any(name.startswith(number + "_") for name in ledger)}
+    if LEDGER_TABLE not in present or BASELINE not in applied:
+        raise ReleaseError("Database is below the supported migration baseline")
+    for number, tables in TABLE_GROUPS.items():
+        if (present & set(tables)) != (set(tables) if number in applied else set()):
+            raise ReleaseError("Migration ledger and database tables disagree")
+    return sorted(present & set(KNOWN_TABLES)), sorted(set(KNOWN_TABLES) - present)
+
+
+def snapshot_program():
+    """One repeatable-read transaction exports the snapshot pg_dump reuses and reads presence, ledger and fingerprints from it."""
+    query = "await pool.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY'); await pool.query(\"SET LOCAL TIME ZONE 'UTC'\");\n"
+    query += "const names=" + json.dumps(KNOWN_TABLES) + ";const tables=[];for(const t of names)if((await pool.query('SELECT to_regclass($1) AS t',['public.'+t])).rows[0].t)tables.push(t);\n"
+    query += "const snapshot=(await pool.query('SELECT pg_export_snapshot() AS id')).rows[0].id;\n"
+    query += "const ledger=(await pool.query('SELECT filename FROM schema_migrations ORDER BY filename')).rows.map(r=>r.filename);\n"
+    query += "const parts=tables.map(t=>\"'\"+t+\"',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM \"+t+\" t)\");\n"
+    query += "const manifest=(await pool.query('SELECT json_build_object('+parts.join(',')+') AS m')).rows[0].m;console.log(JSON.stringify({snapshot,tables,ledger,manifest}));await new Promise(r=>process.stdin.once('data',r));await pool.query('ROLLBACK');"
+    return node_program("const client=await pool.connect();try{" + query.replace("pool.query", "client.query") + "}finally{client.release();}").decode()
+
+
+def grant_check_program(role, table):
+    """Effective privileges (grants, memberships and ownership) plus owner, superuser and sequence facts for one contract table."""
+    return ("const role=" + json.dumps(role) + ",table=" + json.dumps(table) + ";"
+            "if(!(await pool.query('SELECT to_regclass($1) AS t',['public.'+table])).rows[0].t){console.log(JSON.stringify({present:false}));}else{"
+            "const names=" + json.dumps(TABLE_PRIVILEGES) + ".concat((await pool.query(\"SELECT current_setting('server_version_num')::int>=170000 AS v\")).rows[0].v?['MAINTAIN']:[]);"
+            "const rows=(await pool.query('SELECT p AS privilege,has_table_privilege($1,$2,p) AS ok FROM unnest($3::text[]) p',[role,table,names])).rows;"
+            "const owner=(await pool.query(\"SELECT pg_has_role($2,c.relowner,'USAGE') OR pg_has_role($2,c.relowner,'SET') AS owner FROM pg_class c WHERE c.oid=to_regclass($1)\",['public.'+table,role])).rows.some(r=>r.owner===true);"
+            "const superuser=(await pool.query('SELECT rolsuper FROM pg_roles WHERE rolname=$1',[role])).rows.some(r=>r.rolsuper===true);"
+            "const sequences=(await pool.query(\"SELECT s.relname AS name FROM pg_class s JOIN pg_depend d ON d.objid=s.oid AND d.deptype IN ('a','i') JOIN pg_class t ON t.oid=d.refobjid WHERE s.relkind='S' AND t.relname=$1 AND t.relnamespace='public'::regnamespace\",[table])).rows;"
+            "console.log(JSON.stringify({present:true,rows,owner,superuser,sequences}));}")
+
+
+def grant_program(role, table, privileges):
+    # Table and privilege names come only from the fixed contract; the role is identifier-quoted by Postgres.
+    if table not in GRANTS or not set(privileges) <= set(GRANTS[table]):
+        raise ReleaseError("Refusing a grant outside the release contract")
+    return ("const role=" + json.dumps(role) + ";const q=(await pool.query('SELECT quote_ident($1) AS q',[role])).rows[0].q;"
+            "await pool.query('GRANT " + ",".join(privileges) + " ON TABLE " + table + " TO '+q);console.log(JSON.stringify({granted:true}));")
+
+
+ROLE_FLAGS = ("superuser", "createdb", "createrole", "bypassrls", "replication")
+
+
+def role_check_program(role, migrator):
+    """Cluster-level facts about the application role, independent of which tables exist yet."""
+    return ("const role=" + json.dumps(role) + ",migrator=" + json.dumps(migrator) + ";"
+            "const flags=(await pool.query('SELECT rolsuper AS superuser,rolcreatedb AS createdb,rolcreaterole AS createrole,rolbypassrls AS bypassrls,rolreplication AS replication FROM pg_roles WHERE rolname=$1',[role])).rows[0];"
+            "if(!flags){console.log(JSON.stringify({exists:false}));}else{"
+            # Ownership reachable through membership counts: an inheriting or SET-capable member can alter, drop and re-grant.
+            "const owned=(await pool.query(\"SELECT count(*)::int AS n FROM pg_class c WHERE c.relnamespace='public'::regnamespace AND c.relkind IN ('r','p','S','v','m') AND (pg_has_role($1,c.relowner,'USAGE') OR pg_has_role($1,c.relowner,'SET'))\",[role])).rows[0].n;"
+            "const database=(await pool.query(\"SELECT pg_has_role($1,datdba,'USAGE') OR pg_has_role($1,datdba,'SET') AS owner FROM pg_database WHERE datname=current_database()\",[role])).rows[0].owner;"
+            "const member=(await pool.query(\"SELECT pg_has_role($1,$2,'MEMBER') AS m\",[role,migrator])).rows[0].m;"
+            "const predefined=(await pool.query(\"SELECT rolname FROM pg_roles WHERE rolname ~ '^pg_' AND pg_has_role($1,oid,'MEMBER') ORDER BY rolname\",[role])).rows.map(r=>r.rolname);"
+            # Cluster attributes are never inherited, but SET ROLE makes them usable, directly or through any chain of
+            # SET-capable memberships. An ADMIN option held by any identity the role can assume (SET) or inherit
+            # (USAGE), itself included, lets it grant memberships, so it can wire its own path to those powers.
+            "const settable=(await pool.query(\"SELECT r.rolname FROM pg_roles r WHERE r.rolname<>$1 AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls OR r.rolreplication) AND pg_has_role($1,r.oid,'SET') ORDER BY 1\",[role])).rows.map(r=>r.rolname);"
+            "const admin=(await pool.query(\"SELECT u.rolname AS identity,g.rolname AS granted FROM pg_auth_members m JOIN pg_roles g ON g.oid=m.roleid JOIN pg_roles u ON u.oid=m.member WHERE m.admin_option AND (pg_has_role($1,m.member,'SET') OR pg_has_role($1,m.member,'USAGE')) ORDER BY 1,2\",[role])).rows;"
+            "const memberships=(await pool.query('SELECT g.rolname AS name FROM pg_auth_members m JOIN pg_roles g ON g.oid=m.roleid JOIN pg_roles u ON u.oid=m.member WHERE u.rolname=$1 ORDER BY 1',[role])).rows.map(r=>r.name);"
+            "console.log(JSON.stringify({exists:true,...flags,owned_objects:owned,database_owner:database===true,migrator_member:member===true,predefined,"
+            "settable_powers:settable,admin_memberships:admin,memberships}));}")
+
+
+def verify_app_role(state):
+    """The application role must be a plain least-privilege login: no cluster powers, reachable or direct, and no ownership."""
+    try:
+        if not state["exists"]:
+            raise ReleaseError("Application database role does not exist")
+        if any(state[flag] is True for flag in ROLE_FLAGS):
+            raise ReleaseError("Application role has cluster privileges (superuser, createdb, createrole, bypassrls or replication); use a plain login role")
+        if state["settable_powers"] or state["admin_memberships"]:
+            raise ReleaseError("Application role can assume a role with cluster privileges or administer role memberships; use a separate least-privilege role")
+        if state["owned_objects"] != 0 or state["database_owner"] or state["migrator_member"] or state["predefined"]:
+            raise ReleaseError("Application role owns, or can act as owner of, database objects or privileged roles; use a separate least-privilege role")
+        return {key: state[key] for key in ROLE_FLAGS + ("owned_objects", "database_owner", "migrator_member", "predefined", "settable_powers", "admin_memberships", "memberships")}
+    except (KeyError, TypeError):
+        raise ReleaseError("Incomplete role verification") from None
+
+
+def verify_local_origins(env):
+    for name in LOOPBACK_VARIABLES:
+        entries = [part.strip() for part in env.get(name, "").split(",") if part.strip()]
+        if any(not re.fullmatch(LOOPBACK_ORIGIN, entry) for entry in entries):
+            raise ReleaseError("Local runtime and memory origins must stay on the visitor's loopback")
+    if any(re.fullmatch(MEMORY_SECRET_NAME, name) for name in env):
+        raise ReleaseError("Local memory credentials must never be configured on the server")
+
+
+def catalog_mounts(env, mounts):
+    """Map each configured catalog to the read-only host file behind its container path."""
+    found = {}
+    for name in CATALOG_VARIABLES:
+        path = env.get(name, "")
+        if not path:
+            continue
+        for mount in sorted(mounts, key=lambda m: -len(m.get("Destination", ""))):
+            destination = mount.get("Destination", "")
+            if destination and mount.get("Source") and (path == destination or path.startswith(destination.rstrip("/") + "/")):
+                if mount.get("RW") is not False:
+                    raise ReleaseError("Configured catalog must be mounted read-only")
+                found[name] = {"path": path, "source": mount["Source"] + path[len(destination):]}
+                break
+        else:
+            raise ReleaseError("Configured catalog is not provided by a container mount")
+    if len({item["source"] for item in found.values()}) != len(found):
+        raise ReleaseError("Model and local catalogs must be distinct files")
+    return found
+
+
+def catalog_digest(source):
+    """Only a digest and size are recorded; catalog contents never enter logs or receipts."""
+    file = Path(source)
+    if not file.is_file() or file.stat().st_size > CATALOG_LIMIT:
+        raise ReleaseError("Configured catalog is not a readable file")
+    data = file.read_bytes()
+    try:
+        json.loads(data)
+    except ValueError:
+        raise ReleaseError("Configured catalog is not valid JSON") from None
+    return {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+
+def free_space_floor(config):
+    floor = config.get("min_free_bytes", DEFAULT_FREE_BYTES)
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 0:
+        raise ReleaseError("Invalid minimum free space configuration")
+    return floor
 
 
 def verify_csp(csp, origin):
@@ -323,7 +496,7 @@ def manifest_sql(tables):
     # Table names are only from the fixed allowlist, never from SSH input.
     return "SELECT json_build_object(" + ",".join(
         "'" + name + "',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM " + name + " t)"
-        for name in tables if name in TABLES) + ")"
+        for name in tables if name in KNOWN_TABLES) + ")"
 
 
 class Release:
@@ -366,7 +539,11 @@ class Release:
             raise ReleaseError("Ingest configuration does not match web")
         if not ingest_env.get("INGEST_STORAGE", "").startswith("s3://"):
             raise ReleaseError("Expected private S3-compatible ingest storage")
-        validate_migrator(web_env, private_env(self.config["migrator_env"]), self.config["ca_file"])
+        migrator_env = private_env(self.config["migrator_env"])
+        validate_migrator(web_env, migrator_env, self.config["ca_file"])
+        # The role contract holds whatever tables exist: checked before backup, build, grants and migrations.
+        roles = [unquote(urlsplit(env["DATABASE_URL"]).username or "") for env in (web_env, migrator_env)]
+        self.receipt["app_role"] = verify_app_role(self.node(role_check_program(*roles)))
         running = self.docker.request("GET", "/containers/json")
         if sum(item.get("Image", "").startswith("valcairn-ingest:") for item in running) != 1:
             raise ReleaseError("Exactly one ingest instance is required")
@@ -374,7 +551,26 @@ class Release:
         expected = {"admin": "admin", "ycinsider": "viewer", "sr008-reviewer": "viewer"}
         if {row["username"]: row["role"] for row in reviewers if row["enabled"]} != expected:
             raise ReleaseError("Reviewer store differs from the approved three-account configuration")
+        verify_local_origins(web_env)
+        # Catalogs are operator-mounted files; the controller never creates one or enables a feature.
+        self.catalogs = catalog_mounts(web_env, self.web.get("Mounts", []))
+        for item in self.catalogs.values():
+            item.update(catalog_digest(item["source"]))
         self.receipt["previous_images"] = {"web": self.web["Config"]["Image"], "ingest": self.ingest["Config"]["Image"]}
+
+    def free_space(self):
+        # Fail closed before any mutation: dump, scratch restore, source and three image builds need room.
+        size = int(self.psql("postgres", "SELECT pg_database_size('" + self.config["db_name"] + "');"))
+        needed = max(free_space_floor(self.config), 3 * size)
+        paths = {str(self.root), self.docker.request("GET", "/info").get("DockerRootDir", "/var/lib/docker")}
+        paths |= {m["Source"] for m in self.docker.inspect(self.config["postgres_container"]).get("Mounts", []) if m.get("Source")}
+        try:
+            low = [path for path in sorted(paths) if shutil.disk_usage(path).free < needed]
+        except OSError:
+            raise ReleaseError("Could not measure free disk space") from None
+        if low:
+            raise ReleaseError("Insufficient free disk space for the backup, scratch restore and image builds")
+        self.receipt["free_space"] = {"required_bytes": needed, "checked": sorted(paths)}
 
     def backup(self):
         backup = child_path(self.root, "backups")
@@ -384,13 +580,7 @@ class Release:
         private_write(self.backup_dir / "runtime-private.json", json.dumps({"web": self.web, "ingest": self.ingest}))
         for name in ("migrator_env", "ca_file"):
             private_write(self.backup_dir / name, Path(self.config[name]).read_bytes())
-        query = "await pool.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY'); await pool.query(\"SET LOCAL TIME ZONE 'UTC'\");\n"
-        query += "const names=" + json.dumps(TABLES) + ";const tables=[];for(const t of names)if((await pool.query('SELECT to_regclass($1) AS t',['public.'+t])).rows[0].t)tables.push(t);\n"
-        query += "const snapshot=(await pool.query('SELECT pg_export_snapshot() AS id')).rows[0].id;\n"
-        query += "const parts=tables.map(t=>\"'\"+t+\"',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM \"+t+\" t)\");\n"
-        query += "const manifest=(await pool.query('SELECT json_build_object('+parts.join(',')+') AS m')).rows[0].m;console.log(JSON.stringify({snapshot,tables,manifest}));await new Promise(r=>process.stdin.once('data',r));await pool.query('ROLLBACK');"
-        query = "const client=await pool.connect();try{" + query.replace("pool.query", "client.query") + "}finally{client.release();}"
-        proc = subprocess.Popen(["docker", "exec", "-i", self.config["web_container"], "node", "--input-type=module", "-e", node_program(query).decode()], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(["docker", "exec", "-i", self.config["web_container"], "node", "--input-type=module", "-e", snapshot_program()], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             with selectors.DefaultSelector() as ready:
                 ready.register(proc.stdout, selectors.EVENT_READ)
@@ -399,6 +589,8 @@ class Release:
             record = json.loads(proc.stdout.readline())
             if "error" in record or not re.fullmatch(r"[0-9A-Fa-f-]+", record["snapshot"]):
                 raise ReleaseError("Could not export a consistent database snapshot")
+            # Presence, ledger and fingerprints all come from the one exported snapshot that pg_dump reuses.
+            verified, absent = verify_tables(record["ledger"], record["tables"])
             source = urlsplit(env_map(self.web)["DATABASE_URL"])
             if source.path.lstrip("/") != self.config["db_name"]:
                 raise ReleaseError("Database identity differs from approved configuration")
@@ -428,8 +620,9 @@ class Release:
         finally:
             if created:
                 self.psql("postgres", 'DROP DATABASE "' + scratch + '" WITH (FORCE);')
-        self.receipt["backup"] = {"path": str(self.backup_dir), "tables_verified": len(record["tables"]), "restore_verified": True}
-        print("Backup restored and verified", flush=True)
+        self.receipt["backup"] = {"path": str(self.backup_dir), "tables_verified": verified, "feature_tables_absent": absent,
+                                  "ledger_entries": len(record["ledger"]), "restore_verified": True}
+        print("Backup restored and verified: " + str(len(verified)) + " tables; feature tables not yet present: " + str(len(absent)), flush=True)
 
     def dump_snapshot(self, snapshot, destination):
         if not re.fullmatch(r"[0-9A-Fa-f-]+", snapshot):
@@ -461,8 +654,41 @@ class Release:
         code = "const c=await pool.connect();try{await c.query('BEGIN READ ONLY');await c.query(\"SET LOCAL TIME ZONE 'UTC'\");const result={};"
         for table, sql in queries.items():
             code += "result[" + json.dumps(table) + "]=(await c.query(" + json.dumps(sql) + ")).rows;"
+        # Feature tables are digested only once they exist; a release before their migration skips them.
+        for table, sql in FROZEN_QUERIES.items():
+            code += "if((await c.query('SELECT to_regclass($1) AS t',['public." + table + "'])).rows[0].t)result[" + json.dumps(table) + "]=(await c.query(" + json.dumps(sql) + ")).rows;"
         code += "await c.query('ROLLBACK');console.log(JSON.stringify(result));}finally{c.release();}"
-        return self.node(code)
+        result = self.node(code)
+        self.receipt["protected_records"] = {table: len(rows) for table, rows in result.items()}
+        return result
+
+    def ensure_grants(self):
+        """Grant only the contract's statements on tables that exist now; any broader effective access stops the release."""
+        app_role = unquote(urlsplit(env_map(self.web)["DATABASE_URL"]).username or "")
+        tables, checked = {}, []
+        for table, required in GRANTS.items():
+            check = grant_check_program(app_role, table)
+            state = self.node(check, self.images["migrate"])
+            if not state["present"]:
+                tables[table] = "absent"
+                continue
+            # An owner (directly or through membership) or a superuser can alter, drop and re-grant whatever its
+            # current ACL says, so it is refused before the ACL is even compared. Never revoke or re-own here.
+            if state["owner"] is True or state["superuser"] is True:
+                raise ReleaseError("Application role owns, or can act as owner of, a contract table; use a separate least-privilege role")
+            if state["sequences"]:
+                raise ReleaseError("Feature table uses a sequence outside the grant contract")
+            missing, excess = privilege_gap(state["rows"], required)
+            if excess:
+                raise ReleaseError("Application role holds privileges beyond the release contract; revoke them before deploying")
+            if missing:
+                self.node(grant_program(app_role, table, missing), self.images["migrate"])
+                missing, excess = privilege_gap(self.node(check, self.images["migrate"])["rows"], required)
+            if missing or excess:
+                raise ReleaseError("Application privileges remain incomplete")
+            tables[table] = list(required)
+            checked = sorted(row["privilege"] for row in state["rows"])
+        self.receipt["grants"] = {"privileges_checked": checked, "tables": tables}
 
     def build(self):
         releases = child_path(self.root, "releases")
@@ -495,21 +721,43 @@ class Release:
         first = run(command).decode().strip(); second = run(command).decode().strip()
         if not first.startswith("Applied ") or second != "Applied 0 migration(s).":
             raise ReleaseError("Migration did not produce the expected ledger result")
-        app_role = unquote(urlsplit(env_map(self.web)["DATABASE_URL"]).username or "")
-        for table in ("annotations", "issue_notes"):
-            check = "const role=" + json.dumps(app_role) + ",table=" + json.dumps(table) + ";console.log(JSON.stringify({rows:(await pool.query(\"SELECT p AS privilege,has_table_privilege($1,$2,p) AS ok FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) p\",[role,table])).rows}));"
-            missing = missing_privileges(self.node(check, self.images["migrate"])["rows"])
-            if missing:
-                code = "const role=" + json.dumps(app_role) + ";const q=(await pool.query('SELECT quote_ident($1) AS q',[role])).rows[0].q;await pool.query('GRANT " + ",".join(missing) + " ON TABLE " + table + " TO '+q);console.log(JSON.stringify({granted:true}));"
-                self.node(code, self.images["migrate"])
-            if missing_privileges(self.node(check, self.images["migrate"])["rows"]):
-                raise ReleaseError("Application privileges remain incomplete")
+        self.ensure_grants()
         operator = (self.source / "scripts/sql/annotation-box-violations.sql").read_text().strip().rstrip(";")
         code = "const rows=(await pool.query(" + json.dumps("WITH violations AS (" + operator + ") SELECT project_status,count(*)::int AS count FROM violations GROUP BY project_status ORDER BY project_status") + ")).rows;"
         code += "if(rows.length===0)await pool.query('ALTER TABLE annotations VALIDATE CONSTRAINT annotations_box_stored_form');"
         code += "const constraint=(await pool.query(\"SELECT convalidated FROM pg_constraint WHERE conname='annotations_box_stored_form' AND conrelid='annotations'::regclass\")).rows;if(constraint.length!==1)throw new Error('constraint_missing');"
         code += "const ledger=(await pool.query('SELECT filename FROM schema_migrations ORDER BY filename')).rows;console.log(JSON.stringify({violations:rows,validated:constraint[0].convalidated,ledger}));"
         self.receipt["migration"] = {"first": first, "second": second, **self.node(code, self.images["migrate"])}
+
+    def validate_catalogs(self):
+        """Parse each configured catalog with the candidate release's own loader, offline and without secrets."""
+        if not self.catalogs:
+            self.receipt["catalogs"] = {}
+            return
+        command = ["docker", "run", "--rm", "-i", "--network", "none"]
+        for item in self.catalogs.values():
+            command += ["-v", item["source"] + ":" + item["path"] + ":ro"]
+        paths = {name: item["path"] for name, item in self.catalogs.items()}
+        program = ("import {randomBytes} from 'node:crypto';\nimport {loadConfig} from './src/config.js';\n"
+                   "const env={NODE_ENV:'production',COOKIE_SECURE:'true',SESSION_SECRET:randomBytes(32).toString('hex'),..." + json.dumps(paths) + "};\n"
+                   "try{const c=loadConfig(env);console.log(JSON.stringify({consumed:{MODEL_CATALOG_FILE:Array.isArray(c.modelCatalog)?c.modelCatalog.length:null,"
+                   "LOCAL_MODEL_CATALOG_FILE:Array.isArray(c.localModelCatalog)?c.localModelCatalog.length:null}}));}"
+                   "catch(e){console.log(JSON.stringify({error:'invalid_catalog'}));}\n")
+        raw = run(command + [self.images["web"], "node", "--input-type=module"], data=program.encode(), timeout=60)
+        try:
+            result = json.loads(raw)
+            consumed = result["consumed"] if "error" not in result else None
+        except Exception:
+            raise ReleaseError("Catalog validation returned an unexpected response") from None
+        if consumed is None:
+            raise ReleaseError("Candidate release rejected a configured catalog")
+        self.receipt["catalogs"] = {name: {**item, "candidate_entries": consumed.get(name)} for name, item in self.catalogs.items()}
+
+    def verify_catalogs_unchanged(self):
+        # The live files are pinned by digest from preflight until the web swap; prior files stay for rollback.
+        for item in self.catalogs.values():
+            if catalog_digest(item["source"])["sha256"] != item["sha256"]:
+                raise ReleaseError("A configured catalog changed during the release")
 
     def swap(self, name, original, image):
         backup_name = name + "-previous-" + str(int(time.time()))
@@ -601,6 +849,7 @@ class Release:
             self.health(self.web); self.health(self.ingest, ingest=True); self.public_checks()
             print(json.dumps({"revision": self.sha, "live": True, "already_deployed": True}), flush=True)
             return
+        self.free_space()
         try:
             print("Backing up and verifying a scratch restore", flush=True)
             self.backup()
@@ -608,7 +857,11 @@ class Release:
             self.build()
             # Building can outlast a newer merge; do not migrate for a stale release.
             verify_release(self.sha, self.config.get("workflow", "ci-deploy.yml"))
+            print("Validating configured catalogs with the candidate release", flush=True)
+            self.validate_catalogs()
             print("Applying migrations and verifying grants", flush=True)
+            # Existing feature tables need their contract grants before the app role can digest frozen rows.
+            self.ensure_grants()
             protected = self.protected_snapshot()
             self.migrate()
             self.receipt["protected_records_preserved"] = False
@@ -619,11 +872,14 @@ class Release:
             print("Rolling ingest", flush=True)
             self.health(self.swap(self.config["ingest_container"], self.ingest, self.images["ingest"]), ingest=True)
             print("Rolling web", flush=True)
+            self.verify_catalogs_unchanged()
             self.health(self.swap(self.config["web_container"], self.web, self.images["web"]))
             self.public_checks()
             self.receipt["live"] = True
-        except Exception:
+        except Exception as error:
             self.receipt["live"] = False
+            # ReleaseError text is sanitized by contract; anything else stays out of the receipt.
+            self.receipt["failure"] = str(error) if isinstance(error, ReleaseError) else "unexpected host error"
             if self.swaps:
                 try:
                     with defer_termination():

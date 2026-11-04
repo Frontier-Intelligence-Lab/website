@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
 import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
+import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
+import { snapshotHash } from '../lib/capital-hash.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
@@ -26,10 +28,50 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const issueNotes = [];
   const audit = [];
   const reviewerAccounts = new Map();
-  const copy = (value) => (value == null ? null : structuredClone(value));
+  const modelPulls = [];
+  const enhanceRuns = [];
+  const devices = [];
+  const deviceReports = [];
+  const modelInstalls = [];
+  const executionRuns = [];
+  const capitalCases = [];
+  const capitalSubmissions = [];
+  const creditRecords = [];
+  const capitalEvidence = [];
+  const capitalReviewMarks = [];
+  const pickRun = ({ name, baseModelId, datasets, steps, compute, spendCapUsd }) => ({ name, baseModelId, datasets: structuredClone(datasets), steps: [...steps], compute, spendCapUsd });
+  const pickCredit = ({ provider, status, amountCents, expiresOn, restrictions, reference }) => ({ provider, status, amountCents, expiresOn, restrictions, reference });
+  const pickEvidence = ({ kind, title, source, reference, verification }) => ({ kind, title, source, reference: structuredClone(reference), verification });
+  const caseOf = (workspaceId, caseId) => capitalCases.find((c) => c.id === caseId && c.workspaceId === workspaceId) ?? null;
+  // Links behave like the composite foreign keys in Postgres: another workspace's project or run does not exist here.
+  const checkCaseLinks = (workspaceId, projectId, enhanceRunId) => {
+    if (projectId != null && projects.get(projectId)?.workspaceId !== workspaceId) throw new StoreError('not_found');
+    if (enhanceRunId != null && !enhanceRuns.some((r) => r.id === enhanceRunId && r.workspaceId === workspaceId)) throw new StoreError('not_found');
+  };
+  const withSupersededBy = (r) => ({ ...structuredClone(r), supersededBy: creditRecords.find((x) => x.supersedes === r.id)?.id ?? null });
+  const currentCredits = (workspaceId) => creditRecords.filter((r) => r.workspaceId === workspaceId).map(withSupersededBy).filter((r) => !r.supersededBy);
+  const openSubmission = (caseId) => capitalSubmissions.find((s) => s.caseId === caseId && !s.decision) ?? null;
+  const latestSubmission = (caseId) => structuredClone(capitalSubmissions.filter((s) => s.caseId === caseId).at(-1) ?? null);
+  const evidenceOf = (caseId) => capitalEvidence.filter((e) => e.caseId === caseId);
+  // Every reference a draft makes must resolve at the moment it is saved or frozen (same check as under the Postgres lock).
+  const checkReferences = (row, draft) => {
+    const frozenVersions = versions.filter((v) => v.workspaceId === row.workspaceId).map((v) => ({ projectId: v.projectId, version: v.number }));
+    if (!referencesResolve(draft, { evidenceIds: new Set(evidenceOf(row.id).map((e) => e.id)), versions: frozenVersions })) throw new StoreError('missing_reference');
+  };
+  // What staff and the queue may see of a case: never its live title, links or draft.
+  const caseMeta = ({ id, workspaceId, status, revision, submittedRevision, createdAt, updatedAt }) => ({ id, workspaceId, status, revision, submittedRevision, createdAt, updatedAt });
+  const copy =(value) => (value == null ? null : structuredClone(value));
   const stamp = () => now().toISOString();
   const publicUser = ({ passwordHash, ...user }) => copy(user);
   const publicReviewer = ({ passwordHash, ...account }) => copy(account);
+  const ownDevice = ({ workspaceId, ownerId, deviceId }) => devices.find((d) => d.id === deviceId && d.workspaceId === workspaceId && d.ownerId === ownerId) ?? null;
+  const activeDevice = (where) => {
+    const d = ownDevice(where);
+    if (!d) throw new StoreError('not_found');
+    if (d.status !== 'active') throw new StoreError('invalid_state');
+    return d;
+  };
+  const latestReport = (deviceId) => copy(deviceReports.filter((r) => r.deviceId === deviceId).at(-1) ?? null);
   const editableProject = (workspaceId, projectId) => {
     const project = projects.get(projectId);
     if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
@@ -404,6 +446,263 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     },
     async listDatasetVersions({ workspaceId, projectId }) {
       return versions.filter((v) => v.workspaceId === workspaceId && v.projectId === projectId).map(copy);
+    },
+
+    async listModelPulls(workspaceId) {
+      return modelPulls.filter((p) => p.workspaceId === workspaceId).map(copy);
+    },
+    // Asking twice returns the first request: one copy of a model per workspace.
+    async requestModelPull({ workspaceId, modelId, requestedBy }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const existing = modelPulls.find((p) => p.workspaceId === workspaceId && p.modelId === modelId);
+      if (existing) return copy(existing);
+      const pull = { id: randomUUID(), workspaceId, modelId, status: 'requested', requestedBy, createdAt: stamp() };
+      modelPulls.push(pull);
+      return copy(pull);
+    },
+    async listEnhanceRuns(workspaceId) {
+      return enhanceRuns.filter((r) => r.workspaceId === workspaceId).map(copy);
+    },
+    async getEnhanceRun({ workspaceId, runId }) {
+      const run = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
+      return run ? copy(run) : null;
+    },
+    async createEnhanceRun({ workspaceId, createdBy, run }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const at = stamp();
+      const row = { id: randomUUID(), workspaceId, ...pickRun(run), status: 'draft', createdBy, requestedBy: null, requestedAt: null, createdAt: at, updatedAt: at };
+      enhanceRuns.push(row);
+      return copy(row);
+    },
+    async updateEnhanceRun({ workspaceId, runId, run }) {
+      const row = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status !== 'draft') throw new StoreError('invalid_state');
+      // Strictly later than the previous edit, so an approval naming the old version is always detected as stale.
+      const at = new Date(Math.max(now().getTime(), new Date(row.updatedAt).getTime() + 1)).toISOString();
+      Object.assign(row, pickRun(run), { updatedAt: at });
+      return copy(row);
+    },
+    async requestEnhanceRun({ workspaceId, runId, requestedBy, expectedUpdatedAt }) {
+      const row = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status !== 'draft') throw new StoreError('invalid_state');
+      if (expectedUpdatedAt == null || new Date(expectedUpdatedAt).getTime() !== new Date(row.updatedAt).getTime()) throw new StoreError('stale_plan');
+      if (!row.datasets.length || !row.steps.length || !row.compute || row.spendCapUsd == null) throw new StoreError('invalid_state');
+      Object.assign(row, { status: 'requested', requestedBy, requestedAt: stamp(), updatedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId: requestedBy, action: 'enhance_run.requested', targetType: 'enhance_run', targetId: runId, metadata: { spendCapUsd: row.spendCapUsd }, createdAt: stamp() });
+      return copy(row);
+    },
+
+    // Devices belong to one person in one workspace; every read and write is filtered on both.
+    async createDevice({ workspaceId, ownerId, label, runtime = 'ollama' }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const device = { id: randomUUID(), workspaceId, ownerId, label, runtime, status: 'active', lastSeenAt: null, revokedAt: null, createdAt: stamp() };
+      devices.push(device);
+      audit.push({ id: audit.length + 1, workspaceId, actorId: ownerId, action: 'device.registered', targetType: 'device', targetId: device.id, metadata: { runtime }, createdAt: stamp() });
+      return { ...copy(device), latestReport: null };
+    },
+    async listDevices({ workspaceId, ownerId }) {
+      return devices.filter((d) => d.workspaceId === workspaceId && d.ownerId === ownerId).map((d) => ({ ...copy(d), latestReport: latestReport(d.id) }));
+    },
+    async getDevice({ workspaceId, ownerId, deviceId }) {
+      const d = ownDevice({ workspaceId, ownerId, deviceId });
+      return d ? { ...copy(d), latestReport: latestReport(d.id) } : null;
+    },
+    async revokeDevice({ workspaceId, ownerId, deviceId }) {
+      const d = ownDevice({ workspaceId, ownerId, deviceId });
+      if (!d) throw new StoreError('not_found');
+      if (d.status === 'revoked') throw new StoreError('invalid_state');
+      Object.assign(d, { status: 'revoked', revokedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId: ownerId, action: 'device.revoked', targetType: 'device', targetId: deviceId, metadata: {}, createdAt: stamp() });
+      return { ...copy(d), latestReport: latestReport(d.id) };
+    },
+    async recordDeviceReport({ workspaceId, ownerId, deviceId, report }) {
+      const d = activeDevice({ workspaceId, ownerId, deviceId });
+      const row = { id: randomUUID(), deviceId, ...copy(report), provenance: 'client_reported', createdAt: stamp() };
+      deviceReports.push(row);
+      d.lastSeenAt = row.createdAt;
+      return copy(row);
+    },
+    async saveModelInstall({ workspaceId, ownerId, deviceId, install }) {
+      activeDevice({ workspaceId, ownerId, deviceId });
+      const at = stamp();
+      let row = modelInstalls.find((i) => i.deviceId === deviceId && i.runtimeRef === install.runtimeRef);
+      const verified = ['verified', 'ready'].includes(install.state);
+      const keepVerified = verified && row?.verifiedAt && row.digest === install.digest;
+      const fields = { ...copy(install), verifiedAt: verified ? (keepVerified ? row.verifiedAt : at) : null, provenance: 'client_reported', updatedAt: at };
+      const previous = row?.state ?? null;
+      if (row) Object.assign(row, fields);
+      else modelInstalls.push(row = { id: randomUUID(), deviceId, ...fields, createdAt: at });
+      if (previous !== row.state) audit.push({ id: audit.length + 1, workspaceId, actorId: ownerId, action: `model_install.${row.state}`, targetType: 'model_install', targetId: row.id, metadata: { runtimeRef: row.runtimeRef, digest: row.digest }, createdAt: at });
+      return copy(row);
+    },
+    async listModelInstalls({ workspaceId, ownerId, deviceId }) {
+      if (!ownDevice({ workspaceId, ownerId, deviceId })) return [];
+      return modelInstalls.filter((i) => i.deviceId === deviceId).sort((a, b) => a.runtimeRef.localeCompare(b.runtimeRef)).map(copy);
+    },
+    async recordExecutionRun({ workspaceId, ownerId, deviceId, run }) {
+      activeDevice({ workspaceId, ownerId, deviceId });
+      if (run.installId && !modelInstalls.some((i) => i.id === run.installId && i.deviceId === deviceId)) throw new StoreError('not_found');
+      const row = { id: randomUUID(), deviceId, ...copy(run), provenance: 'client_reported', createdAt: stamp() };
+      executionRuns.push(row);
+      return copy(row);
+    },
+    async listExecutionRuns({ workspaceId, ownerId, deviceId, limit = 50 }) {
+      if (!ownDevice({ workspaceId, ownerId, deviceId })) return [];
+      return executionRuns.filter((r) => r.deviceId === deviceId).slice(-limit).reverse().map(copy);
+    },
+
+    // Capital: cases with an editable, revisioned draft; frozen submitted revisions; append-only credit records; evidence references.
+    async listCapitalCases(workspaceId) {
+      return capitalCases.filter((c) => c.workspaceId === workspaceId).map(copy);
+    },
+    async getCapitalCase({ workspaceId, caseId }) {
+      return copy(caseOf(workspaceId, caseId));
+    },
+    async createCapitalCase({ workspaceId, createdBy, title, projectId = null, enhanceRunId = null, draft }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      checkCaseLinks(workspaceId, projectId, enhanceRunId);
+      const at = stamp();
+      const row = { id: randomUUID(), workspaceId, projectId, enhanceRunId, title, status: 'draft', draft: copy(draft), revision: 1, submittedRevision: null, createdBy, createdAt: at, updatedAt: at };
+      capitalCases.push(row);
+      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'capital_case.created', targetType: 'capital_case', targetId: row.id, metadata: {}, createdAt: at });
+      return copy(row);
+    },
+    // The caller names the revision it edited; a different revision means someone else saved first.
+    async updateCapitalCase({ workspaceId, caseId, expectedRevision, title, projectId = null, enhanceRunId = null, draft }) {
+      const row = caseOf(workspaceId, caseId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status === 'submitted') throw new StoreError('invalid_state');
+      if (row.revision !== expectedRevision) throw new StoreError('stale_revision');
+      checkCaseLinks(workspaceId, projectId, enhanceRunId);
+      checkReferences(row, draft);
+      Object.assign(row, { title, projectId, enhanceRunId, draft: copy(draft), revision: row.revision + 1, updatedAt: stamp() });
+      return copy(row);
+    },
+    // Consent binds the exact content: the revision edited and the hash of everything the snapshot will freeze
+    // (draft, links, evidence, current credit records). Both are rechecked here against the data being frozen.
+    async submitCapitalCase({ workspaceId, caseId, submittedBy, expectedRevision, contentHash }) {
+      const row = caseOf(workspaceId, caseId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status === 'submitted') {
+        // A retry of the same revision and content gets the submission it already made; anything else waits for the review.
+        const open = openSubmission(row.id);
+        if (open && row.submittedRevision === expectedRevision) {
+          if (open.contentHash !== contentHash) throw new StoreError('stale_revision', 'content');
+          return copy(open);
+        }
+        throw new StoreError('invalid_state');
+      }
+      if (row.revision !== expectedRevision) throw new StoreError('stale_revision');
+      if (capitalSubmissions.some((s) => s.caseId === row.id && s.revision === row.revision)) throw new StoreError('invalid_state');
+      if (!draftComplete(row.draft)) throw new StoreError('invalid_state');
+      checkReferences(row, row.draft);
+      const snapshot = capitalSnapshot(row, currentCredits(workspaceId), evidenceOf(row.id));
+      const hash = snapshotHash(snapshot);
+      if (hash !== contentHash) throw new StoreError('stale_revision', 'content');
+      const submission = { id: randomUUID(), caseId: row.id, workspaceId, revision: row.revision, snapshot, contentHash: hash, submittedBy, submittedAt: stamp(), decision: null, decidedBy: null, decidedAt: null, notes: null };
+      capitalSubmissions.push(submission);
+      Object.assign(row, { status: 'submitted', submittedRevision: row.revision, updatedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId: submittedBy, action: 'capital.submitted', targetType: 'capital_case', targetId: row.id, metadata: { submissionId: submission.id, revision: submission.revision }, createdAt: stamp() });
+      return copy(submission);
+    },
+    async withdrawCapitalCase({ workspaceId, caseId, actorId }) {
+      const row = caseOf(workspaceId, caseId);
+      if (!row) throw new StoreError('not_found');
+      const open = openSubmission(row.id);
+      if (row.status !== 'submitted' || !open) throw new StoreError('invalid_state');
+      Object.assign(open, { decision: 'withdrawn', decidedBy: actorId, decidedAt: stamp() });
+      // The withdrawn revision stays on record; the draft gets a new revision number so it can be sent again.
+      Object.assign(row, { status: 'draft', revision: row.revision + 1, updatedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'capital.withdrawn', targetType: 'capital_case', targetId: row.id, metadata: { submissionId: open.id, revision: open.revision }, createdAt: stamp() });
+      return copy(row);
+    },
+    async listCapitalSubmissions({ workspaceId, caseId }) {
+      return capitalSubmissions.filter((s) => s.workspaceId === workspaceId && s.caseId === caseId).map(copy);
+    },
+
+    async listCreditRecords(workspaceId) {
+      return creditRecords.filter((r) => r.workspaceId === workspaceId).map(withSupersededBy);
+    },
+    // Append-only: a correction is a new row that supersedes one earlier row, which can be corrected only once.
+    async createCreditRecord({ workspaceId, createdBy, record, supersedes = null }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      if (supersedes != null) {
+        if (!creditRecords.some((r) => r.id === supersedes && r.workspaceId === workspaceId)) throw new StoreError('not_found');
+        if (creditRecords.some((r) => r.supersedes === supersedes)) throw new StoreError('invalid_state');
+      }
+      const row = { id: randomUUID(), workspaceId, ...pickCredit(record), supersedes, createdBy, createdAt: stamp() };
+      creditRecords.push(row);
+      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: supersedes ? 'credit_record.corrected' : 'credit_record.created', targetType: 'credit_record', targetId: row.id, metadata: { supersedes }, createdAt: stamp() });
+      return withSupersededBy(row);
+    },
+
+    async listCapitalEvidence({ workspaceId, caseId }) {
+      return capitalEvidence.filter((e) => e.workspaceId === workspaceId && e.caseId === caseId).map(copy);
+    },
+    async addCapitalEvidence({ workspaceId, caseId, createdBy, item }) {
+      const row = caseOf(workspaceId, caseId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status === 'submitted') throw new StoreError('invalid_state');
+      const evidence = { id: randomUUID(), caseId: row.id, workspaceId, ...pickEvidence(item), createdBy, createdAt: stamp() };
+      capitalEvidence.push(evidence);
+      return copy(evidence);
+    },
+    async deleteCapitalEvidence({ workspaceId, caseId, evidenceId }) {
+      const row = caseOf(workspaceId, caseId);
+      if (!row) throw new StoreError('not_found');
+      if (row.status === 'submitted') throw new StoreError('invalid_state');
+      const i = capitalEvidence.findIndex((e) => e.id === evidenceId && e.caseId === row.id);
+      if (i < 0) throw new StoreError('not_found');
+      // An incurred cost cites its record; the record stays until that item changes (checked on the same row as edits).
+      if (citedEvidenceIds(row.draft).has(evidenceId)) throw new StoreError('evidence_in_use');
+      return copy(capitalEvidence.splice(i, 1)[0]);
+    },
+    async listCapitalReviewMarks({ workspaceId, caseId }) {
+      const ids = new Set(capitalSubmissions.filter((s) => s.workspaceId === workspaceId && s.caseId === caseId).map((s) => s.id));
+      return capitalReviewMarks.filter((m) => ids.has(m.submissionId)).map(copy);
+    },
+
+    // Staff queue across workspaces: only what was sent for review, as frozen in each submission. Live titles,
+    // drafts, evidence and credit records changed since are never returned here.
+    async listCapitalCasesForReview({ status = 'submitted' } = {}) {
+      return capitalCases.filter((c) => c.status === status).map((c) => ({ ...caseMeta(c), workspaceName: workspaces.get(c.workspaceId).name, latestSubmission: latestSubmission(c.id) }));
+    },
+    async getCapitalCaseForReview(caseId) {
+      const c = capitalCases.find((x) => x.id === caseId);
+      if (!c) return null;
+      const w = workspaces.get(c.workspaceId);
+      const submission = latestSubmission(c.id);
+      return { case: caseMeta(c), workspace: { id: w.id, name: w.name, kind: w.kind, synthetic: Boolean(w.profile?.synthetic) }, submission, marks: submission ? capitalReviewMarks.filter((m) => m.submissionId === submission.id).map(copy) : [] };
+    },
+    // A decision names the submission the reviewer saw. If the customer withdrew or sent a newer revision since,
+    // that is a different submission and the decision is refused (stale_revision), never applied to the newer one.
+    async decideCapitalSubmission({ caseId, submissionId, reviewerId, decision, notes = null }) {
+      const row = capitalCases.find((x) => x.id === caseId);
+      if (!row) throw new StoreError('not_found');
+      const open = openSubmission(caseId);
+      if (row.status !== 'submitted' || !open || !CASE_DECISIONS.includes(decision)) throw new StoreError('invalid_state');
+      if (open.id !== submissionId) throw new StoreError('stale_revision', 'submission');
+      Object.assign(open, { decision, decidedBy: reviewerId, decidedAt: stamp(), notes });
+      Object.assign(row, { status: decision, updatedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId: row.workspaceId, actorId: reviewerId, action: `capital.${decision}`, targetType: 'capital_case', targetId: caseId, metadata: { submissionId: open.id, revision: open.revision }, createdAt: stamp() });
+      return copy(open);
+    },
+    // An append-only mark on one evidence id frozen in the submission the reviewer saw. The customer's record is not touched.
+    async markCapitalEvidenceReviewed({ caseId, submissionId, evidenceId, reviewerId }) {
+      const row = capitalCases.find((x) => x.id === caseId);
+      if (!row) throw new StoreError('not_found');
+      const open = openSubmission(caseId);
+      if (row.status !== 'submitted' || !open) throw new StoreError('invalid_state');
+      if (open.id !== submissionId) throw new StoreError('stale_revision', 'submission');
+      if (!open.snapshot.evidence.some((e) => e.id === evidenceId)) throw new StoreError('not_found');
+      const existing = capitalReviewMarks.find((m) => m.submissionId === open.id && m.evidenceId === evidenceId);
+      if (existing) return copy(existing);
+      const mark = { id: randomUUID(), submissionId: open.id, evidenceId, reviewerId, createdAt: stamp() };
+      capitalReviewMarks.push(mark);
+      audit.push({ id: audit.length + 1, workspaceId: row.workspaceId, actorId: reviewerId, action: 'capital.evidence_item_reviewed', targetType: 'capital_submission', targetId: open.id, metadata: { caseId, evidenceId }, createdAt: stamp() });
+      return copy(mark);
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {

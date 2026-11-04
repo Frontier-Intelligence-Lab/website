@@ -57,6 +57,8 @@ function accountRoutes() {
   const dataset = () => import('./app/dataset.jsx');
   const invite = () => import('./app/invite.jsx');
   const staff = () => import('./app/staff.jsx');
+  const models = () => import('./app/models.jsx');
+  const device = () => import('./app/device.jsx');
   return [
     { path: '/signup', lazy: page(auth, 'SignUp', 'signUpLoader') },
     { path: '/signin', lazy: page(auth, 'SignIn', 'signInLoader') },
@@ -79,6 +81,13 @@ function accountRoutes() {
     { path: '/w/:slug/projects/:projectId/dataset/resolve', lazy: page(dataset, 'DatasetResolve', 'datasetLoader') },
     { path: '/w/:slug/projects/:projectId/dataset/import', lazy: page(dataset, 'DatasetImport', 'datasetLoader') },
     { path: '/w/:slug/projects/:projectId/dataset/versions', lazy: page(dataset, 'DatasetVersions', 'datasetLoader') },
+    { path: '/w/:slug/device', lazy: page(device, 'RunOnDevice', 'deviceLoader') },
+    { path: '/w/:slug/models', lazy: page(models, 'ModelCatalog', 'modelsLoader') },
+    { path: '/w/:slug/models/mine', lazy: page(models, 'MyModels', 'modelsLoader') },
+    { path: '/w/:slug/models/catalog/:modelId', lazy: page(models, 'ModelDetail', 'modelsLoader') },
+    { path: '/w/:slug/models/runs', lazy: page(models, 'EnhanceRuns', 'modelsLoader') },
+    { path: '/w/:slug/models/runs/new', lazy: page(models, 'EnhanceRun', 'enhanceLoader') },
+    { path: '/w/:slug/models/runs/:runId', lazy: page(models, 'EnhanceRun', 'enhanceLoader') },
     { path: '/invite/:token', lazy: page(invite, 'Invite', 'inviteLoader') },
     { path: '/staff', lazy: page(staff, 'StaffQueue', 'queueLoader') },
     { path: '/staff/reviews/:reviewId', lazy: page(staff, 'StaffReview', 'reviewLoader') },

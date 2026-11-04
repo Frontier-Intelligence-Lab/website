@@ -12,6 +12,8 @@ import { applyMigrations } from '../scripts/migrate.js';
 import { runStoreContract } from './store-contract.js';
 import { makeApp, json, postHeaders } from './helpers.js';
 import { signToken } from '../src/lib/tokens.js';
+import { capitalSnapshot } from '../src/lib/capital.js';
+import { snapshotHash } from '../src/lib/capital-hash.js';
 
 // These tests reset ONLY the explicitly supplied, dedicated test database.
 // No application connection string is ever used to establish a connection.
@@ -992,4 +994,145 @@ withStore('an invalid rule written while submit waits on the lock is seen by the
   assert.equal(result.ok, false);
   assert.equal(result.error.code, 'issues_open');
   assert.equal((await store.getProject(where)).status, 'draft');
+});
+
+withStore('a requested enhance run cannot be changed or deleted, even by direct SQL', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'r', baseModelId: 'example-base', datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft'], compute: 'nebius', spendCapUsd: 100 } });
+  await pool.query('UPDATE enhance_runs SET spend_cap_usd = 120 WHERE id = $1', [run.id]);
+  const current = await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id });
+  await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: current.updatedAt });
+  for (const sql of ['UPDATE enhance_runs SET spend_cap_usd = 99999 WHERE id = $1', "UPDATE enhance_runs SET status = 'draft', requested_at = NULL, requested_by = NULL WHERE id = $1", 'DELETE FROM enhance_runs WHERE id = $1']) {
+    await assert.rejects(pool.query(sql, [run.id]), (err) => /run_frozen/.test(err.message), sql);
+  }
+  assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).spendCapUsd, 120);
+  await assert.rejects(pool.query("INSERT INTO enhance_runs (workspace_id, name, base_model_id, status, created_by) VALUES ($1, 'x', 'example-base', 'requested', $2)", [ws.id, owner.id]), (err) => err.code === '23514', 'a requested row needs a complete plan');
+  await assert.rejects(pool.query("INSERT INTO model_pulls (workspace_id, model_id, requested_by) VALUES ($1, 'Bad Id', $2)", [ws.id, owner.id]), (err) => err.code === '23514');
+});
+
+const capitalDraft = (extra = {}) => ({ purpose: 'Pilot', requestedAmountCents: 5000000, timing: { neededBy: null, termMonths: null }, company: { legalName: 'QA ONLY Co', registrationRef: '', country: '', foundedYear: null, employees: null, website: '', description: '' }, costItems: [{ id: 'ci_1', category: 'compute', label: 'GPU hours', amountCents: 250000, period: 'one_time', basis: 'estimated', source: 'Price list', observedAt: '2026-11-01', evidenceId: null }], references: [], datasetVersions: [], ...extra });
+// The hash of exactly what sending would freeze, from the same reads a route makes.
+const capitalHash = async (store, mine) => snapshotHash(capitalSnapshot(await store.getCapitalCase(mine), await store.listCreditRecords(mine.workspaceId), await store.listCapitalEvidence(mine)));
+
+withStore('capital: the SQL draft check fails closed: missing keys, wrong types, fractions and huge amounts are false, never NULL', async (store, pool) => {
+  const valid = async (draft) => (await pool.query('SELECT capital_draft_valid($1::jsonb) AS ok', [JSON.stringify(draft)])).rows[0].ok;
+  const item = (patch) => ({ ...capitalDraft().costItems[0], ...patch });
+  const without = (key) => { const i = item({}); delete i[key]; return i; };
+  const bad = {
+    'empty object': {}, 'array draft': [], 'string draft': 'x', 'null draft': null, 'number draft': 7,
+    'costItems object': { costItems: {} }, 'costItems string': { costItems: 'x' }, 'costItems null': { costItems: null },
+    'empty item': { costItems: [{}] }, 'string item': { costItems: ['x'] }, 'null item': { costItems: [null] }, 'array item': { costItems: [[]] },
+    'no amount': { costItems: [without('amountCents')] }, 'no category': { costItems: [without('category')] }, 'no period': { costItems: [without('period')] }, 'no basis': { costItems: [without('basis')] },
+    'string amount': { costItems: [item({ amountCents: '100' })] }, 'fraction': { costItems: [item({ amountCents: 12.5 })] }, 'negative': { costItems: [item({ amountCents: -1 })] }, 'huge': { costItems: [item({ amountCents: 1000000000001 })] },
+    'null amount': { costItems: [item({ amountCents: null })] }, 'bool amount': { costItems: [item({ amountCents: true })] }, 'unknown basis': { costItems: [item({ basis: 'actual' })] }, 'null basis': { costItems: [item({ basis: null })] },
+    'incurred without evidence': { costItems: [item({ basis: 'incurred' })] }, 'incurred null evidence': { costItems: [item({ basis: 'incurred', evidenceId: null })] }, 'incurred number evidence': { costItems: [item({ basis: 'incurred', evidenceId: 7 })] },
+    'too many': { costItems: Array.from({ length: 41 }, (_, i) => item({ id: `ci_${i}` })) },
+    'amount zero': { costItems: [], requestedAmountCents: 0 }, 'amount fraction': { costItems: [], requestedAmountCents: 1.5 }, 'amount string': { costItems: [], requestedAmountCents: '5' }, 'amount huge': { costItems: [], requestedAmountCents: 1000000000001 }, 'amount object': { costItems: [], requestedAmountCents: {} },
+  };
+  for (const [name, draft] of Object.entries(bad)) assert.strictEqual(await valid(draft), false, name);
+  for (const [name, draft] of Object.entries({ 'empty list': { costItems: [] }, 'null amount key': { costItems: [], requestedAmountCents: null }, 'incomplete but valid': { costItems: [item({})] }, 'complete': capitalDraft(), 'incurred with evidence': { costItems: [item({ basis: 'incurred', evidenceId: 'e1' })] }, 'at the bounds': { costItems: [item({ amountCents: 1000000000000 })], requestedAmountCents: 1 } })) {
+    assert.strictEqual(await valid(draft), true, name);
+  }
+  // The CHECK constraint refuses the same inputs on insert, and the default draft passes.
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  for (const [name, draft] of Object.entries(bad)) {
+    await assert.rejects(pool.query("INSERT INTO capital_cases (workspace_id, title, draft, created_by) VALUES ($1, 'x', $2::jsonb, $3)", [ws.id, JSON.stringify(draft), owner.id]), (err) => err.code === '23514', `insert ${name}`);
+  }
+  assert.equal((await pool.query("INSERT INTO capital_cases (workspace_id, title, created_by) VALUES ($1, 'x', $2) RETURNING draft", [ws.id, owner.id])).rows[0].draft.costItems.length, 0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM capital_cases')).rows[0].n, 1);
+});
+
+withStore('capital: submitted revisions, credit records and review marks are frozen against direct SQL; links are checked in the database', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const other = await workspace(store, owner.id, { slug: 'other' });
+  const foreign = await store.createProject({ workspaceId: other.id, createdBy: owner.id, name: 'Theirs', task: 'x', modalities: [], startingPoint: 'own' });
+  const kase = await store.createCapitalCase({ workspaceId: ws.id, createdBy: owner.id, title: 'Pilot', draft: capitalDraft() });
+  const mine = { workspaceId: ws.id, caseId: kase.id };
+  // A case cannot point at another workspace's project, even by direct SQL.
+  await assert.rejects(pool.query('UPDATE capital_cases SET project_id = $2 WHERE id = $1', [kase.id, foreign.id]), (err) => err.code === '23503');
+  await assert.rejects(pool.query("INSERT INTO capital_cases (workspace_id, project_id, title, created_by) VALUES ($1, $2, 'x', $3)", [ws.id, foreign.id, owner.id]), (err) => err.code === '23503');
+  await assert.rejects(pool.query("UPDATE capital_cases SET status = 'submitted' WHERE id = $1", [kase.id]), (err) => err.code === '23514', 'a non-draft status needs a submitted revision');
+  await assert.rejects(pool.query("UPDATE capital_cases SET status = 'approved', submitted_revision = 1 WHERE id = $1", [kase.id]), (err) => err.code === '23514', 'lender states do not exist');
+  const evidence = await store.addCapitalEvidence({ ...mine, createdBy: owner.id, item: { kind: 'company_record', title: 'Statement', source: 'Held by the company', reference: {}, verification: 'unverified' } });
+  await assert.rejects(pool.query("INSERT INTO capital_evidence (case_id, workspace_id, kind, title, verification, created_by) VALUES ($1, $2, 'company_record', 'x', 'reviewed', $3)", [kase.id, ws.id, owner.id]), (err) => err.code === '23514', 'reviewed is not a state of the customer’s record');
+
+  const sub = await store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 1, contentHash: await capitalHash(store, mine) });
+  for (const sql of ["UPDATE capital_submissions SET snapshot = '{}'::jsonb WHERE id = $1", 'UPDATE capital_submissions SET revision = 9 WHERE id = $1', `UPDATE capital_submissions SET content_hash = '${'0'.repeat(64)}' WHERE id = $1`, 'DELETE FROM capital_submissions WHERE id = $1']) {
+    await assert.rejects(pool.query(sql, [sub.id]), (err) => /submission_frozen/.test(err.message), sql);
+  }
+  const insert = 'INSERT INTO capital_submissions (case_id, workspace_id, revision, snapshot, content_hash, submitted_by) VALUES ($1, $2, $3, $4::jsonb, $5, $6)';
+  await assert.rejects(pool.query(insert, [kase.id, ws.id, 1, '{}', 'a'.repeat(64), owner.id]), (err) => err.code === '23505', 'one submission per revision');
+  await assert.rejects(pool.query(insert, [kase.id, ws.id, 2, '{}', 'a'.repeat(64), owner.id]), (err) => err.code === '23505', 'one open submission per case');
+  await assert.rejects(pool.query(insert, [kase.id, ws.id, 2, '{}', 'not-a-hash', owner.id]), (err) => err.code === '23514', 'a submission carries the consented hash');
+  const mark = await store.markCapitalEvidenceReviewed({ caseId: kase.id, submissionId: sub.id, evidenceId: evidence.id, reviewerId: owner.id });
+  for (const sql of ['UPDATE capital_review_marks SET evidence_id = $1 WHERE id = $1', 'DELETE FROM capital_review_marks WHERE id = $1']) {
+    await assert.rejects(pool.query(sql, [mark.id]), (err) => /review_mark_frozen/.test(err.message), sql);
+  }
+  await assert.rejects(pool.query('INSERT INTO capital_review_marks (submission_id, evidence_id, reviewer_id) VALUES ($1, $2, $3)', [sub.id, evidence.id, owner.id]), (err) => err.code === '23505', 'one mark per record and submission');
+  await store.decideCapitalSubmission({ caseId: kase.id, submissionId: sub.id, reviewerId: owner.id, decision: 'changes_requested', notes: 'x' });
+  await assert.rejects(pool.query("UPDATE capital_submissions SET notes = 'y' WHERE id = $1", [sub.id]), (err) => /submission_frozen/.test(err.message), 'a decision is written once');
+  await assert.rejects(pool.query("UPDATE capital_submissions SET decision = 'evidence_reviewed' WHERE id = $1", [sub.id]), (err) => /submission_frozen/.test(err.message));
+  assert.equal((await store.listCapitalSubmissions(mine))[0].decision, 'changes_requested');
+  assert.equal((await store.listCapitalSubmissions(mine))[0].snapshot.evidence[0].verification, 'unverified', 'the frozen snapshot is unchanged by the mark');
+
+  const credit = await store.createCreditRecord({ workspaceId: ws.id, createdBy: owner.id, record: { provider: 'Cloud', status: 'claimed', amountCents: 1000000, expiresOn: '2027-06-30', restrictions: '', reference: '' } });
+  for (const sql of ['UPDATE credit_records SET amount_cents = 1 WHERE id = $1', 'DELETE FROM credit_records WHERE id = $1']) {
+    await assert.rejects(pool.query(sql, [credit.id]), (err) => /credit_record_frozen/.test(err.message), sql);
+  }
+  await assert.rejects(pool.query("INSERT INTO credit_records (workspace_id, provider, status, amount_cents, created_by) VALUES ($1, 'x', 'claimed', -1, $2)", [ws.id, owner.id]), (err) => err.code === '23514');
+  await assert.rejects(pool.query("INSERT INTO credit_records (workspace_id, provider, status, amount_cents, created_by) VALUES ($1, 'x', 'evidenced', 1, $2)", [ws.id, owner.id]), (err) => err.code === '23514', 'evidenced needs a reference');
+  await assert.rejects(pool.query("INSERT INTO credit_records (workspace_id, provider, status, amount_cents, supersedes, created_by) VALUES ($1, 'x', 'claimed', 1, $2, $3)", [other.id, credit.id, owner.id]), (err) => err.code === '23503', 'a correction stays in its workspace');
+  assert.equal((await store.listCreditRecords(ws.id))[0].expiresOn, '2027-06-30', 'dates come back as the day entered');
+});
+
+withStore('capital: parallel sends of one revision make one submission; parallel edits of one revision have one winner', async (store) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const kase = await store.createCapitalCase({ workspaceId: ws.id, createdBy: owner.id, title: 'Race', draft: capitalDraft() });
+  const mine = { workspaceId: ws.id, caseId: kase.id };
+  const edits = await Promise.allSettled(Array.from({ length: 6 }, (_, i) => store.updateCapitalCase({ ...mine, expectedRevision: 1, title: `Edit ${i}`, draft: capitalDraft() })));
+  assert.equal(edits.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.ok(edits.filter((r) => r.status === 'rejected').every((r) => r.reason.code === 'stale_revision'));
+  assert.equal((await store.getCapitalCase(mine)).revision, 2);
+  const contentHash = await capitalHash(store, mine);
+  const sends = await Promise.all(Array.from({ length: 6 }, () => store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash })));
+  assert.equal(new Set(sends.map((s) => s.id)).size, 1);
+  assert.equal((await store.listCapitalSubmissions(mine)).length, 1);
+  assert.equal((await store.listAudit(ws.id)).filter((e) => e.action === 'capital.submitted').length, 1);
+  const stale = await Promise.allSettled(Array.from({ length: 3 }, () => store.updateCapitalCase({ ...mine, expectedRevision: 2, title: 'late', draft: capitalDraft() })));
+  assert.ok(stale.every((r) => r.status === 'rejected' && r.reason.code === 'invalid_state'), 'frozen while submitted');
+});
+
+withStore('capital: references are settled on the locked row: a cited record cannot vanish under the plan, and a send recheck catches a dangling one', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const kase = await store.createCapitalCase({ workspaceId: ws.id, createdBy: owner.id, title: 'Refs', draft: capitalDraft() });
+  const mine = { workspaceId: ws.id, caseId: kase.id };
+  const evidence = await store.addCapitalEvidence({ ...mine, createdBy: owner.id, item: { kind: 'company_record', title: 'Invoice', source: 'Held by the company', reference: {}, verification: 'unverified' } });
+  const citing = capitalDraft({ costItems: [{ ...capitalDraft().costItems[0], id: 'ci_inc', basis: 'incurred', evidenceId: evidence.id }] });
+  // Deleting the record and saving a plan that cites it race: exactly one of them can win, never both.
+  for (let round = 0; round < 4; round++) {
+    const fresh = await store.createCapitalCase({ workspaceId: ws.id, createdBy: owner.id, title: `Race ${round}`, draft: capitalDraft() });
+    const where = { workspaceId: ws.id, caseId: fresh.id };
+    const ev = await store.addCapitalEvidence({ ...where, createdBy: owner.id, item: { kind: 'company_record', title: 'Invoice', source: 'x', reference: {}, verification: 'unverified' } });
+    const draft = capitalDraft({ costItems: [{ ...capitalDraft().costItems[0], basis: 'incurred', evidenceId: ev.id }] });
+    const [del, upd] = await Promise.allSettled([store.deleteCapitalEvidence({ ...where, evidenceId: ev.id }), store.updateCapitalCase({ ...where, expectedRevision: 1, title: 'Race', draft })]);
+    assert.equal([del, upd].filter((r) => r.status === 'fulfilled').length, 1, `round ${round}: one winner`);
+    if (del.status === 'fulfilled') assert.equal(upd.reason.code, 'missing_reference');
+    else assert.equal(del.reason.code, 'evidence_in_use');
+    const after = await store.getCapitalCase(where);
+    const stillThere = (await store.listCapitalEvidence(where)).some((e) => e.id === ev.id);
+    assert.equal(after.draft.costItems.some((i) => i.evidenceId === ev.id), stillThere, `round ${round}: no dangling citation`);
+  }
+  // A dangling citation written around the store (the SQL check only requires a string) is caught by the send recheck.
+  await store.updateCapitalCase({ ...mine, expectedRevision: 1, title: 'Refs', draft: citing });
+  await pool.query('DELETE FROM capital_evidence WHERE id = $1', [evidence.id]);
+  await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash: await capitalHash(store, mine) }), { code: 'missing_reference' });
+  assert.equal((await store.listCapitalSubmissions(mine)).length, 0);
+  // Same for a dataset version that is not frozen in this workspace.
+  await pool.query('UPDATE capital_cases SET draft = $2::jsonb WHERE id = $1', [kase.id, JSON.stringify(capitalDraft({ datasetVersions: [{ projectId: kase.id, version: 1 }] }))]);
+  await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash: await capitalHash(store, mine) }), { code: 'missing_reference' });
 });

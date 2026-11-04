@@ -17,6 +17,8 @@ import { createStore } from './store/index.js';
 import { registerAccountRoutes } from './accounts.js';
 import { registerDatasetRoutes } from './datasets.js';
 import { registerWorkspaceDataRoutes } from './workspace-data.js';
+import { registerModelRoutes } from './models.js';
+import { registerDeviceRoutes } from './devices.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -48,6 +50,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   if (sessions?.close) app.addHook('onClose', () => sessions.close());
   const reviewers = createReviewerSource({ store: accountStore, fileReviewers: config.reviewers });
   if (reviewers.source === 'postgres' && config.reviewers.length) app.log.warn('REVIEWERS_FILE/REVIEWERS_JSON is ignored: reviewer accounts are read from Postgres');
+  if (!config.modelCatalog.length) app.log.warn('MODEL_CATALOG_FILE is unset or lists no models: the model catalog is empty, so pulls and new enhance plans are unavailable');
   // Keeps a private, no-store header set by the route; public pages revalidate so new builds are picked up.
   const page = (reply, status = 200) => {
     if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-cache');
@@ -67,8 +70,9 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
         'img-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'media-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'font-src': ["'self'"],
-        // Sample uploads go straight to the ingest service, so the browser may also connect to it.
-        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
+        // Sample uploads go straight to the ingest service, so the browser may also connect to it. Run on this device
+        // talks to a runtime on the visitor's own loopback address; the server never proxies it.
+        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : []), ...config.localRuntimeOrigins],
         'form-action': ["'self'"],
         'base-uri': ["'self'"],
         'frame-ancestors': ["'none'"],
@@ -150,6 +154,8 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   const { guards } = await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers });
   registerDatasetRoutes(app, { config, store: accountStore, helpers, guards, ingestClient });
   registerWorkspaceDataRoutes(app, { config, store: accountStore, helpers, guards });
+  registerModelRoutes(app, { config, store: accountStore, helpers, guards });
+  registerDeviceRoutes(app, { config, store: accountStore, helpers, guards });
 
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,
