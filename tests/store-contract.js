@@ -445,15 +445,23 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal(run.status, 'draft');
     assert.equal(await store.getEnhanceRun({ workspaceId: other.id, runId: run.id }), null, 'scoped to its workspace');
     await assert.rejects(store.updateEnhanceRun({ workspaceId: other.id, runId: run.id, run: plan }), { code: 'not_found' });
-    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id }), { code: 'invalid_state' }, 'an incomplete plan cannot be requested');
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: run.updatedAt }), { code: 'invalid_state' }, 'an incomplete plan cannot be requested');
     const complete = { ...plan, datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft', 'grpo'], compute: 'nebius', spendCapUsd: 250 };
-    assert.deepEqual((await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: complete })).steps, ['sft', 'grpo']);
-    const requested = await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id });
+    const reviewed = await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: complete });
+    assert.deepEqual(reviewed.steps, ['sft', 'grpo']);
+    // Someone raises the cap after the approver opened the plan: approving the old version must fail, not freeze the new cap.
+    const raised = await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: { ...complete, spendCapUsd: 9000 } });
+    assert.notEqual(raised.updatedAt, reviewed.updatedAt, 'every edit is a new version');
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: reviewed.updatedAt }), { code: 'stale_plan' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id }), { code: 'stale_plan' }, 'an approval must name the version it approves');
+    assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).status, 'draft');
+    const current = await store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: complete });
+    const requested = await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: current.updatedAt });
     assert.equal(requested.status, 'requested');
     assert.equal(requested.requestedBy, owner.id);
     assert.ok(requested.requestedAt);
     await assert.rejects(store.updateEnhanceRun({ workspaceId: ws.id, runId: run.id, run: { ...complete, spendCapUsd: 9999 } }), { code: 'invalid_state' });
-    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id }), { code: 'invalid_state' });
+    await assert.rejects(store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: requested.updatedAt }), { code: 'invalid_state' });
     assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).spendCapUsd, 250);
     assert.equal((await store.listEnhanceRuns(ws.id)).length, 1);
     assert.ok((await store.listAudit(ws.id)).some((e) => e.action === 'enhance_run.requested'));

@@ -1,5 +1,5 @@
 import { StoreError } from './store/index.js';
-import { COMPUTE_OPTIONS, ENHANCE_METHODS, MODEL_CATALOG, catalogModel, validateEnhanceRun } from './lib/models.js';
+import { COMPUTE_OPTIONS, ENHANCE_METHODS, MODEL_CATALOG, allowsTraining, catalogModel, validateEnhanceRun } from './lib/models.js';
 
 /**
  * Models: the open-weight catalog, models pulled into a workspace, and enhance runs that post-train a pulled
@@ -11,15 +11,14 @@ export function registerModelRoutes(app, { store, guards, helpers }) {
   const { signedIn, member, post, get, fail } = guards;
   const base = '/api/workspaces/:workspaceId';
 
-  // Approved versions whose recorded rights allow training. Version manifests are frozen, so this is stable.
+  // Approved versions that are delivered data with recorded rights allowing training. A license or collection
+  // request, a missing rights record or an empty version is not training data. Manifests are frozen, so this is stable.
   const eligibleVersions = async (workspaceId) => {
     const projects = await store.listProjects(workspaceId);
     const out = [];
     for (const project of projects) {
       for (const v of await store.listDatasetVersions({ workspaceId, projectId: project.id })) {
-        const source = v.manifest?.dataSource;
-        const allowsTraining = source?.mode !== 'upload' || (source.allowedUses ?? []).includes('training');
-        if (!allowsTraining) continue;
+        if (!allowsTraining(v.manifest)) continue;
         out.push({ projectId: project.id, projectName: project.name, version: v.number, files: v.manifest?.files?.length ?? 0, labels: v.manifest?.annotations?.length ?? 0, createdAt: v.createdAt });
       }
     }
@@ -84,9 +83,16 @@ export function registerModelRoutes(app, { store, guards, helpers }) {
   app.post(`${base}/enhance-runs/:runId/request`, post([signedIn, member('manageMembers'), loadRun]), async (request, reply) => {
     const { workspaceId } = request.params;
     if (request.run.status !== 'draft') return storeFail(reply, new StoreError('invalid_state'));
+    // The approver names the exact plan they reviewed; the store refuses if it changed since (stale_plan).
+    const expectedUpdatedAt = request.body?.expectedUpdatedAt;
+    if (typeof expectedUpdatedAt !== 'string' || Number.isNaN(Date.parse(expectedUpdatedAt))) return problem(reply, 400, 'Reload the plan and approve the version you reviewed.', { code: 'stale_plan' });
+    if (expectedUpdatedAt !== request.run.updatedAt) return problem(reply, 409, 'This plan changed after you opened it. Review the current plan, then approve it.', { code: 'stale_plan', run: request.run });
     const check = validateEnhanceRun(request.run, { pulled: await pulledIds(workspaceId), eligible: await eligibleVersions(workspaceId), forRequest: true });
     if (check.errors) return problem(reply, 400, 'Finish the plan before you request it.', { errors: check.errors });
-    try { return { run: await store.requestEnhanceRun({ workspaceId, runId: request.run.id, requestedBy: request.user.id }) }; }
-    catch (err) { return storeFail(reply, err); }
+    try { return { run: await store.requestEnhanceRun({ workspaceId, runId: request.run.id, requestedBy: request.user.id, expectedUpdatedAt }) }; }
+    catch (err) {
+      if (err instanceof StoreError && err.code === 'stale_plan') return problem(reply, 409, 'This plan changed after you opened it. Review the current plan, then approve it.', { code: 'stale_plan' });
+      return storeFail(reply, err);
+    }
   });
 }

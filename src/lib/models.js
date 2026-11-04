@@ -7,7 +7,7 @@ const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, 
 export const MODEL_CATALOG = [
   {
     id: 'qwen3-8b', name: 'Qwen3-8B', maker: 'Qwen team', monogram: 'Qw', tone: 'violet', source: 'Qwen/Qwen3-8B',
-    params: '8.2B', architecture: 'dense', active: null, contextK: 128, modalities: ['text'], tags: ['reasoning'],
+    params: '8.2B', architecture: 'dense', active: null, contextK: 32, contextNote: '131K with YaRN scaling', modalities: ['text'], tags: ['reasoning'],
     license: 'Apache 2.0', commercial: true, licenseNote: 'Keep the LICENSE and NOTICE files when you share the weights.',
     formats: [{ format: 'bf16', gb: 16.4 }, { format: 'FP8', gb: 8.2 }, { format: '4-bit', gb: 5.0 }], loraGpus: 1,
     summary: 'A dense 8B text model, strong at reasoning and following instructions. A good first base for a company assistant: one GPU fine-tunes it.',
@@ -42,7 +42,7 @@ export const MODEL_CATALOG = [
   },
   {
     id: 'qwen3-30b-a3b', name: 'Qwen3-30B-A3B', maker: 'Qwen team', monogram: 'Qw', tone: 'violet', source: 'Qwen/Qwen3-30B-A3B',
-    params: '30.5B', architecture: 'moe', active: '3.3B', contextK: 128, modalities: ['text'], tags: ['reasoning'],
+    params: '30.5B', architecture: 'moe', active: '3.3B', contextK: 32, contextNote: '131K with YaRN scaling', modalities: ['text'], tags: ['reasoning'],
     license: 'Apache 2.0', commercial: true, licenseNote: 'Keep the LICENSE and NOTICE files when you share the weights.',
     formats: [{ format: 'bf16', gb: 61 }, { format: 'FP8', gb: 31 }, { format: '4-bit', gb: 17 }], loraGpus: 4,
     summary: 'A mixture-of-experts model: 8 of 128 experts run per token, so it knows like a 30B model and runs like a 3B one.',
@@ -64,6 +64,12 @@ export const COMPUTE_OPTIONS = [
 ];
 
 export const MAX_SPEND_CAP_USD = 100000;
+export const MAX_RUN_DATASETS = 20;
+
+/** A frozen version manifest is training data only if files were delivered under an uploaded rights record that allows training. */
+export const allowsTraining = (manifest) => manifest?.dataSource?.mode === 'upload'
+  && Array.isArray(manifest.dataSource.allowedUses) && manifest.dataSource.allowedUses.includes('training')
+  && Array.isArray(manifest.files) && manifest.files.length > 0;
 export const catalogModel = (id) => MODEL_CATALOG.find((m) => m.id === id) ?? null;
 
 /**
@@ -79,7 +85,10 @@ export function validateEnhanceRun(raw, { pulled, eligible, forRequest = false }
   else if (!pulled.has(baseModelId)) errors.baseModelId = 'Pull this model into the workspace first.';
 
   const datasets = [];
-  for (const d of Array.isArray(body.datasets) ? body.datasets.slice(0, 20) : []) {
+  const asked = Array.isArray(body.datasets) ? body.datasets : [];
+  // An approval plan is never silently changed: too many versions is an error, not a truncation.
+  if (asked.length > MAX_RUN_DATASETS) errors.datasets = `Choose at most ${MAX_RUN_DATASETS} dataset versions for one run.`;
+  for (const d of asked.length > MAX_RUN_DATASETS ? [] : asked) {
     const version = Number(d?.version);
     const match = eligible.find((e) => e.projectId === d?.projectId && e.version === version);
     if (!match) { errors.datasets = 'Only approved dataset versions that allow training can be used.'; break; }
@@ -93,7 +102,10 @@ export function validateEnhanceRun(raw, { pulled, eligible, forRequest = false }
 
   let spendCapUsd = null;
   if (body.spendCapUsd != null && body.spendCapUsd !== '') {
-    const cap = Number(body.spendCapUsd);
+    // Whole dollars only, written plainly: "12.5", "-5", "1e3" or "0x10" are refused, never rewritten.
+    const raw = body.spendCapUsd;
+    // Only a number or a plain string: an array such as [250] would otherwise stringify to "250".
+    const cap = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
     if (!Number.isInteger(cap) || cap < 1 || cap > MAX_SPEND_CAP_USD) errors.spendCapUsd = `Set a whole-dollar cap between $1 and $${MAX_SPEND_CAP_USD.toLocaleString('en-US')}.`;
     else spendCapUsd = cap;
   }

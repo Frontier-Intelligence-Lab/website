@@ -68,7 +68,7 @@ export const api = {
   enhanceRun: (id, runId) => load(`/api/workspaces/${id}/enhance-runs/${runId}`),
   createEnhanceRun: (id, plan) => request(`/api/workspaces/${id}/enhance-runs`, plan),
   updateEnhanceRun: (id, runId, plan) => request(`/api/workspaces/${id}/enhance-runs/${runId}`, plan),
-  requestEnhanceRun: (id, runId) => request(`/api/workspaces/${id}/enhance-runs/${runId}/request`, {}),
+  requestEnhanceRun: (id, runId, expectedUpdatedAt) => request(`/api/workspaces/${id}/enhance-runs/${runId}/request`, { expectedUpdatedAt }),
   staffReviews: (status = 'pending') => load(`/api/staff/reviews?status=${status}`),
   staffReview: (reviewId) => load(`/api/staff/reviews/${reviewId}`),
   staffDecide: (reviewId, body) => request(`/api/staff/reviews/${reviewId}/decision`, body),

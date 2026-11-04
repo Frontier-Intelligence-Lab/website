@@ -4,6 +4,7 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY vite.config.js ./
 COPY web ./web
+COPY src/lib/onboarding.js src/lib/models.js ./src/lib/
 RUN npm run build
 
 FROM node:24-alpine AS deps
