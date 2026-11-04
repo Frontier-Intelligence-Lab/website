@@ -22,6 +22,9 @@ const DATASET_PAGES = [
   ['versions', 'Versions', '/versions'],
 ];
 
+// Capital (cost plan, financing request, evidence) is for the people who run the company and its finances.
+export const CAPITAL_ROLES = ['owner', 'admin', 'finance'];
+
 // Models pages, shown under Models while you are in one of them.
 const MODEL_PAGES = [
   ['models-catalog', 'Catalog', ''],
@@ -88,9 +91,10 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
           )}
           <Link to={`/w/${entry.slug}/device`} title="Run on this device" aria-current={current === 'device' ? 'page' : undefined}><Tile icon="play" tone="green" size="sm" /><span className="ob-side-label">Run on this device</span></Link>
           <Link to={`/w/${entry.slug}/memory`} title="Memory" aria-current={current === 'memory' ? 'page' : undefined}><Tile icon="data" tone="teal" size="sm" /><span className="ob-side-label">Memory</span></Link>
-          {entry.kind === 'organization' && <a aria-disabled="true" title="Financing: planned, not available yet"><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Financing</span> <span className="ob-badge">Planned</span></a>}
+          {entry.kind === 'organization' && CAPITAL_ROLES.includes(role) && <Link to={`/w/${entry.slug}/capital`} title="Capital" aria-current={current.startsWith('capital') ? 'page' : undefined}><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Capital</span></Link>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`} title="Team"><Tile icon="people" tone="violet" size="sm" /><span className="ob-side-label">Team</span></Link>}
           {account.isStaff && <Link to="/staff" title="Review queue"><Tile icon="shield" tone="green" size="sm" /><span className="ob-side-label">Review queue</span></Link>}
+          {account.isStaff && <Link to="/staff/capital" title="Capital review"><Tile icon="bank" tone="green" size="sm" /><span className="ob-side-label">Capital review</span></Link>}
         </nav>
         <div className="ob-side-foot">
           <ThemeToggle className="icon-btn ob-side-theme" />

@@ -60,6 +60,7 @@ function accountRoutes() {
   const models = () => import('./app/models.jsx');
   const device = () => import('./app/device.jsx');
   const memory = () => import('./app/memory.jsx');
+  const capital = () => import('./app/capital.jsx');
   return [
     { path: '/signup', lazy: page(auth, 'SignUp', 'signUpLoader') },
     { path: '/signin', lazy: page(auth, 'SignIn', 'signInLoader') },
@@ -90,8 +91,14 @@ function accountRoutes() {
     { path: '/w/:slug/models/runs', lazy: page(models, 'EnhanceRuns', 'modelsLoader') },
     { path: '/w/:slug/models/runs/new', lazy: page(models, 'EnhanceRun', 'enhanceLoader') },
     { path: '/w/:slug/models/runs/:runId', lazy: page(models, 'EnhanceRun', 'enhanceLoader') },
+    { path: '/w/:slug/capital', lazy: page(capital, 'CapitalHome', 'capitalLoader') },
+    { path: '/w/:slug/capital/cases/:caseId', lazy: page(capital, 'CapitalPlan', 'caseLoader') },
+    { path: '/w/:slug/capital/cases/:caseId/request', lazy: page(capital, 'CapitalRequest', 'caseLoader') },
+    { path: '/w/:slug/capital/cases/:caseId/evidence', lazy: page(capital, 'CapitalEvidence', 'caseLoader') },
     { path: '/invite/:token', lazy: page(invite, 'Invite', 'inviteLoader') },
     { path: '/staff', lazy: page(staff, 'StaffQueue', 'queueLoader') },
     { path: '/staff/reviews/:reviewId', lazy: page(staff, 'StaffReview', 'reviewLoader') },
+    { path: '/staff/capital', lazy: page(capital, 'StaffCapitalQueue', 'staffCapitalLoader') },
+    { path: '/staff/capital/:caseId', lazy: page(capital, 'StaffCapitalCase', 'staffCapitalCaseLoader') },
   ].map((route) => ({ ...route, ErrorBoundary: RouteError, HydrateFallback: Loading }));
 }
