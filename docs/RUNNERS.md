@@ -20,7 +20,7 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 
 ## In the app
 
-**Compute** (`/w/:slug/compute`, added by the stacked Compute screen increment on top of this API) lists the workspace's runners with what each one reports: GPUs, sandbox, Ollama models and platform, and whether it is online (reported within the last 90 seconds). Owners and admins link a machine there, which shows the key once with the commands to start the runner. Plans approved with compute set to **Your Valcairn Runner** are listed with **Start training**. A finished training job shows the held-out loss of the base and the tuned model, the example counts, the steps and time, the adapter's SHA-256 and the loss curve. They can also run a sandbox check or disconnect a runner. Each job shows its status, its attempt and a live event timeline. A job that has not finished can be cancelled.
+**Compute** (`/w/:slug/compute`) lists the workspace's runners with what each one reports: GPUs, sandbox, Ollama models and platform, and whether it is online (reported within the last 90 seconds). Owners and admins link a machine there, which shows the key once with the commands to start the runner. Plans approved with compute set to **Your Valcairn Runner** are listed with **Start training**. A finished training job shows the held-out loss of the base and the tuned model, the example counts, the steps and time, the adapter's SHA-256 and the loss curve. They can also run a sandbox check or disconnect a runner. Each job shows its status, its attempt and a live event timeline. A job that has not finished can be cancelled.
 
 ## Rules
 
@@ -75,8 +75,8 @@ Errors: `401 runner_key_invalid`, `401 runner_owner_inactive`, `404` (another ru
 - Cancel works both while a job waits and while it runs. A `succeeded` finish after cancel is recorded as `cancelled`, and no new inputs are issued after cancel.
 - A lease that expires while its call waits for the row lock is refused (Postgres, two connections).
 - Reusing a request key for a different training run or adapter is `409`, also when the two requests race.
-- A malformed successful result is refused by kind. (The Compute screen increment tests that a malformed stored record renders without crashing.)
-- A job with 550 events is read in two pages, 500 and 50, with nothing dropped.
+- A malformed successful result is refused by kind, and Compute renders a malformed stored record without crashing.
+- A job with 550 events is read in two pages and Compute shows all 550.
 - Revoking a runner ends its jobs, and a revoked runner gets no new jobs.
 - Another workspace's runner gets `404` for this workspace's jobs and cannot be used for them.
 - A training job without an approved runner plan is refused, and so is a probe that carries a plan.

@@ -1,8 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createMemoryStore } from '../src/store/memory.js';
 import { LEASE_MS, MAX_ATTEMPTS, bearerKey, buildJobSpec, projectResult, stableJson, validateCapabilities, validateEvents, validateFinish } from '../src/lib/jobs.js';
 import { FIXTURE_CATALOG, makeApp, json, postHeaders } from './helpers.js';
+import * as fmt from '../web/src/app/job-format.js';
 
 function client(app) {
   let cookies = {};
@@ -424,4 +429,57 @@ test('review 2: one request key means one complete request, including the traini
   // Two different requests racing under one fresh key: exactly one wins, the other is a conflict.
   const race = await Promise.all(trained.map((t) => ask(t.id, 'eval-key-race1')));
   assert.deepEqual(race.map((r) => r.statusCode).sort(), [200, 409]);
+});
+
+test('review 6: the demo seed refuses any target but a disposable local database, before writing anything', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'valcairn-seed-'));
+  const objects = join(dir, 'objects');
+  const run = (DATABASE_URL, extra = []) => {
+    const env = { ...process.env, NODE_ENV: 'development', MODEL_CATALOG_FILE: FIXTURE_CATALOG };
+    delete env.DATABASE_URL;
+    if (DATABASE_URL) env.DATABASE_URL = DATABASE_URL;
+    return spawnSync(process.execPath, ['scripts/seed-train-demo.js', '--model', 'fixture-dense-8b', '--objects', objects, ...extra], { env, encoding: 'utf8' });
+  };
+  try {
+    const cases = [
+      [undefined, /Set DATABASE_URL/],
+      ['postgresql://u:synthetic-pass@db.example.com:5432/valcairn_demo', /this machine/],
+      ['postgresql://u:synthetic-pass@127.0.0.1:5432/valcairn', /"demo", "test" or "qa"/],
+      ['mysql://u:synthetic-pass@127.0.0.1:5432/valcairn_demo', /postgres/],
+      ['postgresql://u:synthetic-pass@127.0.0.1:5432/valcairn_demo', /--disposable-db/],
+    ];
+    for (const [url, message] of cases) {
+      const res = run(url);
+      assert.equal(res.status, 2, `${url}: ${res.stdout}${res.stderr}`);
+      assert.match(res.stderr, message);
+      assert.ok(!res.stderr.includes('synthetic-pass') && !res.stdout.includes('synthetic-pass'), 'credentials are never printed');
+    }
+    assert.equal(existsSync(objects), false, 'nothing was written');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('review 7: the seed stores a valid acceptance rule and labels its review as a synthetic fixture', () => {
+  const source = readFileSync('scripts/seed-train-demo.js', 'utf8');
+  assert.match(source, /requireResolved: true/);
+  assert.match(source, /Synthetic demo fixture: approved by the seed script, not reviewed by a person\./);
+  assert.match(source, /rights: true, consent: true, labels: true, duplicates: true, format: true/);
+  assert.match(source, /if \(ruleProblem\(success\)\) fail/);
+});
+
+test('review 3: Compute formats malformed stored results as dashes instead of throwing', () => {
+  const malformed = ['2.1', null, undefined, {}, [], Number.NaN, Infinity, true, { toFixed: 1 }];
+  for (const v of malformed) {
+    assert.equal(fmt.fix(v, 2), '—');
+    assert.equal(fmt.pct(v, 1), '—');
+    assert.equal(fmt.mb(v), '—');
+    assert.equal(fmt.hash(v), '—');
+    assert.deepEqual(fmt.list(v), Array.isArray(v) ? v : []);
+  }
+  assert.equal(fmt.txt({ prompt: 'x' }), '—');
+  assert.equal(fmt.txt('x'.repeat(500), 10), 'x'.repeat(10));
+  assert.deepEqual(fmt.obj('x'), {});
+  assert.deepEqual(fmt.obj([1]), {});
+  assert.equal(fmt.fix(1.23456, 2), '1.23');
+  assert.equal(fmt.hash('c'.repeat(64)), `${'c'.repeat(16)}…`);
+  assert.equal(fmt.hash('C'.repeat(64)), '—');
 });
