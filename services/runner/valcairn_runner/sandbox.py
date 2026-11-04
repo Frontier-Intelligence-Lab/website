@@ -65,6 +65,15 @@ class Sandbox:
         if name:
             self._run(["docker", "kill", name], capture_output=True, timeout=30, check=False)
 
+    def _wait(self, proc, grace: float = 60.0) -> int:
+        """Waits for the docker client; if it does not exit after a kill, it is killed too, so the runner never hangs."""
+        try:
+            return proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            self.stop()
+            proc.kill()
+            return proc.wait(timeout=grace)
+
     def run(self, step: Step, on_line, cancelled: threading.Event) -> int:
         """Runs one step, calling on_line for each output line. Returns the exit code; raises Cancelled or TimeoutError."""
         name = f"valcairn-{uuid.uuid4().hex[:12]}"
@@ -77,6 +86,7 @@ class Sandbox:
             self.stop()
 
         timer = threading.Timer(step.limits.seconds, on_timeout)
+        proc = None
         try:
             proc = self._popen(docker_args(step, name), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
             timer.start()
@@ -85,7 +95,13 @@ class Sandbox:
                     self.stop()
                     break
                 on_line(line.rstrip("\n"))
-            code = proc.wait()
+            code = self._wait(proc)
+        except BaseException:
+            # Whatever went wrong on this side, the container must not outlive the step.
+            self.stop()
+            if proc is not None:
+                self._wait(proc)
+            raise
         finally:
             timer.cancel()
             with self._lock:

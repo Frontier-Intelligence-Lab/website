@@ -174,5 +174,77 @@ class ApiErrorTests(unittest.TestCase):
             Api("https://v.example", KEY, opener=opener(500, b"not json")).lease()
 
 
+class SandboxLifetimeTests(unittest.TestCase):
+    """The container never outlives its step, and the runner never waits forever on it."""
+
+    class Proc:
+        def __init__(self, lines, hang=False):
+            self.stdout = iter(lines)
+            self.hang, self.killed, self.waits = hang, False, 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.hang and not self.killed:
+                import subprocess
+                raise subprocess.TimeoutExpired("docker", timeout)
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    def make(self, proc):
+        from valcairn_runner.sandbox import Sandbox
+        kills = []
+        box = Sandbox(popen=lambda *a, **k: proc, run=lambda args, **k: kills.append(args))
+        return box, kills
+
+    def test_a_failing_line_handler_stops_the_container(self):
+        proc = self.Proc(["one", "two"])
+        box, kills = self.make(proc)
+
+        def bad(line):
+            raise RuntimeError("handler bug")
+        with self.assertRaises(RuntimeError):
+            box.run(Step(image="img", command=["x"]), bad, threading.Event())
+        self.assertTrue(kills and kills[0][:2] == ["docker", "kill"], "docker kill was called")
+
+    def test_a_docker_client_that_will_not_exit_is_killed(self):
+        proc = self.Proc([], hang=True)
+        box, kills = self.make(proc)
+        self.assertEqual(box.run(Step(image="img", command=["x"]), lambda line: None, threading.Event()), 0)
+        self.assertTrue(proc.killed)
+        self.assertTrue(kills)
+
+
+class EventOrderTests(unittest.TestCase):
+    def test_a_refused_batch_is_dropped_not_resent_forever(self):
+        class Refusing(FakeApi):
+            def events(self, job_id, token, events):
+                self.calls.append("events")
+                raise ApiError(400, {"errors": {"events": "bad"}})
+        api = Refusing()
+        run_job(api, job(), FakeSandbox(lines=["GPU A, 24000, 1.0"]), FAST, CAPS)
+        self.assertLessEqual(api.calls.count("events"), 3)
+
+    def test_concurrent_flushes_keep_sequence_order(self):
+        from valcairn_runner.runner import JobContext
+        gate = threading.Event()
+
+        class Slow(FakeApi):
+            def events(self, job_id, token, events):
+                gate.wait(2)
+                return super().events(job_id, token, events)
+        api = Slow()
+        ctx = JobContext(api, job(), FakeSandbox(), FAST, CAPS)
+        for i in range(60):
+            ctx._pending.append({"seq": i, "kind": "log", "data": {"level": "info", "message": str(i)}})
+        first = threading.Thread(target=ctx.flush)
+        first.start()
+        ctx.flush()  # skipped while the first is sending
+        gate.set()
+        first.join()
+        ctx.flush()
+        self.assertEqual([e["seq"] for e in api.events_sent], list(range(60)))
+
 if __name__ == "__main__":
     unittest.main()

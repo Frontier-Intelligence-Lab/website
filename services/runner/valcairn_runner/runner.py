@@ -35,12 +35,15 @@ class JobContext:
         self._seq = 0
         self._pending: list[dict] = []
         self._lock = threading.Lock()
+        # One flush at a time, so a failed batch is put back before any later batch is sent: order is kept.
+        self._flushing = threading.Lock()
 
     def emit(self, kind: str, **data) -> None:
         with self._lock:
             self._pending.append({"seq": self._seq, "kind": kind, "data": data})
             self._seq += 1
-        if len(self._pending) >= 20:
+            full = len(self._pending) >= 20
+        if full:
             self.flush()
 
     def log(self, message: str, level: str = "info") -> None:
@@ -48,6 +51,14 @@ class JobContext:
 
     def flush(self) -> None:
         """Send buffered events. A failed send keeps them; the same sequence numbers make the retry safe."""
+        if not self._flushing.acquire(blocking=False):
+            return  # another thread is sending; it keeps the order
+        try:
+            self._send()
+        finally:
+            self._flushing.release()
+
+    def _send(self) -> None:
         with self._lock:
             batch, self._pending = self._pending[:50], self._pending[50:]
         if not batch:
@@ -57,7 +68,14 @@ class JobContext:
             self._note(reply["job"])
         except LeaseLost:
             self._lose()
-        except (OSError, ApiError):
+        except ApiError as err:
+            # Refused as invalid: resending cannot help, so the batch is dropped (and the reason logged here).
+            if err.status == 400:
+                log.warning("Valcairn refused %s event(s): %s", len(batch), err.body.get("errors"))
+            else:
+                with self._lock:
+                    self._pending = batch + self._pending
+        except OSError:
             with self._lock:
                 self._pending = batch + self._pending
 
