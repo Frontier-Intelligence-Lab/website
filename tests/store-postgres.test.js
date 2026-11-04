@@ -1136,3 +1136,51 @@ withStore('capital: references are settled on the locked row: a cited record can
   await pool.query('UPDATE capital_cases SET draft = $2::jsonb WHERE id = $1', [kase.id, JSON.stringify(capitalDraft({ datasetVersions: [{ projectId: kase.id, version: 1 }] }))]);
   await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash: await capitalHash(store, mine) }), { code: 'missing_reference' });
 });
+
+withStore('evaluation: direct SQL cannot change frozen cases, versions, imports or reports, and deleting the workspace fails closed', async (store, pool) => {
+  const owner = await user(store, 'eval-sql@example.test');
+  const ws = await workspace(store, owner.id, { slug: 'eval-sql', name: 'Eval SQL' });
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Support', task: 'Answer policy questions.', modalities: ['Text'], startingPoint: 'model' });
+  await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: { measure: 'exact', target: 'the cited policy' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'] } } });
+  const review = await store.submitForReview({ workspaceId: ws.id, projectId: project.id, submittedBy: owner.id });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+  const dataset = await store.createDatasetVersion({ workspaceId: ws.id, projectId: project.id, createdBy: owner.id });
+  const set = await store.createEvalSet({ workspaceId: ws.id, projectId: project.id, createdBy: owner.id, name: 'SQL', purpose: 'development' });
+  const source = { projectId: project.id, versionId: dataset.id, fileId: null };
+  const saved = await store.saveEvalCase({ workspaceId: ws.id, projectId: project.id, setId: set.id, expectedRevision: set.revision, input: { id: 'a', input: 'Question a', expectedAnswer: '30 days', sources: [source] } });
+  const detail = await store.getEvalSet({ workspaceId: ws.id, projectId: project.id, setId: set.id });
+  const frozen = await store.freezeEvalSet({ workspaceId: ws.id, projectId: project.id, setId: set.id, expectedRevision: detail.set.revision, actorId: owner.id });
+  const jsonl = '{"id":"a","status":"answered","output":"30 days"}\n';
+  const baseline = await store.importEvalPredictions({ workspaceId: ws.id, projectId: project.id, versionId: frozen.id, role: 'baseline', label: 'old', claimedSystem: {}, claimedScorer: null, filename: 'a.jsonl', jsonl, importedBy: owner.id });
+  const candidate = await store.importEvalPredictions({ workspaceId: ws.id, projectId: project.id, versionId: frozen.id, role: 'candidate', label: 'new', claimedSystem: {}, claimedScorer: null, filename: 'b.jsonl', jsonl, importedBy: owner.id });
+  const comparison = await store.createEvalComparison({ workspaceId: ws.id, projectId: project.id, setId: set.id, versionId: frozen.id, baselineBatchId: baseline.batch.id, candidateBatchId: candidate.batch.id, createdBy: owner.id });
+  const preview = await store.readEvalComparison({ workspaceId: ws.id, comparisonId: comparison.id });
+  const report = await store.approveEvalReport({ workspaceId: ws.id, comparisonId: comparison.id, expectedRevision: comparison.revision, contentHash: preview.contentHash, approvedBy: owner.id });
+  const predictionId = (await pool.query('SELECT id FROM eval_predictions WHERE batch_id = $1', [baseline.batch.id])).rows[0].id;
+  const refused = [
+    ['UPDATE eval_cases SET input = $2 WHERE id = $1', [saved.id, 'Changed by SQL']],
+    ['DELETE FROM eval_cases WHERE id = $1', [saved.id]],
+    ['UPDATE eval_sets SET acceptance = $2::jsonb WHERE id = $1', [set.id, JSON.stringify({ version: 1 })]],
+    ['UPDATE eval_set_versions SET content_hash = $2 WHERE id = $1', [frozen.id, 'a'.repeat(64)]],
+    ['DELETE FROM eval_set_versions WHERE id = $1', [frozen.id]],
+    ['UPDATE eval_batches SET label = $2 WHERE id = $1', [baseline.batch.id, 'renamed']],
+    ['DELETE FROM eval_batches WHERE id = $1', [baseline.batch.id]],
+    ['UPDATE eval_predictions SET output = $2 WHERE id = $1', [predictionId, 'rewritten']],
+    ['DELETE FROM eval_predictions WHERE id = $1', [predictionId]],
+    ['UPDATE eval_reports SET decision = $2 WHERE id = $1', [report.id, 'pass']],
+    ['DELETE FROM eval_reports WHERE id = $1', [report.id]],
+  ];
+  for (const [sql, params] of refused) {
+    await assert.rejects(pool.query(sql, params), (err) => /eval_frozen/.test(err.message), sql);
+  }
+  await assert.rejects(pool.query('DELETE FROM workspaces WHERE id = $1', [ws.id]), (err) => /eval_frozen/.test(err.message));
+  const reopened = await store.reopenEvalSet({ workspaceId: ws.id, projectId: project.id, setId: set.id, actorId: owner.id });
+  await pool.query('UPDATE eval_cases SET input = $2 WHERE set_id = $1', [set.id, 'Edited after reopen']);
+  const kept = await pool.query('SELECT manifest, content_hash FROM eval_set_versions WHERE id = $1', [frozen.id]);
+  assert.equal(kept.rows[0].manifest.cases[0].input, 'Question a');
+  assert.equal(kept.rows[0].content_hash, frozen.contentHash);
+  const frozenReport = await pool.query('SELECT snapshot FROM eval_reports WHERE id = $1', [report.id]);
+  assert.equal(frozenReport.rows[0].snapshot.cases[0].input, 'Question a');
+  assert.equal(reopened.revision, detail.set.revision + 1);
+  await assert.rejects(pool.query('DELETE FROM eval_reports WHERE id = $1', [report.id]), (err) => /eval_frozen/.test(err.message));
+});
