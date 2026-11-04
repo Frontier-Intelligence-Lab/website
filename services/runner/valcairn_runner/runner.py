@@ -19,6 +19,10 @@ log = logging.getLogger("valcairn_runner")
 class Settings:
     ollama_host: str = "http://127.0.0.1:11434"
     probe_image: str = "ubuntu:24.04"
+    train_image: str = "valcairn-train:0.1"
+    home: str = ""  # where inputs, model caches and outputs live; defaults to ~/.valcairn-runner
+    train_memory: str = "32g"
+    train_seconds: int = 4 * 3600
     poll_seconds: float = 5.0
     report_seconds: float = 30.0
     touch_seconds: float = 15.0
@@ -57,7 +61,14 @@ class JobContext:
             self._note(reply["job"])
         except LeaseLost:
             self._lose()
-        except (OSError, ApiError):
+        except ApiError as err:
+            # Refused as invalid: resending cannot help, so the batch is dropped (and the reason logged here).
+            if err.status != 400:
+                with self._lock:
+                    self._pending = batch + self._pending
+            else:
+                log.warning("Valcairn refused %s event(s): %s", len(batch), err.body.get("errors"))
+        except OSError:
             with self._lock:
                 self._pending = batch + self._pending
 

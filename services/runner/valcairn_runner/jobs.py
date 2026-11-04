@@ -4,13 +4,9 @@ from __future__ import annotations
 
 from .machine import parse_nvidia_smi
 from .sandbox import Limits, Step
+from .training import JobFailure, train
 
 
-class JobFailure(Exception):
-    def __init__(self, category: str, message: str = "", retryable: bool = False):
-        super().__init__(message or category)
-        self.category = category
-        self.retryable = retryable
 
 
 def probe(ctx) -> dict:
@@ -38,4 +34,4 @@ def probe(ctx) -> dict:
     return {**result, "sandbox": True, "network": "none", "sandboxGpus": seen}
 
 
-HANDLERS = {"probe": probe}
+HANDLERS = {"probe": probe, "train": train}

@@ -84,5 +84,8 @@ class Api:
     def events(self, job_id: str, token: str, events: list[dict]) -> dict:
         return self._call("POST", f"/api/runner/jobs/{urllib.parse.quote(job_id)}/events", {"leaseToken": token, "events": events})
 
+    def inputs(self, job_id: str, token: str) -> dict:
+        return self._call("POST", f"/api/runner/jobs/{urllib.parse.quote(job_id)}/inputs", {"leaseToken": token})
+
     def finish(self, job_id: str, token: str, **outcome) -> dict:
         return self._call("POST", f"/api/runner/jobs/{urllib.parse.quote(job_id)}/finish", {"leaseToken": token, **outcome})["job"]
