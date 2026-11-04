@@ -999,7 +999,8 @@ withStore('a requested enhance run cannot be changed or deleted, even by direct 
   const ws = await workspace(store, owner.id);
   const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'r', baseModelId: 'qwen3-8b', datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft'], compute: 'nebius', spendCapUsd: 100 } });
   await pool.query('UPDATE enhance_runs SET spend_cap_usd = 120 WHERE id = $1', [run.id]);
-  await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id });
+  const current = await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id });
+  await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: current.updatedAt });
   for (const sql of ['UPDATE enhance_runs SET spend_cap_usd = 99999 WHERE id = $1', "UPDATE enhance_runs SET status = 'draft', requested_at = NULL, requested_by = NULL WHERE id = $1", 'DELETE FROM enhance_runs WHERE id = $1']) {
     await assert.rejects(pool.query(sql, [run.id]), (err) => /run_frozen/.test(err.message), sql);
   }

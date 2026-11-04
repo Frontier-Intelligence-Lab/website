@@ -666,15 +666,20 @@ export function createPostgresStore(options) {
         if (!current) throw new StoreError('not_found');
         if (current.status !== 'draft') throw new StoreError('invalid_state');
         return runRow((await query(`UPDATE enhance_runs SET name = $3, base_model_id = $4, datasets = $5::jsonb, steps = $6::jsonb, compute = $7,
-          spend_cap_usd = $8, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 RETURNING *`,
+          spend_cap_usd = $8, updated_at = greatest(clock_timestamp(), date_trunc('milliseconds', updated_at) + interval '1 millisecond')
+          WHERE workspace_id = $1 AND id = $2 RETURNING *`,
         [workspaceId, runId, run.name, run.baseModelId, JSON.stringify(run.datasets), JSON.stringify(run.steps), run.compute, run.spendCapUsd], client)).rows[0]);
       });
     },
-    async requestEnhanceRun({ workspaceId, runId, requestedBy }) {
+    async requestEnhanceRun({ workspaceId, runId, requestedBy, expectedUpdatedAt }) {
       if (!isId(workspaceId) || !isId(runId)) throw new StoreError('not_found');
+      const expected = expectedUpdatedAt == null ? NaN : Date.parse(expectedUpdatedAt);
       return transaction(async (client) => {
         const current = (await query('SELECT * FROM enhance_runs WHERE workspace_id = $1 AND id = $2 FOR UPDATE', [workspaceId, runId], client)).rows[0];
         if (!current) throw new StoreError('not_found');
+        if (current.status !== 'draft') throw new StoreError('invalid_state');
+        // Compared at the millisecond precision the API exposes, under the row lock, so a concurrent edit cannot slip in.
+        if (Number.isNaN(expected) || new Date(current.updated_at).getTime() !== expected) throw new StoreError('stale_plan');
         if (current.status !== 'draft' || !current.datasets.length || !current.steps.length || !current.compute || current.spend_cap_usd == null) throw new StoreError('invalid_state');
         const row = (await query(`UPDATE enhance_runs SET status = 'requested', requested_by = $3, requested_at = clock_timestamp(), updated_at = clock_timestamp()
           WHERE workspace_id = $1 AND id = $2 RETURNING *`, [workspaceId, runId, requestedBy], client)).rows[0];
