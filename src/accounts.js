@@ -9,6 +9,9 @@ const CAN = {
   manageMembers: ['owner', 'admin'],
   writeProjects: ['owner', 'admin', 'member'],
   readProjects: ROLES,
+  // Financial detail is for the people who run the company and its finances; members and viewers never receive it.
+  readCapital: ['owner', 'admin', 'finance'],
+  writeCapital: ['owner', 'admin', 'finance'],
 };
 const CODE_TTL_MS = 15 * 60 * 1000;
 const INVITE_TTL_MS = 7 * 86400 * 1000;

@@ -19,6 +19,7 @@ import { registerDatasetRoutes } from './datasets.js';
 import { registerWorkspaceDataRoutes } from './workspace-data.js';
 import { registerModelRoutes } from './models.js';
 import { registerDeviceRoutes } from './devices.js';
+import { registerCapitalRoutes } from './capital.js';
 import { registerJobRoutes } from './jobs.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
@@ -158,6 +159,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   registerWorkspaceDataRoutes(app, { config, store: accountStore, helpers, guards });
   registerModelRoutes(app, { config, store: accountStore, helpers, guards });
   registerDeviceRoutes(app, { config, store: accountStore, helpers, guards });
+  registerCapitalRoutes(app, { config, store: accountStore, helpers, guards });
   registerJobRoutes(app, { config, store: accountStore, helpers, guards });
 
   app.get('/api/config', async () => ({
