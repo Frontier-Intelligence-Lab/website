@@ -82,16 +82,24 @@ export function AgentsPage() {
       bump();
     }
   }
+  // Approve and Decline act on exactly the draft revision this screen rendered, in one guarded ledger transaction.
+  // If another tab changed the run meanwhile, nothing is written: the stored record wins, this screen reloads it
+  // and says why. A refused approval never starts an execution.
   async function approve(run) {
     try {
-      await ledger.putGrant(newGrant(run));
-      const approved = await ledger.updateRun(run.id, { status: 'approved', approvedAt: new Date().toISOString() });
+      const { run: approved } = await ledger.approveDraft(run.id, run.revision, newGrant);
       bump();
       await execute(approved);
-    } catch (err) { setNotice({ tone: 'warn', text: explainAgent(err) }); }
+    } catch (err) { await refused(run, err); }
   }
   async function decline(run) {
-    try { await ledger.updateRun(run.id, { declinedAt: new Date().toISOString() }); bump(); } catch (err) { setNotice({ tone: 'warn', text: explainAgent(err) }); }
+    try { await ledger.declineDraft(run.id, run.revision); bump(); } catch (err) { await refused(run, err); }
+  }
+  async function refused(run, err) {
+    setNotice({ tone: 'warn', text: explainAgent(err) });
+    const current = await ledger.run(run.id).catch(() => null);
+    if (!current) setSelectedId(null);
+    bump();
   }
   // Delete history takes the ledger lock exclusively: refused while any tab executes a run, never queued behind it.
   async function clearHistory() {

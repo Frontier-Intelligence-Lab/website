@@ -22,7 +22,7 @@ const NAMES = Object.keys(STORES);
 export const dbName = (workspaceId, userId) => `valcairn-agent.${workspaceId}.${userId}`;
 export const scopeKeyOf = (workspaceId, userId) => `${workspaceId}.${userId}`;
 
-/** Records kept in memory, copied on the way in and out like IndexedDB copies them. */
+/** Records kept in memory, copied on the way in and out like IndexedDB copies them; a transaction that throws leaves no partial write, as IndexedDB aborts it. */
 export function memoryBackend() {
   const tables = Object.fromEntries(NAMES.map((n) => [n, new Map()]));
   const keyOf = (name, value) => STORES[name].key.map((k) => value[k]).join('\u0000');
@@ -33,7 +33,22 @@ export function memoryBackend() {
     all: async (index, value) => [...tables[name].values()].filter((v) => !index || v[index] === value).map((v) => structuredClone(v)),
     clear: async () => tables[name].clear(),
   });
-  return { transact: (names, _mode, fn) => fn(Object.fromEntries(names.map((n) => [n, api(n)]))) };
+  return {
+    async transact(names, _mode, fn) {
+      const undo = []; // what this transaction overwrote, so a throw puts only its own writes back
+      const stores = Object.fromEntries(names.map((n) => {
+        const base = api(n);
+        const remember = (key) => { const prior = tables[n].get(key); undo.push(() => (prior === undefined ? tables[n].delete(key) : tables[n].set(key, prior))); };
+        return [n, {
+          ...base,
+          put: (value) => { remember(keyOf(n, value)); return base.put(value); },
+          delete: (key) => { remember([key].flat().join('\u0000')); return base.delete(key); },
+          clear: async () => { const prior = tables[n]; tables[n] = new Map(); undo.push(() => { tables[n] = prior; }); },
+        }];
+      }));
+      try { return await fn(stores); } catch (err) { undo.reverse().forEach((u) => u()); throw err; }
+    },
+  };
 }
 
 const request = (req) => new Promise((resolve, reject) => { req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error); });
@@ -64,7 +79,16 @@ export async function indexedDbBackend(name, idb = globalThis.indexedDB) {
       const tx = db.transaction(names, mode);
       const done = new Promise((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onabort = () => reject(tx.error ?? new LedgerError('storage_failed', 'The local database aborted the write.')); tx.onerror = () => reject(tx.error); });
       let result;
-      try { result = await fn(Object.fromEntries(names.map((n) => [n, wrap(tx.objectStore(n))]))); } catch (err) { try { tx.abort(); } catch { /* already finished */ } throw err; }
+      try {
+        result = await fn(Object.fromEntries(names.map((n) => [n, wrap(tx.objectStore(n))])));
+      } catch (err) {
+        // A refusal or a failed request: abort, then wait for the transaction's own settlement (its error or abort
+        // event rejects `done`; consumed here so it never surfaces as a second, unhandled error) and report the
+        // callback's own error.
+        try { tx.abort(); } catch { /* already aborting or finished */ }
+        await done.catch(() => {});
+        throw err;
+      }
       await done;
       return result;
     },
@@ -87,6 +111,14 @@ export function openLedger({ scopeKey, backend }) {
     const r = await runs.get(runId);
     if (!r || r.scopeKey !== scopeKey) throw new LedgerError('not_found', 'That run is no longer in this ledger.');
     if (r.status !== 'running' || r.executionId !== executionId) throw new LedgerError('superseded', `That run is ${r.status} and no longer owned by this execution.`);
+    return r;
+  };
+  // A draft the person may still approve or decline: this ledger's, still a draft, and exactly the revision shown.
+  const editableDraft = async (runs, runId, expectedRevision) => {
+    const r = await runs.get(runId);
+    if (!r || r.scopeKey !== scopeKey) throw new LedgerError('not_found', 'That run is no longer in this ledger.');
+    if (r.status !== 'draft') throw new LedgerError('not_draft', `That run is now ${r.status}, so the draft screen is out of date.`);
+    if (r.revision !== expectedRevision) throw new LedgerError('stale', 'That draft changed in another tab of this browser; review it again.');
     return r;
   };
   const ledger = {
@@ -116,6 +148,27 @@ export function openLedger({ scopeKey, backend }) {
     }),
     grant: (runId) => tx(['grants'], 'readonly', ({ grants }) => grants.get(runId)).then((g) => g ?? null),
     putGrant: (grant) => tx(['grants'], 'readwrite', ({ grants }) => grants.put(grant)).then(() => grant),
+    /**
+     * The person's Approve, as one transaction over the run and its grant: it lands only if the run is still this
+     * ledger's, still a draft and still the exact revision the screen showed. Both records are then written
+     * together, the grant derived from the stored run. A screen that went stale in another tab (the run was
+     * approved, started, stopped, finished, declined or deleted meanwhile) is refused before any write.
+     */
+    approveDraft: (runId, expectedRevision, makeGrant) => tx(['runs', 'grants'], 'readwrite', async ({ runs, grants }) => {
+      const run = await editableDraft(runs, runId, expectedRevision);
+      const grant = makeGrant(run);
+      await grants.put(grant);
+      const next = { ...run, status: 'approved', approvedAt: new Date().toISOString(), revision: run.revision + 1, updatedAt: new Date().toISOString() };
+      await runs.put(next);
+      return { run: next, grant };
+    }),
+    /** The person's Decline, under the same guard: only the exact draft they reviewed can be declined. */
+    declineDraft: (runId, expectedRevision) => tx(['runs'], 'readwrite', async ({ runs }) => {
+      const run = await editableDraft(runs, runId, expectedRevision);
+      const next = { ...run, declinedAt: new Date().toISOString(), revision: run.revision + 1, updatedAt: new Date().toISOString() };
+      await runs.put(next);
+      return next;
+    }),
     steps: (runId) => tx(['steps'], 'readonly', ({ steps }) => steps.all('runId', runId)).then((list) => list.sort((a, b) => a.stepIndex - b.stepIndex)),
     snapshots: (runId) => tx(['snapshots'], 'readonly', ({ snapshots }) => snapshots.all('runId', runId)),
     proposal: (runId) => tx(['proposals'], 'readonly', ({ proposals }) => proposals.all('runId', runId)).then((list) => list[0] ?? null),
