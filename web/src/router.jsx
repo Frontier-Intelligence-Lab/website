@@ -61,6 +61,7 @@ function accountRoutes() {
   const device = () => import('./app/device.jsx');
   const memory = () => import('./app/memory.jsx');
   const capital = () => import('./app/capital.jsx');
+  const agents = () => import('./app/agents.jsx');
   return [
     { path: '/signup', lazy: page(auth, 'SignUp', 'signUpLoader') },
     { path: '/signin', lazy: page(auth, 'SignIn', 'signInLoader') },
@@ -85,6 +86,7 @@ function accountRoutes() {
     { path: '/w/:slug/projects/:projectId/dataset/versions', lazy: page(dataset, 'DatasetVersions', 'datasetLoader') },
     { path: '/w/:slug/device', lazy: page(device, 'RunOnDevice', 'deviceLoader') },
     { path: '/w/:slug/memory', lazy: page(memory, 'MemoryPage', 'memoryLoader') },
+    { path: '/w/:slug/agents', lazy: page(agents, 'AgentsPage', 'agentsLoader') },
     { path: '/w/:slug/models', lazy: page(models, 'ModelCatalog', 'modelsLoader') },
     { path: '/w/:slug/models/mine', lazy: page(models, 'MyModels', 'modelsLoader') },
     { path: '/w/:slug/models/catalog/:modelId', lazy: page(models, 'ModelDetail', 'modelsLoader') },
