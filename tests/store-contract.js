@@ -752,4 +752,35 @@ export function runStoreContract(test, makeStore, label) {
     const actions = (await store.listAudit(ws.id)).map((a) => a.action);
     for (const a of ['runner.linked', 'job.created', 'job.cancel_requested', 'runner.revoked']) assert.ok(actions.includes(a), a);
   });
+
+  // Regressions for the independent PR13 review (comment 6637458993); each failed on 6b5fbb7.
+  withStore('jobs review: cancel wins over a late success, one key means one complete request, and events page', async (store) => {
+    const owner = await store.createUser({ email: 'r@acme.com', name: 'R', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'R', slug: 'r-jobs', ownerId: owner.id });
+    const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'a'.repeat(64), keyPrefix: 'vrk_abcdef' });
+    const mk = (key, spec) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec, idempotencyKey: key, createdBy: owner.id });
+
+    // Idempotency compares the whole frozen spec, key order aside, sequentially and when two requests race.
+    const job = await mk('key-review-01', { checks: ['gpu'], source: { a: 1, b: 2 } });
+    assert.equal((await mk('key-review-01', { source: { b: 2, a: 1 }, checks: ['gpu'] })).id, job.id);
+    await assert.rejects(mk('key-review-01', { checks: ['gpu'], source: { a: 1, b: 3 } }), { code: 'invalid_state' });
+    const race = await Promise.allSettled([mk('key-review-02', { checks: ['gpu'] }), mk('key-review-02', { checks: ['sandbox'] })]);
+    assert.equal(race.filter((r) => r.status === 'fulfilled').length, 1);
+    assert.equal(race.find((r) => r.status === 'rejected').reason.code, 'invalid_state');
+
+    // Cancel requested, then the runner reports success: the job is cancelled and the result is not kept.
+    const held = await store.leaseJob({ runnerId: runner.id, leaseHash: 'b'.repeat(64) });
+    assert.equal(held.id, job.id);
+    const who = { runnerId: runner.id, jobId: job.id, leaseHash: 'b'.repeat(64) };
+    const events = Array.from({ length: 7 }, (_, i) => ({ seq: i, kind: 'log', data: { level: 'info', message: `e${i}` } }));
+    await store.appendJobEvents({ ...who, events });
+    assert.equal((await store.cancelJob({ workspaceId: ws.id, jobId: job.id, actorId: owner.id })).status, 'cancel_requested');
+    const ended = await store.finishJob({ ...who, outcome: 'succeeded', result: { network: 'none' } });
+    assert.deepEqual([ended.status, ended.result ?? null], ['cancelled', null]);
+
+    // Events page by id with a limit; the next page starts after the last id.
+    const page = await store.listJobEvents({ workspaceId: ws.id, jobId: job.id, limit: 4 });
+    assert.deepEqual(page.map((e) => e.seq), [0, 1, 2, 3]);
+    assert.deepEqual((await store.listJobEvents({ workspaceId: ws.id, jobId: job.id, afterId: page.at(-1).id, limit: 4 })).map((e) => e.seq), [4, 5, 6]);
+  });
 }

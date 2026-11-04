@@ -3,7 +3,7 @@ import { StoreError } from './errors.js';
 import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
-import { LEASE_MS, MAX_ATTEMPTS } from '../lib/jobs.js';
+import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
@@ -618,7 +618,9 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     async createJob({ workspaceId, runnerId, kind, enhanceRunId = null, spec, idempotencyKey, createdBy }) {
       const existing = jobs.find((j) => j.workspaceId === workspaceId && j.idempotencyKey === idempotencyKey);
       if (existing) {
-        if (existing.kind !== kind || existing.runnerId !== runnerId || existing.enhanceRunId !== enhanceRunId) throw new StoreError('invalid_state');
+        // The same key must mean the same request: kind, runner, plan and every frozen input, including the
+        // training run and artifact an evaluation or export names.
+        if (existing.kind !== kind || existing.runnerId !== runnerId || existing.enhanceRunId !== enhanceRunId || stableJson(existing.spec) !== stableJson(spec)) throw new StoreError('invalid_state');
         return publicJob(existing);
       }
       const runner = runners.find((x) => x.id === runnerId && x.workspaceId === workspaceId);
@@ -691,8 +693,9 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     },
     async finishJob({ runnerId, jobId, leaseHash, outcome, result = null, failure = null, retryable = false }) {
       const j = heldJob({ runnerId, jobId, leaseHash });
-      if (outcome === 'succeeded') endJob(j, { status: 'succeeded', result: copy(result) });
-      else if (j.status === 'cancel_requested' || failure === 'cancelled') endJob(j, { status: 'cancelled' });
+      // Cancellation contract (docs/RUNNERS.md): once cancel is requested, the job ends cancelled, whatever the runner reports.
+      if (j.status === 'cancel_requested' || (outcome === 'failed' && failure === 'cancelled')) endJob(j, { status: 'cancelled' });
+      else if (outcome === 'succeeded') endJob(j, { status: 'succeeded', result: copy(result) });
       else if (retryable && j.attempt < j.maxAttempts) Object.assign(j, { status: 'queued', leaseHash: null, leaseExpiresAt: null, updatedAt: stamp() });
       else endJob(j, { status: 'failed', failure });
       return publicJob(j);

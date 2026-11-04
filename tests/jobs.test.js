@@ -1,8 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createMemoryStore } from '../src/store/memory.js';
-import { LEASE_MS, MAX_ATTEMPTS, bearerKey, buildJobSpec, validateCapabilities, validateEvents } from '../src/lib/jobs.js';
+import { LEASE_MS, MAX_ATTEMPTS, bearerKey, buildJobSpec, projectResult, stableJson, validateCapabilities, validateEvents, validateFinish } from '../src/lib/jobs.js';
 import { FIXTURE_CATALOG, makeApp, json, postHeaders } from './helpers.js';
+import * as fmt from '../web/src/app/job-format.js';
 
 function client(app) {
   let cookies = {};
@@ -135,13 +140,13 @@ test('a job is leased to one runner at a time, its events are stored once, and i
   assert.equal((await runnerApi.post(`/api/runner/jobs/${job.id}/events`, { ...token, events: [{ seq: 2, kind: 'metric', data: { name: 'x', value: 'NaN' } }] })).statusCode, 400);
 
   assert.equal((await runnerApi.post(`/api/runner/jobs/${job.id}/finish`, { ...token, outcome: 'failed', failure: 'Traceback: secret row 42' })).statusCode, 400, 'only failure categories are accepted');
-  const done = await runnerApi.post(`/api/runner/jobs/${job.id}/finish`, { ...token, outcome: 'succeeded', result: { gpu: true } });
+  const done = await runnerApi.post(`/api/runner/jobs/${job.id}/finish`, { ...token, outcome: 'succeeded', result: { sandbox: true, network: 'none', hostGpus: 1, unknownField: 'dropped' } });
   assert.equal(done.json().job.status, 'succeeded');
   assert.equal((await runnerApi.post(`/api/runner/jobs/${job.id}/finish`, { ...token, outcome: 'succeeded', result: {} })).json().code, 'lease_lost', 'it finishes once');
 
   const view = (await owner.get(`${base}/jobs/${job.id}`)).json();
   assert.equal(view.job.status, 'succeeded');
-  assert.deepEqual(view.job.result, { gpu: true });
+  assert.deepEqual(view.job.result, { sandbox: true, network: 'none', hostGpus: 1 }, 'results are projected onto the documented shape');
   assert.deepEqual(view.events.map((e) => [e.attempt, e.seq, e.kind]), [[1, 0, 'stage'], [1, 1, 'metric']]);
   assert.equal((await owner.get(`${base}/jobs/${job.id}?after=${view.events[0].id}`)).json().events.length, 1);
   assert.equal((await runnerApi.post('/api/runner/lease')).json().job.id, second.id, 'the next job is leased after the first ends');
@@ -310,4 +315,171 @@ test('runner input validation', () => {
   assert.ok(validateEvents(Array.from({ length: 51 }, (_, i) => ({ seq: i, kind: 'log', data: { level: 'info', message: 'a' } }))).errors);
   assert.ok(validateEvents([{ seq: 0, kind: 'artifact', data: { name: 'adapter.safetensors', sha256: 'f'.repeat(64), sizeBytes: 10 } }]).values);
   assert.ok(buildJobSpec({ kind: 'train', run: { status: 'requested', compute: 'runner', baseModelId: 'gone' }, catalog: [] }).errors);
+});
+
+// --- Regressions for the independent PR13 review (comment 6637458993). Each one failed on 6b5fbb7.
+
+const runnerPlan = async (store, owner, ws, projectId = '00000000-0000-4000-8000-000000000003') => {
+  const draft = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId, version: 1 }], steps: ['sft'], compute: 'runner', spendCapUsd: 1 } });
+  return store.requestEnhanceRun({ workspaceId: ws.id, runId: draft.id, requestedBy: owner.id, expectedUpdatedAt: draft.updatedAt });
+};
+// Leases the runner's next job and finishes it with this result.
+const leaseAndFinish = async (runnerApi, jobId, result) => {
+  const leased = (await runnerApi.post('/api/runner/lease')).json().job;
+  assert.equal(leased.id, jobId);
+  return { leased, res: await runnerApi.post(`/api/runner/jobs/${jobId}/finish`, { leaseToken: leased.leaseToken, outcome: 'succeeded', result }) };
+};
+
+test('review 3: successful results are typed and bounded by kind; unknown fields are dropped', () => {
+  const adapter = { sha256: 'c'.repeat(64), sizeBytes: 10 };
+  const good = { adapter, baseHeldOutLoss: 2.5, tunedHeldOutLoss: 1.5, gpus: ['GPU'], samples: [{ prompt: 'p', base: 'b', tuned: 't' }], extra: 'dropped' };
+  assert.deepEqual(projectResult('train', good), { adapter, baseHeldOutLoss: 2.5, tunedHeldOutLoss: 1.5, gpus: ['GPU'], samples: [{ prompt: 'p', base: 'b', tuned: 't' }] });
+  const refused = {
+    'string loss': { adapter, baseHeldOutLoss: '2.1' },
+    'object samples': { adapter, samples: { prompt: 'x' } },
+    'sample missing tuned': { adapter, samples: [{ prompt: 'p', base: 'b' }] },
+    'oversized sample': { adapter, samples: [{ prompt: 'x'.repeat(601), base: 'b', tuned: 't' }] },
+    'no adapter': { baseHeldOutLoss: 2 },
+    'short adapter hash': { adapter: { sha256: 'abc' } },
+    'string gpus': { adapter, gpus: 'GPU' },
+    'too many samples': { adapter, samples: Array.from({ length: 6 }, () => ({ prompt: 'p', base: 'b', tuned: 't' })) },
+    'over 32 KB': { adapter, location: 'x'.repeat(40_000) },
+    'array': [adapter],
+  };
+  for (const [name, raw] of Object.entries(refused)) assert.equal(projectResult('train', raw), null, name);
+  assert.equal(projectResult('probe', { sandboxGpus: { name: 'x' } }), null);
+  assert.equal(projectResult('export', { ollamaModel: 'x' }), null, 'an export names its GGUF');
+  assert.equal(projectResult('export', { gguf: { sha256: 'd'.repeat(64) }, loadTest: { tuned: { tokensPerSec: 'fast' } } }), null);
+  assert.equal(projectResult('nope', {}), null, 'unknown kinds have no result');
+  assert.ok(validateFinish({ outcome: 'succeeded', result: { baseHeldOutLoss: '2' } }, 'train').errors.result);
+  assert.equal(stableJson({ b: 1, a: [1, { d: 2, c: 3 }] }), stableJson({ a: [1, { c: 3, d: 2 }], b: 1 }));
+});
+
+test('review 3: the finish route refuses a malformed result for the job kind and stores only the projection', async () => {
+  const { store, owner, ws, base, link, queue } = await setup();
+  const { runner, runnerApi } = await link();
+  const plan = await runnerPlan(store, owner, ws);
+  const train = (await queue(runner.id, { kind: 'train', enhanceRunId: plan.id })).json().job;
+  const { leased, res } = await leaseAndFinish(runnerApi, train.id, { adapter: { sha256: 'c'.repeat(64) }, baseHeldOutLoss: '2.1', samples: { prompt: 'x' } });
+  assert.equal(res.statusCode, 400);
+  assert.notEqual((await owner.get(`${base}/jobs/${train.id}`)).json().job.status, 'succeeded', 'a refused result does not finish the job');
+  const ok = await runnerApi.post(`/api/runner/jobs/${train.id}/finish`, { leaseToken: leased.leaseToken, outcome: 'succeeded', result: { adapter: { sha256: 'c'.repeat(64) }, baseHeldOutLoss: 2.1, secret: 'row 42' } });
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.deepEqual((await owner.get(`${base}/jobs/${train.id}`)).json().job.result, { adapter: { sha256: 'c'.repeat(64) }, baseHeldOutLoss: 2.1 });
+});
+
+test('review 4: a finished job with 550 events is read in pages and nothing is silently dropped', async () => {
+  const { owner, base, link, queue } = await setup();
+  const { runner, runnerApi } = await link();
+  const job = (await queue(runner.id)).json().job;
+  const leased = (await runnerApi.post('/api/runner/lease')).json().job;
+  for (let batch = 0; batch < 11; batch += 1) {
+    const events = Array.from({ length: 50 }, (_, i) => ({ seq: batch * 50 + i, kind: 'log', data: { level: 'info', message: `line ${batch * 50 + i}` } }));
+    assert.equal((await runnerApi.post(`/api/runner/jobs/${job.id}/events`, { leaseToken: leased.leaseToken, events })).json().added, 50);
+  }
+  await runnerApi.post(`/api/runner/jobs/${job.id}/finish`, { leaseToken: leased.leaseToken, outcome: 'succeeded', result: { network: 'none' } });
+  const first = (await owner.get(`${base}/jobs/${job.id}`)).json();
+  assert.deepEqual([first.job.status, first.events.length, first.more], ['succeeded', 500, true]);
+  const rest = (await owner.get(`${base}/jobs/${job.id}?after=${first.events.at(-1).id}`)).json();
+  assert.deepEqual([rest.events.length, rest.more], [50, false]);
+  assert.deepEqual([...first.events, ...rest.events].map((e) => e.seq), Array.from({ length: 550 }, (_, i) => i));
+});
+
+test('review 5: once cancel is stored the job ends cancelled, even if the runner reports success; no new inputs after cancel', async () => {
+  const store = createMemoryStore();
+  const app = await makeApp({ store, env: { MODEL_CATALOG_FILE: FIXTURE_CATALOG, INGEST_PUBLIC_URL: 'http://127.0.0.1:4100', INGEST_SHARED_SECRET: 's'.repeat(40) } });
+  const owner = await person(app, 'o@acme-robotics.com');
+  const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
+  const base = `/api/workspaces/${ws.id}`;
+  const { runner, key } = (await owner.post(`${base}/runners`, { label: 'Box' })).json();
+  const api = runnerClient(app, key);
+  const projectId = '00000000-0000-4000-8000-0000000000ab';
+  const manifest = { dataSource: { mode: 'upload', allowedUses: ['training'] }, files: [{ id: 'f1', filename: 'c.jsonl', sha256: 'a'.repeat(64), sizeBytes: 1, contentType: 'application/json', objectKey: `ws/${ws.id}/f1` }] };
+  store.listDatasetVersions = async ({ workspaceId, projectId: p }) => (workspaceId === ws.id && p === projectId ? [{ number: 1, manifest }] : []);
+  const plan = await runnerPlan(store, owner, ws, projectId);
+  const job = (await owner.post(`${base}/jobs`, { kind: 'train', runnerId: runner.id, enhanceRunId: plan.id, idempotencyKey: 'cancel-key-001' })).json().job;
+  const leased = (await api.post('/api/runner/lease')).json().job;
+  const token = { leaseToken: leased.leaseToken };
+  assert.equal((await api.post(`/api/runner/jobs/${job.id}/inputs`, token)).statusCode, 200, 'inputs before cancel');
+  assert.equal((await owner.post(`${base}/jobs/${job.id}/cancel`)).json().job.status, 'cancel_requested');
+  const refused = await api.post(`/api/runner/jobs/${job.id}/inputs`, token);
+  assert.deepEqual([refused.statusCode, refused.json().code], [409, 'job_cancelled']);
+  const end = await api.post(`/api/runner/jobs/${job.id}/finish`, { ...token, outcome: 'succeeded', result: { adapter: { sha256: 'c'.repeat(64) } } });
+  assert.equal(end.json().job.status, 'cancelled', 'cancel wins over a late success');
+  const stored = (await owner.get(`${base}/jobs/${job.id}`)).json().job;
+  assert.deepEqual([stored.status, stored.result ?? null], ['cancelled', null], 'the late result is not stored');
+});
+
+test('review 2: one request key means one complete request, including the training run it names', async () => {
+  const { store, owner, ws, link, queue } = await setup();
+  const { runner, runnerApi } = await link();
+  const plan = await runnerPlan(store, owner, ws);
+  const trained = [];
+  for (const sha of ['a', 'b']) {
+    const t = (await queue(runner.id, { kind: 'train', enhanceRunId: plan.id })).json().job;
+    assert.equal((await leaseAndFinish(runnerApi, t.id, { adapter: { sha256: sha.repeat(64), location: `jobs/${sha}/adapter` } })).res.statusCode, 200);
+    trained.push(t);
+  }
+  const ask = (trainJobId, idempotencyKey = 'eval-key-0001') => queue(runner.id, { kind: 'evaluate', enhanceRunId: plan.id, trainJobId, idempotencyKey });
+  const first = await ask(trained[0].id);
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal((await ask(trained[0].id)).json().job.id, first.json().job.id, 'the same request returns the same job');
+  const other = await ask(trained[1].id);
+  assert.deepEqual([other.statusCode, other.json().code], [409, 'idempotency_conflict'], 'another training run under the same key is a conflict');
+  // Two different requests racing under one fresh key: exactly one wins, the other is a conflict.
+  const race = await Promise.all(trained.map((t) => ask(t.id, 'eval-key-race1')));
+  assert.deepEqual(race.map((r) => r.statusCode).sort(), [200, 409]);
+});
+
+test('review 6: the demo seed refuses any target but a disposable local database, before writing anything', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'valcairn-seed-'));
+  const objects = join(dir, 'objects');
+  const run = (DATABASE_URL, extra = []) => {
+    const env = { ...process.env, NODE_ENV: 'development', MODEL_CATALOG_FILE: FIXTURE_CATALOG };
+    delete env.DATABASE_URL;
+    if (DATABASE_URL) env.DATABASE_URL = DATABASE_URL;
+    return spawnSync(process.execPath, ['scripts/seed-train-demo.js', '--model', 'fixture-dense-8b', '--objects', objects, ...extra], { env, encoding: 'utf8' });
+  };
+  try {
+    const cases = [
+      [undefined, /Set DATABASE_URL/],
+      ['postgresql://u:synthetic-pass@db.example.com:5432/valcairn_demo', /this machine/],
+      ['postgresql://u:synthetic-pass@127.0.0.1:5432/valcairn', /"demo", "test" or "qa"/],
+      ['mysql://u:synthetic-pass@127.0.0.1:5432/valcairn_demo', /postgres/],
+      ['postgresql://u:synthetic-pass@127.0.0.1:5432/valcairn_demo', /--disposable-db/],
+    ];
+    for (const [url, message] of cases) {
+      const res = run(url);
+      assert.equal(res.status, 2, `${url}: ${res.stdout}${res.stderr}`);
+      assert.match(res.stderr, message);
+      assert.ok(!res.stderr.includes('synthetic-pass') && !res.stdout.includes('synthetic-pass'), 'credentials are never printed');
+    }
+    assert.equal(existsSync(objects), false, 'nothing was written');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('review 7: the seed stores a valid acceptance rule and labels its review as a synthetic fixture', () => {
+  const source = readFileSync('scripts/seed-train-demo.js', 'utf8');
+  assert.match(source, /requireResolved: true/);
+  assert.match(source, /Synthetic demo fixture: approved by the seed script, not reviewed by a person\./);
+  assert.match(source, /rights: true, consent: true, labels: true, duplicates: true, format: true/);
+  assert.match(source, /if \(ruleProblem\(success\)\) fail/);
+});
+
+test('review 3: Compute formats malformed stored results as dashes instead of throwing', () => {
+  const malformed = ['2.1', null, undefined, {}, [], Number.NaN, Infinity, true, { toFixed: 1 }];
+  for (const v of malformed) {
+    assert.equal(fmt.fix(v, 2), '—');
+    assert.equal(fmt.pct(v, 1), '—');
+    assert.equal(fmt.mb(v), '—');
+    assert.equal(fmt.hash(v), '—');
+    assert.deepEqual(fmt.list(v), Array.isArray(v) ? v : []);
+  }
+  assert.equal(fmt.txt({ prompt: 'x' }), '—');
+  assert.equal(fmt.txt('x'.repeat(500), 10), 'x'.repeat(10));
+  assert.deepEqual(fmt.obj('x'), {});
+  assert.deepEqual(fmt.obj([1]), {});
+  assert.equal(fmt.fix(1.23456, 2), '1.23');
+  assert.equal(fmt.hash('c'.repeat(64)), `${'c'.repeat(16)}…`);
+  assert.equal(fmt.hash('C'.repeat(64)), '—');
 });

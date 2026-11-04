@@ -95,6 +95,13 @@ BEGIN
 END $$;
 CREATE TRIGGER jobs_spec_frozen BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION jobs_spec_frozen();
 
+-- Jobs are deleted only together with their workspace (a cascade), never one by one.
+CREATE FUNCTION jobs_kept() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'job_frozen';
+END $$;
+CREATE TRIGGER jobs_kept BEFORE DELETE ON jobs FOR EACH ROW WHEN (pg_trigger_depth() = 0) EXECUTE FUNCTION jobs_kept();
+
 CREATE FUNCTION job_events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION 'job_event_frozen';

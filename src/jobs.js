@@ -9,6 +9,7 @@ import { LEASE_MS, bearerKey, buildJobSpec, hashSecret, keyPrefix, newLeaseToken
  * never connects to a runner: the runner always calls in, so it can sit behind NAT on a laptop.
  */
 const INPUT_TTL_S = 15 * 60;
+const EVENT_PAGE = 500;
 
 export function registerJobRoutes(app, { config, store, helpers, guards }) {
   const { problem, privateHeaders } = helpers;
@@ -51,8 +52,9 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
     const job = await store.getJob({ workspaceId, jobId });
     if (!job) return problem(reply, 404, 'Not found.');
     const afterId = Number.parseInt(request.query?.after ?? '0', 10);
-    const events = await store.listJobEvents({ workspaceId, jobId, afterId: Number.isSafeInteger(afterId) && afterId > 0 ? afterId : 0 });
-    return { job: view(job), events };
+    // One page of events; `more` says another page follows (ask again with after = the last id).
+    const page = await store.listJobEvents({ workspaceId, jobId, afterId: Number.isSafeInteger(afterId) && afterId > 0 ? afterId : 0, limit: EVENT_PAGE + 1 });
+    return { job: view(job), events: page.slice(0, EVENT_PAGE), more: page.length > EVENT_PAGE };
   });
 
   // Running code on a machine and spending its compute is an owner/admin decision, like approving a plan.
@@ -146,6 +148,8 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
     try { job = await store.touchJob({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body) }); }
     catch (err) { return jobFail(reply, err); }
     if (job.kind === 'probe') return problem(reply, 400, 'A sandbox check has no inputs.');
+    // A cancelled job gets no new input grants. Links issued before the cancel stay valid until they expire.
+    if (job.status === 'cancel_requested') return problem(reply, 409, 'This job was cancelled, so no new inputs are issued.', { code: 'job_cancelled' });
     const ingest = config.ingest;
     if (!ingest) return problem(reply, 503, 'File storage is not configured on this server.', { code: 'storage_unavailable' });
     const datasets = [];
@@ -164,7 +168,9 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
   });
 
   app.post('/api/runner/jobs/:jobId/finish', runnerRoute, async (request, reply) => {
-    const result = validateFinish(request.body);
+    const held = await store.getRunnerJob({ runnerId: request.runner.id, jobId: request.params.jobId });
+    if (!held) return problem(reply, 404, 'Not found.');
+    const result = validateFinish(request.body, held.kind);
     if (result.errors) return invalid(reply, result.errors);
     try { return { job: forRunner(await store.finishJob({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body), ...result.values })) }; }
     catch (err) { return jobFail(reply, err); }

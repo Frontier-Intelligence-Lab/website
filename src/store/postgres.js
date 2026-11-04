@@ -4,7 +4,7 @@ import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf,
 import { boxNotStoredForm, frozenBoxViolations } from '../lib/box-sql.js';
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
-import { LEASE_MS, MAX_ATTEMPTS } from '../lib/jobs.js';
+import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
@@ -257,6 +257,9 @@ export function createPostgresStore(options) {
     const j = (await query('SELECT * FROM jobs WHERE id = $1 AND runner_id = $2 FOR UPDATE', [jobId, runnerId], client)).rows[0];
     if (!j) throw new StoreError('not_found');
     if (!HELD.includes(j.status) || j.lease_hash !== leaseHash) throw new StoreError('lease_lost');
+    // The row lock may have taken a while: decide on the lease with the clock as it is now, after the wait.
+    const { expired } = (await query('SELECT lease_expires_at <= clock_timestamp() AS expired FROM jobs WHERE id = $1', [jobId], client)).rows[0];
+    if (expired) throw new StoreError('lease_lost');
     return j;
   };
   const extendLease = async (client, j, leaseMs) => (await query(`UPDATE jobs SET status = CASE WHEN status = 'leased' THEN 'running' ELSE status END,
@@ -930,7 +933,8 @@ export function createPostgresStore(options) {
     async createJob({ workspaceId, runnerId, kind, enhanceRunId = null, spec, idempotencyKey, createdBy }) {
       if (![workspaceId, runnerId, createdBy].every(isId) || (enhanceRunId != null && !isId(enhanceRunId))) throw new StoreError('not_found');
       return transaction(async (client) => {
-        const same = (row) => row.kind === kind && row.runner_id === runnerId && (row.enhance_run_id ?? null) === enhanceRunId;
+        // The same key must mean the same request, including every frozen input (training run, artifact, plan version).
+        const same = (row) => row.kind === kind && row.runner_id === runnerId && (row.enhance_run_id ?? null) === enhanceRunId && stableJson(row.spec) === stableJson(spec);
         const prior = (await query('SELECT * FROM jobs WHERE workspace_id = $1 AND idempotency_key = $2', [workspaceId, idempotencyKey], client)).rows[0];
         if (prior) {
           if (!same(prior)) throw new StoreError('invalid_state');
@@ -1025,8 +1029,9 @@ export function createPostgresStore(options) {
         const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
         const done = "lease_hash = NULL, lease_expires_at = NULL, finished_at = clock_timestamp(), updated_at = clock_timestamp()";
         let row;
-        if (outcome === 'succeeded') row = (await query(`UPDATE jobs SET status = 'succeeded', result = $2::jsonb, ${done} WHERE id = $1 RETURNING *`, [jobId, JSON.stringify(result)], client)).rows[0];
-        else if (j.status === 'cancel_requested' || failure === 'cancelled') row = (await query(`UPDATE jobs SET status = 'cancelled', ${done} WHERE id = $1 RETURNING *`, [jobId], client)).rows[0];
+        // Cancellation contract (docs/RUNNERS.md): once cancel is requested, the job ends cancelled, whatever the runner reports.
+        if (j.status === 'cancel_requested' || (outcome === 'failed' && failure === 'cancelled')) row = (await query(`UPDATE jobs SET status = 'cancelled', ${done} WHERE id = $1 RETURNING *`, [jobId], client)).rows[0];
+        else if (outcome === 'succeeded') row = (await query(`UPDATE jobs SET status = 'succeeded', result = $2::jsonb, ${done} WHERE id = $1 RETURNING *`, [jobId, JSON.stringify(result)], client)).rows[0];
         else if (retryable && j.attempt < j.max_attempts) row = (await query("UPDATE jobs SET status = 'queued', lease_hash = NULL, lease_expires_at = NULL, updated_at = clock_timestamp() WHERE id = $1 RETURNING *", [jobId], client)).rows[0];
         else row = (await query(`UPDATE jobs SET status = 'failed', failure = $2, ${done} WHERE id = $1 RETURNING *`, [jobId, failure], client)).rows[0];
         return jobRow(row);

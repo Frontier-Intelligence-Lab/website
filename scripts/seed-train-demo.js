@@ -6,20 +6,40 @@
 // whose rights record allows training; one synthetic JSONL file of 252 support conversations for a fictional
 // company, stored where a local ingest service with INGEST_STORAGE=file://<dir> keeps committed objects; an
 // approved dataset version; a model pull; and an enhance plan approved to run on "Your Valcairn Runner".
-// Approval is recorded as a separate synthetic staff account. Nothing here is real customer data.
-// Refuses to run with NODE_ENV=production.
+// The review is a synthetic fixture: a separate synthetic staff account records an approval with every check ticked
+// and a note saying no person reviewed it. Nothing here is real customer data.
+//
+// It writes only to a disposable local database: DATABASE_URL is required (it never falls back to the in-memory store,
+// which would lose the data), its host must be loopback, and the database name must contain "demo", "test" or "qa".
+// Pass --disposable-db to confirm that database may receive synthetic rows. NODE_ENV is not what decides this.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { hashPassword } from '../src/lib/passwords.js';
 import { createStore } from '../src/store/index.js';
 import { loadConfig } from '../src/config.js';
+import { ruleProblem } from '../src/lib/onboarding.js';
 
 const arg = (name) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : undefined; };
 const modelId = arg('--model');
 const objects = arg('--objects') ? resolve(arg('--objects')) : null;
-if (process.env.NODE_ENV === 'production') { console.error('Refusing to seed demo data with NODE_ENV=production.'); process.exit(2); }
+const fail = (message) => { console.error(message); process.exit(2); };
+// Checked before anything is created or written, including the object store.
+export function disposableDatabase(url) {
+  if (!url) return 'Set DATABASE_URL to a disposable local database. The seed never uses the in-memory store.';
+  let u;
+  try { u = new URL(url); } catch { return 'DATABASE_URL is not a valid URL.'; }
+  if (!['postgres:', 'postgresql:'].includes(u.protocol)) return 'DATABASE_URL must be a postgres:// URL.';
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) return 'DATABASE_URL must point at this machine (127.0.0.1, localhost or ::1).';
+  const name = decodeURIComponent(u.pathname.slice(1));
+  if (!/(demo|test|qa)/i.test(name)) return 'The database name must contain "demo", "test" or "qa", so a real database is never seeded.';
+  return null;
+}
+const dbProblem = disposableDatabase(process.env.DATABASE_URL);
+if (dbProblem) fail(dbProblem);
+if (!process.argv.includes('--disposable-db')) fail('Pass --disposable-db to confirm this database may receive synthetic demo rows.');
 const config = loadConfig();
+if (!config.databaseUrl) fail('DATABASE_URL was not loaded.');
 if (!modelId || !config.modelCatalog.some((m) => m.id === modelId)) {
   console.error(`Pass --model with a model id from MODEL_CATALOG_FILE (${config.modelCatalog.map((m) => m.id).join(', ') || 'the catalog is empty'}).`);
   process.exit(2);
@@ -68,8 +88,11 @@ for (const [product, facts] of Object.entries(PRODUCTS)) {
 }
 const bytes = Buffer.from(rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
 
+// A valid acceptance rule, checked with the same function the API, Resolve and the submit gate use.
+const success = { measure: 'rubric', criteria: 'On held-out synthetic conversations, the tuned model answers with the right product fact more often than the base model, in the support team format.', baseline: 'off_the_shelf', runsOn: 'servers' };
+if (ruleProblem(success)) fail(`Seed acceptance rule is invalid: ${ruleProblem(success)}`);
 const store = await createStore(config);
-if (!store) { console.error('No store: set DATABASE_URL.'); process.exit(2); }
+if (!store) fail('No store: set DATABASE_URL.');
 const password = randomBytes(12).toString('base64url');
 const ownerEmail = 'train.owner@acme-demo.example';
 let owner = (await store.getUserAuthByEmail(ownerEmail))?.user;
@@ -82,14 +105,15 @@ const stamp = Date.now().toString(36).slice(-5);
 const ws = await store.createWorkspace({ kind: 'organization', name: `Acme Robotics (synthetic demo ${stamp})`, slug: `acme-demo-${stamp}`, ownerId: owner.id });
 const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Support replies (synthetic)', task: 'Answer customer questions about Acme robots with the right facts, in the support team’s format.', modalities: ['Text'], startingPoint: 'own' });
 const where = { workspaceId: ws.id, projectId: project.id };
-await store.updateProject({ ...where, patch: { success: { measure: 'held-out answer accuracy', target: 'better than the base model' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['training', 'testing'], personalData: 'no' } } });
+await store.updateProject({ ...where, patch: { success, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['training', 'testing'], personalData: 'no' } } });
 // Committed-object layout of services/ingest (ws/<workspace>/projects/<project>/uploads/<uuid>).
 const objectKey = `ws/${ws.id}/projects/${project.id}/uploads/${randomUUID()}`;
 mkdirSync(dirname(join(objects, objectKey)), { recursive: true });
 writeFileSync(join(objects, objectKey), bytes);
 await store.createUpload({ ...where, uploadedBy: owner.id, objectKey, sha256: createHash('sha256').update(bytes).digest('hex'), sizeBytes: bytes.length, contentType: 'application/jsonl', filename: 'acme-support.synthetic.jsonl' });
-const review = await store.submitForReview({ ...where, submittedBy: owner.id });
-await store.decideReview({ reviewId: review.id, reviewerId: staff.id, decision: 'approved', checks: {} });
+const review = await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true });
+const checks = { rights: true, consent: true, labels: true, duplicates: true, format: true };
+await store.decideReview({ reviewId: review.id, reviewerId: staff.id, decision: 'approved', checks, notes: 'Synthetic demo fixture: approved by the seed script, not reviewed by a person.' });
 const version = await store.createDatasetVersion({ ...where, createdBy: owner.id });
 await store.requestModelPull({ workspaceId: ws.id, modelId, requestedBy: owner.id });
 const draft = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Support replies (synthetic)', baseModelId: modelId, datasets: [{ projectId: project.id, version: version.number }], steps: ['sft'], compute: 'runner', spendCapUsd: 1 } });

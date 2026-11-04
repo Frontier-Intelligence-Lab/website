@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Component, useCallback, useEffect, useState } from 'react';
 import { useLoaderData } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
+import { fix, hash, isNum, list, mb, obj, pct, txt } from './job-format.js';
 
 const MANAGERS = ['owner', 'admin'];
 const ONLINE_MS = 90_000;
@@ -262,25 +263,43 @@ function JobsCard({ jobs, runners, manager, workspaceId, open, setOpen, onChange
 }
 
 // Every stage, log and artifact; for each metric only its latest value, so a long training run stays readable.
-const visible = (events) => events.filter((e, i) => e.kind !== 'metric' || !events.slice(i + 1).some((n) => n.kind === 'metric' && n.data.name === e.data.name));
+const visible = (events) => events.filter((e, i) => e.kind !== 'metric' || !events.slice(i + 1).some((n) => n.kind === 'metric' && n.data?.name === e.data?.name));
 
-function JobDetail({ workspaceId, jobId, manager, onChange, onOpen }) {
+class DetailBoundary extends Component {
+  constructor(props) { super(props); this.state = { failed: false }; }
+  static getDerivedStateFromError() { return { failed: true }; }
+  render() {
+    return this.state.failed ? <p className="tone-warn" role="alert">This job's details could not be shown. Its record may be malformed; the job list is unaffected.</p> : this.props.children;
+  }
+}
+
+function JobDetail(props) {
+  return <DetailBoundary key={props.jobId}><JobDetailBody {...props} /></DetailBoundary>;
+}
+
+function JobDetailBody({ workspaceId, jobId, manager, onChange, onOpen }) {
   const [job, setJob] = useState(null);
   const [events, setEvents] = useState([]);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [pending, setPending] = useState(false);
   useEffect(() => {
     let stop = false;
     let after = 0;
     let timer;
+    // Pages through every event, finished job or not: a job with more than one page shows all of them.
     const load = async () => {
       const res = await api.job(workspaceId, jobId, after).catch(() => null);
-      if (stop || !res?.ok) return;
+      if (stop) return;
+      if (!res?.ok) { setLoadingMore(false); return; }
       setJob(res.data.job);
-      if (res.data.events.length) {
-        after = res.data.events.at(-1).id;
-        setEvents((prev) => [...prev, ...res.data.events.filter((e) => !prev.some((p) => p.id === e.id))]);
+      const page = list(res.data.events);
+      if (page.length) {
+        after = page.at(-1).id;
+        setEvents((prev) => [...prev, ...page.filter((e) => !prev.some((p) => p.id === e.id))]);
       }
-      if (!FINISHED.includes(res.data.job.status)) timer = setTimeout(load, 2000);
+      setLoadingMore(Boolean(res.data.more));
+      if (res.data.more) timer = setTimeout(load, 0);
+      else if (!FINISHED.includes(res.data.job.status)) timer = setTimeout(load, 2000);
     };
     load();
     return () => { stop = true; clearTimeout(timer); };
@@ -292,7 +311,7 @@ function JobDetail({ workspaceId, jobId, manager, onChange, onOpen }) {
     setPending(false);
     onChange();
   };
-  const result = job.result ?? {};
+  const result = obj(job.result);
   const exportRun = async () => {
     setPending(true);
     const res = await api.createJob(workspaceId, { kind: 'export', runnerId: job.runnerId, enhanceRunId: job.enhanceRunId, trainJobId: job.id, idempotencyKey: crypto.randomUUID() }).catch(() => null);
@@ -300,7 +319,10 @@ function JobDetail({ workspaceId, jobId, manager, onChange, onOpen }) {
     onChange();
     if (res?.ok) onOpen(res.data.job.id);
   };
-  const score = (s) => (s ? `${(s.f1 * 100).toFixed(1)}% token F1 · ${(s.exact * 100).toFixed(0)}% exact` : '—');
+  const evaluation = obj(result.evaluation);
+  const score = (s) => (isNum(obj(s).f1) ? `${pct(s.f1, 1)} token F1 · ${pct(s.exact, 0)} exact` : '—');
+  const adapter = obj(result.adapter), gguf = obj(result.gguf), load = obj(result.loadTest);
+  const gpus = list(result.sandboxGpus).filter((g) => g && typeof g === 'object');
   return (
     <div className="dev-facts-col" style={{ marginTop: 12 }} aria-live="polite">
       <div className="row-between" style={{ flexWrap: 'wrap', gap: 10 }}>
@@ -308,53 +330,59 @@ function JobDetail({ workspaceId, jobId, manager, onChange, onOpen }) {
         {manager && !FINISHED.includes(job.status) && job.status !== 'cancel_requested' && <button type="button" className="btn-ghost" onClick={cancel} disabled={pending}>Cancel job</button>}
       </div>
       {job.status === 'failed' && <p className="tone-warn">{FAILURE[job.failure] ?? 'The job failed.'}</p>}
+      {job.status === 'cancelled' && <p className="ob-muted">Cancelled. Whatever the runner did after the cancel was requested is not used.</p>}
       {job.kind === 'probe' && job.status === 'succeeded' && (
-        <p>Sandbox ran with network <strong>{result.network}</strong>; {plural(result.sandboxGpus?.length ?? 0, 'GPU')} visible inside it{result.sandboxGpus?.length ? ` (${result.sandboxGpus.map((g) => `${g.name}, ${Math.round(g.memoryMb / 1024)} GB`).join('; ')})` : ''}. Ollama {result.ollamaReachable ? 'reachable' : 'not reachable'} on the runner.</p>
+        <p>Sandbox ran with network <strong>{txt(result.network, 40)}</strong>; {plural(gpus.length, 'GPU')} visible inside it{gpus.length ? ` (${gpus.map((g) => `${txt(g.name, 120)}, ${isNum(g.memoryMb) ? Math.round(g.memoryMb / 1024) : '—'} GB`).join('; ')})` : ''}. Ollama {result.ollamaReachable === true ? 'reachable' : 'not reachable'} on the runner.</p>
       )}
       {job.kind === 'train' && job.status === 'succeeded' && (
-        <dl className="dev-facts" style={{ display: 'grid', gap: 8 }}>
-          <div className="dev-fact"><dt>Held-out loss, base model</dt><dd>{result.baseHeldOutLoss?.toFixed(4)}</dd></div>
-          <div className="dev-fact"><dt>Held-out loss, tuned</dt><dd><strong>{result.tunedHeldOutLoss?.toFixed(4)}</strong></dd></div>
-          <div className="dev-fact"><dt>Examples</dt><dd>{result.trainExamples} trained · {result.heldOutExamples} held out</dd></div>
-          <div className="dev-fact"><dt>Training</dt><dd>{result.steps} steps · {result.trainSeconds} s · {result.gpus?.join(', ')}</dd></div>
-          <div className="dev-fact"><dt>Adapter</dt><dd><code>{result.adapter?.sha256?.slice(0, 16)}…</code> · {Math.round((result.adapter?.sizeBytes ?? 0) / 2 ** 20)} MB, on the runner</dd></div>
+        <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Training result, reported by the runner">
+          <div className="dev-fact"><dt>Held-out loss, base model</dt><dd>{fix(result.baseHeldOutLoss, 4)}</dd></div>
+          <div className="dev-fact"><dt>Held-out loss, tuned</dt><dd><strong>{fix(result.tunedHeldOutLoss, 4)}</strong></dd></div>
+          <div className="dev-fact"><dt>Examples</dt><dd>{isNum(result.trainExamples) ? result.trainExamples : '—'} trained · {isNum(result.heldOutExamples) ? result.heldOutExamples : '—'} held out</dd></div>
+          <div className="dev-fact"><dt>Training</dt><dd>{isNum(result.steps) ? result.steps : '—'} steps · {fix(result.trainSeconds, 1)} s · {list(result.gpus).filter((g) => typeof g === 'string').join(', ') || '—'}</dd></div>
+          <div className="dev-fact"><dt>Adapter</dt><dd><code>{hash(adapter.sha256)}</code> · {mb(adapter.sizeBytes)}, on the runner</dd></div>
         </dl>
       )}
       {job.kind === 'train' && job.status === 'succeeded' && result.evaluation && (
         <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Answers on held-out examples">
-          <div className="dev-fact"><dt>Held-out answers, base</dt><dd>{score(result.evaluation.base)}</dd></div>
-          <div className="dev-fact"><dt>Held-out answers, tuned</dt><dd><strong>{score(result.evaluation.tuned)}</strong></dd></div>
+          <div className="dev-fact"><dt>Held-out answers, base</dt><dd>{score(evaluation.base)}</dd></div>
+          <div className="dev-fact"><dt>Held-out answers, tuned</dt><dd><strong>{score(evaluation.tuned)}</strong></dd></div>
         </dl>
       )}
-      {(result.samples ?? []).slice(0, 2).map((s, i) => (
+      {['train', 'export'].includes(job.kind) && job.status === 'succeeded' && <p className="ob-muted" style={{ fontSize: 12 }}>Measured and reported by the runner. Token F1 and loss on held-out examples from this dataset; they do not show general model quality.</p>}
+      {list(result.samples).filter((s) => s && typeof s === 'object').slice(0, 2).map((s, i) => (
         <div key={i} className="dev-confirm" style={{ gap: 6 }}>
-          <span className="ob-muted" style={{ fontSize: 12 }}>Held-out example {i + 1} · never trained on</span>
-          <span><strong>Prompt:</strong> {s.prompt}</span>
-          <span><strong>Base:</strong> {s.base}</span>
-          <span><strong>Tuned:</strong> {s.tuned}</span>
+          <span className="ob-muted" style={{ fontSize: 12 }}>Held-out example {i + 1} · not in the training split</span>
+          <span><strong>Prompt:</strong> {txt(s.prompt)}</span>
+          <span><strong>Base:</strong> {txt(s.base)}</span>
+          <span><strong>Tuned:</strong> {txt(s.tuned)}</span>
         </div>
       ))}
       {manager && job.kind === 'train' && job.status === 'succeeded' && <button type="button" className="btn-app" onClick={exportRun} disabled={pending} style={{ alignSelf: 'flex-start' }}>Export to Ollama on this runner</button>}
       {job.kind === 'export' && job.status === 'succeeded' && (
         <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Export">
-          <div className="dev-fact"><dt>In Ollama as</dt><dd><code>{result.ollamaModel}</code></dd></div>
-          <div className="dev-fact"><dt>GGUF</dt><dd><code>{result.gguf?.sha256?.slice(0, 16)}…</code> · {result.gguf?.quantization} · {Math.round((result.gguf?.sizeBytes ?? 0) / 2 ** 20)} MB</dd></div>
-          <div className="dev-fact"><dt>Speed, tuned</dt><dd>{result.loadTest?.tuned?.tokensPerSec?.toFixed(1)} tok/s</dd></div>
-          <div className="dev-fact"><dt>Speed, base</dt><dd>{result.loadTest?.base ? `${result.loadTest.base.tokensPerSec.toFixed(1)} tok/s (${result.loadTest.base.model})` : 'Base not installed in Ollama'}</dd></div>
-          <div className="dev-fact"><dt>Manifest</dt><dd><code>{result.manifestSha256?.slice(0, 16)}…</code> · with model card and license</dd></div>
+          <div className="dev-fact"><dt>In Ollama as</dt><dd><code>{txt(result.ollamaModel, 120)}</code></dd></div>
+          <div className="dev-fact"><dt>GGUF</dt><dd><code>{hash(gguf.sha256)}</code> · {txt(gguf.quantization, 20)} · {mb(gguf.sizeBytes)}</dd></div>
+          <div className="dev-fact"><dt>Speed, tuned</dt><dd>{fix(obj(load.tuned).tokensPerSec, 1)} tok/s</dd></div>
+          <div className="dev-fact"><dt>Speed, base</dt><dd>{isNum(obj(load.base).tokensPerSec) ? `${fix(load.base.tokensPerSec, 1)} tok/s (${txt(load.base.model, 120)})` : 'Not measured'}</dd></div>
+          <div className="dev-fact"><dt>Manifest</dt><dd><code>{hash(result.manifestSha256)}</code> · with model card and license</dd></div>
         </dl>
       )}
-      {job.kind === 'train' && <LossChart points={events.filter((e) => e.kind === 'metric' && e.data.name === 'train_loss').map((e) => e.data)} />}
+      {job.kind === 'train' && <LossChart points={events.filter((e) => e.kind === 'metric' && obj(e.data).name === 'train_loss' && isNum(e.data.value)).map((e) => e.data)} />}
+      <p className="ob-muted" style={{ fontSize: 12 }} role="status">{events.length} event{events.length === 1 ? '' : 's'}{loadingMore ? ', loading more…' : ''}. Each metric shows its latest value.</p>
       <ol className="dev-steps" aria-label="Job events">
-        {events.length === 0 ? <li className="ob-muted">No events yet.</li> : visible(events).map((e) => (
-          <li key={e.id}>
-            <span className="ob-muted" style={{ fontSize: 12 }}>{when(e.createdAt)} · attempt {e.attempt}</span>{' '}
-            {e.kind === 'stage' && <>Stage <strong>{e.data.name}</strong> {e.data.status}</>}
-            {e.kind === 'metric' && <><strong>{e.data.name}</strong> = {Number(e.data.value).toLocaleString()}{e.data.step != null ? ` (step ${e.data.step})` : ''}</>}
-            {e.kind === 'log' && <span className={e.data.level === 'error' ? 'tone-warn' : undefined}>{e.data.message}</span>}
-            {e.kind === 'artifact' && <>Artifact <strong>{e.data.name}</strong> · <code>{e.data.sha256.slice(0, 12)}…</code></>}
-          </li>
-        ))}
+        {events.length === 0 ? <li className="ob-muted">No events yet.</li> : visible(events).map((e) => {
+          const d = obj(e.data);
+          return (
+            <li key={e.id}>
+              <span className="ob-muted" style={{ fontSize: 12 }}>{when(e.createdAt)} · attempt {e.attempt}</span>{' '}
+              {e.kind === 'stage' && <>Stage <strong>{txt(d.name, 60)}</strong> {txt(d.status, 20)}</>}
+              {e.kind === 'metric' && <><strong>{txt(d.name, 60)}</strong> = {isNum(d.value) ? d.value.toLocaleString() : '—'}{isNum(d.step) ? ` (step ${d.step})` : ''}</>}
+              {e.kind === 'log' && <span className={d.level === 'error' ? 'tone-warn' : undefined}>{txt(d.message, 2000)}</span>}
+              {e.kind === 'artifact' && <>Artifact <strong>{txt(d.name, 200)}</strong> · <code>{hash(d.sha256)}</code></>}
+            </li>
+          );
+        })}
       </ol>
     </div>
   );

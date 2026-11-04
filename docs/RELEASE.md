@@ -24,7 +24,15 @@ New web configuration (all as runtime secrets or Coolify environment, never buil
 
 Ingest needs `INGEST_SHARED_SECRET`, `INGEST_STORAGE=s3://…`, `INGEST_ALLOWED_ORIGINS=https://frontierintelligencelab.com`, `INGEST_BIND=0.0.0.0:4100` and the `AWS_*` storage credentials. Set a bucket lifecycle rule that aborts incomplete multipart uploads after 1 day. Pending uploads that were never committed are swept every hour (`INGEST_PENDING_TTL_SECONDS`, default 24 h).
 
-**Runners and jobs (migration 014).** `014_jobs.sql` only creates tables (`runners`, `jobs`, `job_events`) and their triggers, so it is safe after 001 to 013 and the previous web build ignores them. Confirm the app role can `SELECT, INSERT, UPDATE` on all three (and `DELETE` only through workspace deletion). No new environment variables. Runners reach the API at `/api/runner/*` with a bearer key, so the reverse proxy must pass the `Authorization` header through unchanged.
+**Runners and jobs (migration 014).** `014_jobs.sql` only creates tables (`runners`, `jobs`, `job_events`) and their triggers, so it is safe after 001 to 013 and the previous web build ignores them. It also replaces the `enhance_runs_compute_check` constraint to allow `runner`; the previous build never writes that value. Migrations create tables as the migrator role, so grant the app role exactly what it uses, if your database does not use default privileges:
+
+  ```sql
+  GRANT SELECT, INSERT, UPDATE ON runners, jobs TO <app_role>;
+  GRANT SELECT, INSERT ON job_events TO <app_role>;
+  GRANT USAGE ON SEQUENCE job_events_id_seq TO <app_role>;
+  ```
+
+  No `DELETE` on any of the three: they are removed only by the cascade from deleting a workspace (which the app role already may do), and triggers refuse direct deletes of jobs and any change to job events. Without `USAGE` on `job_events_id_seq` every event report fails. Do not run this migration against production from a development machine; it ships through the normal release. No new environment variables. Runners reach the API at `/api/runner/*` with a bearer key, so the reverse proxy must pass the `Authorization` header through unchanged.
 
 **Run on this device (migration 012).** `012_devices.sql` only creates tables (`devices`, `device_reports`, `model_installs`, `execution_runs`), so it is safe after 001 to 011 and the previous web build ignores them. Confirm the app role can `SELECT, INSERT, UPDATE` on all four. `LOCAL_RUNTIME_ORIGINS` is optional and defaults to Ollama on loopback. Mount a reviewed catalog and set `LOCAL_MODEL_CATALOG_FILE` to offer downloads (start from `docs/local-models.example.json`); a bad catalog stops startup. This file is distinct from `MODEL_CATALOG_FILE` below: it lists what a person may download to their own runtime, in its own format, and the two must not be swapped. Each user adds the production origin to their own `OLLAMA_ORIGINS`; nothing on the server configures that. With the production CSP, including `upgrade-insecure-requests`, Chromium was checked to leave `http://127.0.0.1:11434` unrewritten (a production-mode server returned the Ollama version). Firefox and Safari, and a page served over https, are not yet checked; do that before announcing the feature.
 

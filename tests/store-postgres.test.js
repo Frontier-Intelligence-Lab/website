@@ -1031,6 +1031,45 @@ withStore('jobs: inputs and finished jobs cannot change and events cannot be edi
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM job_events WHERE job_id = $1', [job.id])).rows[0].n, 0);
 });
 
+// Review 1 (comment 6637458993): a lease that runs out while its call waits for the row lock must be refused.
+// Two real connections: one holds the job row; the store's call waits behind it past the lease expiry.
+withStore('jobs: a lease that expires while waiting for the row lock is refused, not renewed', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'e'.repeat(64), keyPrefix: 'vrk_eeeeee' });
+  const job = await store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: 'lock-key-0001', createdBy: owner.id });
+  const calls = [(w) => store.touchJob(w), (w) => store.appendJobEvents({ ...w, events: [{ seq: 0, kind: 'log', data: { level: 'info', message: 'late' } }] }), (w) => store.finishJob({ ...w, outcome: 'succeeded', result: { network: 'none' } })];
+  for (const [i, call] of calls.entries()) {
+    // A fresh 500 ms lease for each call (attempts 1 to 3); leasing reclaims the previous, expired one.
+    const leaseHash = String(i + 1).repeat(64);
+    assert.equal((await store.leaseJob({ runnerId: runner.id, leaseHash, leaseMs: 500 }))?.id, job.id);
+    const blocker = await pool.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query('SELECT id FROM jobs WHERE id = $1 FOR UPDATE', [job.id]);
+      const waiting = call({ runnerId: runner.id, jobId: job.id, leaseHash }).then(() => 'accepted', (err) => err.code);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await blocker.query('COMMIT');
+      assert.equal(await waiting, 'lease_lost', `call ${i + 1} waited past its lease`);
+    } finally { blocker.release(); }
+  }
+  const after = await store.getJob({ workspaceId: ws.id, jobId: job.id });
+  assert.notEqual(after.status, 'succeeded', 'an expired holder could not finish the job');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM job_events WHERE job_id = $1', [job.id])).rows[0].n, 0, 'nor add events');
+});
+
+withStore('jobs: a job is deleted only with its workspace, never one by one', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'e'.repeat(64), keyPrefix: 'vrk_eeeeee' });
+  const job = await store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: {}, idempotencyKey: 'del-key-0001', createdBy: owner.id });
+  await assert.rejects(pool.query('DELETE FROM jobs WHERE id = $1', [job.id]), (err) => /job_frozen/.test(err.message));
+  await store.cancelJob({ workspaceId: ws.id, jobId: job.id, actorId: owner.id });
+  await assert.rejects(pool.query('DELETE FROM jobs WHERE id = $1', [job.id]), (err) => /job_frozen/.test(err.message), 'finished jobs too');
+  await pool.query('DELETE FROM workspaces WHERE id = $1', [ws.id]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM jobs WHERE id = $1', [job.id])).rows[0].n, 0);
+});
+
 const capitalDraft = (extra = {}) => ({ purpose: 'Pilot', requestedAmountCents: 5000000, timing: { neededBy: null, termMonths: null }, company: { legalName: 'QA ONLY Co', registrationRef: '', country: '', foundedYear: null, employees: null, website: '', description: '' }, costItems: [{ id: 'ci_1', category: 'compute', label: 'GPU hours', amountCents: 250000, period: 'one_time', basis: 'estimated', source: 'Price list', observedAt: '2026-11-01', evidenceId: null }], references: [], datasetVersions: [], ...extra });
 // The hash of exactly what sending would freeze, from the same reads a route makes.
 const capitalHash = async (store, mine) => snapshotHash(capitalSnapshot(await store.getCapitalCase(mine), await store.listCreditRecords(mine.workspaceId), await store.listCapitalEvidence(mine)));

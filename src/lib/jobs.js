@@ -96,11 +96,12 @@ export function validateEvents(raw) {
 }
 
 /** How a runner ends an attempt. */
-export function validateFinish(raw) {
+export function validateFinish(raw, kind) {
   if (!isObject(raw)) return { errors: { outcome: 'Say how the job ended.' } };
   if (raw.outcome === 'succeeded') {
-    if (!isObject(raw.result) || jsonSize(raw.result) > 32_768) return { errors: { result: 'Send a result object under 32 KB.' } };
-    return { values: { outcome: 'succeeded', result: raw.result } };
+    const result = projectResult(kind, raw.result);
+    if (!result) return { errors: { result: `Send a ${kind ?? 'job'} result with the documented fields and types, under 32 KB.` } };
+    return { values: { outcome: 'succeeded', result } };
   }
   if (raw.outcome === 'failed') {
     if (!FAILURES.includes(raw.failure)) return { errors: { failure: 'Use one of the listed failure categories.' } };
@@ -141,4 +142,83 @@ export function buildJobSpec({ kind, run, catalog, trainJob = null }) {
       baseModel: structuredClone(baseModel),
     },
   };
+}
+
+// --- Successful results, by job kind. A runner is untrusted input: every result is projected onto a bounded,
+// typed shape (unknown fields are dropped) and refused if a known field has the wrong type or size.
+const HEX = /^[0-9a-f]{64}$/;
+const T = {
+  num: (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined),
+  int: (v) => (Number.isSafeInteger(v) && v >= 0 ? v : undefined),
+  bool: (v) => (typeof v === 'boolean' ? v : undefined),
+  str: (max) => (v) => (typeof v === 'string' && v.length <= max ? v : undefined),
+  hex: (v) => (typeof v === 'string' && HEX.test(v) ? v : undefined),
+  arr: (item, max) => (v) => {
+    if (!Array.isArray(v) || v.length > max) return undefined;
+    const out = v.map(item);
+    return out.every((x) => x !== undefined) ? out : undefined;
+  },
+  map: (item, max) => (v) => {
+    if (!isObject(v) || Object.keys(v).length > max) return undefined;
+    const out = Object.entries(v).map(([k, x]) => [k.slice(0, 200), item(x)]);
+    return out.every(([, x]) => x !== undefined) ? Object.fromEntries(out) : undefined;
+  },
+  // An object: `required` fields must be present and valid; the rest may be absent but, if present, must be valid.
+  obj: (fields, required = []) => (v) => {
+    if (!isObject(v)) return undefined;
+    const out = {};
+    for (const [k, check] of Object.entries(fields)) {
+      if (v[k] === undefined || v[k] === null) {
+        if (required.includes(k)) return undefined;
+        continue;
+      }
+      const x = check(v[k]);
+      if (x === undefined) return undefined;
+      out[k] = x;
+    }
+    return out;
+  },
+};
+const scores = T.obj({ f1: T.num, exact: T.num, n: T.int });
+const sample = T.obj({ prompt: T.str(600), base: T.str(1000), tuned: T.str(1000) }, ['prompt', 'base', 'tuned']);
+const RESULT_SCHEMAS = {
+  probe: T.obj({
+    hostGpus: T.int, ollamaReachable: T.bool, sandbox: T.bool, network: T.str(40),
+    sandboxGpus: T.arr(T.obj({ name: T.str(120), memoryMb: T.int, driver: T.str(40) }, ['name', 'memoryMb']), 16),
+  }),
+  train: T.obj({
+    method: T.str(40), rank: T.int, alpha: T.int, epochs: T.num, steps: T.int,
+    trainExamples: T.int, heldOutExamples: T.int, skippedLines: T.int,
+    baseHeldOutLoss: T.num, tunedHeldOutLoss: T.num, trainSeconds: T.num, peakGpuMemoryMb: T.int,
+    gpus: T.arr(T.str(120), 16),
+    evaluation: T.obj({ metric: T.str(200), base: scores, tuned: scores }),
+    samples: T.arr(sample, 5),
+    baseModel: T.obj({ id: T.str(80), source: T.str(200), revision: T.str(80), weightsSha256: T.map(T.hex, 64), configSha256: T.hex, tokenizerSha256: T.hex }),
+    adapter: T.obj({ sha256: T.hex, configSha256: T.hex, sizeBytes: T.int, location: T.str(300) }, ['sha256']),
+    splitSha256: T.hex, trainingManifestSha256: T.hex, datasetFiles: T.int,
+  }, ['adapter']),
+  export: T.obj({
+    ollamaModel: T.str(120), manifestSha256: T.hex, trainingManifestSha256: T.hex, baseGgufSha256: T.hex, location: T.str(300),
+    gguf: T.obj({ file: T.str(200), sha256: T.hex, sizeBytes: T.int, quantization: T.str(20) }, ['sha256']),
+    loadTest: T.obj({
+      conversations: T.int, seconds: T.num,
+      tuned: T.obj({ model: T.str(120), tokensPerSec: T.num }), base: T.obj({ model: T.str(120), tokensPerSec: T.num }),
+    }),
+    samples: T.arr(sample, 5),
+  }, ['gguf']),
+  evaluate: T.obj({ evaluation: T.obj({ metric: T.str(200), base: scores, tuned: scores }), samples: T.arr(sample, 5) }),
+};
+
+/** The result to store for a successful job of this kind, or null if it is malformed. */
+export function projectResult(kind, raw) {
+  const schema = RESULT_SCHEMAS[kind];
+  if (!schema || !isObject(raw) || jsonSize(raw) > 32_768) return null;
+  return schema(raw) ?? null;
+}
+
+/** Canonical JSON (sorted keys) for comparing two requests' immutable inputs. */
+export function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isObject(value)) return `{${Object.keys(value).filter((k) => value[k] !== undefined).sort().map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
+  return JSON.stringify(value);
 }
