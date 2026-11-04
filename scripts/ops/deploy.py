@@ -547,6 +547,20 @@ def load_config(path):
     return config
 
 
+HOST_MAPPING = r"[A-Za-z0-9_][A-Za-z0-9._-]{0,252}:(?:[0-9A-Fa-f.:]{1,45}|host-gateway)"
+
+
+def host_arguments(container):
+    """Docker `--add-host` arguments repeating the live container's custom host mappings (`HostConfig.ExtraHosts`),
+    so a helper container resolves the configured database hostname exactly as the web container does, keeping
+    the database URL and its TLS identity unchanged. Values are validated only for safe argument construction,
+    passed as separate arguments (never through a shell) and never logged."""
+    mappings = (container.get("HostConfig") or {}).get("ExtraHosts") or []
+    if not all(isinstance(mapping, str) and re.fullmatch(HOST_MAPPING, mapping) for mapping in mappings):
+        raise ReleaseError("Web container has an unsupported extra host mapping")
+    return [argument for mapping in mappings for argument in ("--add-host", mapping)]
+
+
 def node_program(code):
     return ("import {createPostgresPool} from './src/store/postgres.js';\n"
             "const pool=createPostgresPool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL});\n"
@@ -568,11 +582,15 @@ class Release:
         self.swaps = []
         self.receipt = {"revision": sha}
 
+    def migrator_arguments(self):
+        """Network, migrator secret file, CA mount and the web container's host mappings: what every database
+        container (migration passes and SQL helpers) needs to reach the database exactly as the web does."""
+        return ["--network", self.config["network"], "--env-file", self.config["migrator_env"],
+                "-v", self.config["ca_file"] + ":/run/pg-ca.crt:ro", *host_arguments(self.web)]
+
     def node(self, code, image=None):
         if image:
-            command = ["docker", "run", "--rm", "-i", "--network", self.config["network"],
-                       "--env-file", self.config["migrator_env"], "-v", self.config["ca_file"] + ":/run/pg-ca.crt:ro",
-                       image, "node", "--input-type=module"]
+            command = ["docker", "run", "--rm", "-i", *self.migrator_arguments(), image, "node", "--input-type=module"]
         else:
             command = ["docker", "exec", "-i", self.config["web_container"], "node", "--input-type=module"]
         raw = run(command, data=node_program(code), timeout=60)
@@ -603,6 +621,8 @@ class Release:
             raise ReleaseError("Expected private S3-compatible ingest storage")
         migrator_env = private_env(self.config["migrator_env"])
         validate_migrator(web_env, migrator_env, self.config["ca_file"])
+        # Fail closed before any backup if the web's custom host mappings cannot be repeated safely (count only).
+        self.receipt["database_host_mappings"] = len(host_arguments(self.web)) // 2
         # The role contract holds whatever tables exist: checked before backup, build, grants and migrations.
         roles = [unquote(urlsplit(env["DATABASE_URL"]).username or "") for env in (web_env, migrator_env)]
         self.receipt["app_role"] = verify_app_role(self.node(role_check_program(*roles)))
@@ -779,7 +799,7 @@ class Release:
         self.receipt["images"] = self.images
 
     def migrate(self):
-        command = ["docker", "run", "--rm", "--network", self.config["network"], "--env-file", self.config["migrator_env"], "-v", self.config["ca_file"] + ":/run/pg-ca.crt:ro", self.images["migrate"]]
+        command = ["docker", "run", "--rm", *self.migrator_arguments(), self.images["migrate"]]
         first = run(command).decode().strip(); second = run(command).decode().strip()
         if not first.startswith("Applied ") or second != "Applied 0 migration(s).":
             raise ReleaseError("Migration did not produce the expected ledger result")
