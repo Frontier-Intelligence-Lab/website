@@ -51,6 +51,30 @@ class RevisionBoundary(unittest.TestCase):
 
 
 class RuntimePreservation(unittest.TestCase):
+    def test_snapshot_dump_uses_existing_postgres_local_socket_with_timeout(self):
+        release = object.__new__(deploy.Release)
+        release.config = {"postgres_container": "projects-db", "db_name": "valcairn"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(deploy, "run") as execute:
+            destination = Path(directory) / "database.dump"
+            release.dump_snapshot("00000003-00000001-1", destination)
+            args, options = execute.call_args
+            command = args[0]
+            self.assertEqual(command[:3], ["docker", "exec", "projects-db"])
+            self.assertEqual(command[-3:], ["dump", "valcairn", "00000003-00000001-1"])
+            self.assertIn('-h /var/run/postgresql -U "$POSTGRES_USER"', command[5])
+            self.assertIn('PGPASSWORD="$POSTGRES_PASSWORD"', command[5])
+            self.assertEqual(options["timeout"], 180)
+            self.assertNotIn("data", options)
+            self.assertTrue(destination.is_file())
+            with self.assertRaises(deploy.ReleaseError):
+                release.dump_snapshot("invalid; command", Path(directory) / "bad.dump")
+
+    def test_dump_timeout_is_sanitized(self):
+        with patch.object(deploy.subprocess, "run", side_effect=deploy.subprocess.TimeoutExpired("private command", 180, stderr=b"private detail")):
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                deploy.run(["docker", "exec"], timeout=180)
+        self.assertNotIn("private", str(failure.exception))
+
     def test_newer_master_after_build_prevents_migrations(self):
         with tempfile.TemporaryDirectory() as directory:
             release = object.__new__(deploy.Release)

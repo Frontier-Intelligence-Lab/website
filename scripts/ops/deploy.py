@@ -402,14 +402,7 @@ class Release:
             source = urlsplit(env_map(self.web)["DATABASE_URL"])
             if source.path.lstrip("/") != self.config["db_name"]:
                 raise ReleaseError("Database identity differs from approved configuration")
-            fields = [source.hostname, str(source.port or 5432), unquote(source.username or ""),
-                      unquote(source.password or ""), self.config["db_name"], record["snapshot"]]
-            if any("\n" in field or "\r" in field for field in fields):
-                raise ReleaseError("Unsupported database connection value")
-            script = "IFS= read -r PGHOST; IFS= read -r PGPORT; IFS= read -r PGUSER; IFS= read -r PGPASSWORD; IFS= read -r PGDATABASE; IFS= read -r SNAP; export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE; export PGSSLMODE=verify-full PGSSLROOTCERT=/run/pg-ca.crt; exec pg_dump -Fc --no-owner --no-acl --snapshot=\"$SNAP\""
-            fd = os.open(self.backup_dir / "database.dump", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as dump:
-                run(["docker", "run", "--rm", "-i", "--network", self.config["network"], "-v", self.config["ca_file"] + ":/run/pg-ca.crt:ro", "postgres:17-alpine", "sh", "-c", script], data=("\n".join(fields)+"\n").encode(), output=dump)
+            self.dump_snapshot(record["snapshot"], self.backup_dir / "database.dump")
             private_write(self.backup_dir / "manifest-private.json", json.dumps(record["manifest"]))
         finally:
             if proc.poll() is None:
@@ -427,8 +420,8 @@ class Release:
         try:
             self.psql("postgres", 'CREATE DATABASE "' + scratch + '";')
             created = True
-            restore = 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_restore --exit-on-error --no-owner --no-acl -U "$POSTGRES_USER" -d "$1"'
-            run(["docker", "exec", "-i", self.config["postgres_container"], "sh", "-c", restore, "restore", scratch], data=(self.backup_dir / "database.dump").read_bytes())
+            restore = 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_restore --exit-on-error --no-owner --no-acl -h /var/run/postgresql -U "$POSTGRES_USER" -d "$1"'
+            run(["docker", "exec", "-i", self.config["postgres_container"], "sh", "-c", restore, "restore", scratch], data=(self.backup_dir / "database.dump").read_bytes(), timeout=300)
             restored = json.loads(self.psql(scratch, "SET TIME ZONE 'UTC'; " + manifest_sql(record["tables"]) + ";"))
             if restored != record["manifest"]:
                 raise ReleaseError("Restored database contents differ from the backup snapshot")
@@ -438,11 +431,24 @@ class Release:
         self.receipt["backup"] = {"path": str(self.backup_dir), "tables_verified": len(record["tables"]), "restore_verified": True}
         print("Backup restored and verified", flush=True)
 
+    def dump_snapshot(self, snapshot, destination):
+        if not re.fullmatch(r"[0-9A-Fa-f-]+", snapshot):
+            raise ReleaseError("Invalid exported database snapshot")
+        # Use the existing database container's local socket and admin environment.
+        # The web transaction holds the exported snapshot; no password leaves Postgres.
+        script = ('export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_dump '
+                  '-h /var/run/postgresql -U "$POSTGRES_USER" -d "$1" '
+                  '-Fc --no-owner --no-acl --lock-wait-timeout=30s --snapshot="$2"')
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as dump:
+            run(["docker", "exec", self.config["postgres_container"], "sh", "-c", script,
+                 "dump", self.config["db_name"], snapshot], output=dump, timeout=180)
+
     def psql(self, database, sql):
         if database != "postgres" and not re.fullmatch(r"valcairn_restore_test_[0-9]+", database):
             raise ReleaseError("Only the scratch database may be restored")
-        script = 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$1"'
-        return run(["docker", "exec", "-i", self.config["postgres_container"], "sh", "-c", script, "psql", database], data=sql.encode()).decode().strip()
+        script = 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -X -qAt -v ON_ERROR_STOP=1 -h /var/run/postgresql -U "$POSTGRES_USER" -d "$1"'
+        return run(["docker", "exec", "-i", self.config["postgres_container"], "sh", "-c", script, "psql", database], data=sql.encode(), timeout=60).decode().strip()
 
     def protected_snapshot(self):
         # Digests stay inside the controller; never emit credential hashes or private snapshots.
