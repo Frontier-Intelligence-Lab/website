@@ -26,8 +26,8 @@ from contextlib import contextmanager
 
 REPOSITORY = "Frontier-Intelligence-Lab/website"
 REQUIRED_JOBS = {"Web / no database", "Web / PostgreSQL 17", "Ingest / Rust 1.99.1"}
-# Tables grouped by the numbered migration that creates them, 001-013 as in migrations/ (Models, Device and
-# Capital included; Memory and Agents add no server table). The migration ledger decides which groups
+# Tables grouped by the numbered migration that creates them, 001-014 as in migrations/ (Models, Device,
+# Capital and Runners/jobs included; Memory and Agents add no server table). The migration ledger decides which groups
 # must exist: a listed migration requires its whole group, an unlisted one forbids it. 003, 005 and 008-010
 # add no tables. The ledger table itself comes from the migrator, and 006 is the baseline the preflight needs.
 TABLE_GROUPS = {
@@ -39,6 +39,7 @@ TABLE_GROUPS = {
     "011": ("model_pulls", "enhance_runs"),
     "012": ("devices", "device_reports", "model_installs", "execution_runs"),
     "013": ("capital_cases", "capital_submissions", "credit_records", "capital_evidence", "capital_review_marks"),
+    "014": ("runners", "jobs", "job_events"),
 }
 LEDGER_TABLE, BASELINE = "schema_migrations", "006"
 KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
@@ -47,7 +48,8 @@ KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
 ROW_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
 # Exactly the statements the application store issues per table (row locks need UPDATE). Append-only and
-# frozen records never get DELETE; new tables use uuid defaults, so no sequence is part of the contract.
+# frozen records never get DELETE. New tables use uuid defaults; the one sequence in the contract is listed in
+# SEQUENCE_GRANTS, and any other sequence on a contract table stops the release.
 GRANTS = {
     "annotations": ROW_PRIVILEGES, "issue_notes": ROW_PRIVILEGES,
     "model_pulls": ("SELECT", "INSERT"), "enhance_runs": ("SELECT", "INSERT", "UPDATE"),
@@ -56,7 +58,13 @@ GRANTS = {
     "capital_cases": ("SELECT", "INSERT", "UPDATE"), "capital_submissions": ("SELECT", "INSERT", "UPDATE"),
     "credit_records": ("SELECT", "INSERT"), "capital_evidence": ("SELECT", "INSERT", "DELETE"),
     "capital_review_marks": ("SELECT", "INSERT"),
+    # Runners and jobs (014): runners and jobs are locked and updated in place; job events are append-only.
+    "runners": ("SELECT", "INSERT", "UPDATE"), "jobs": ("SELECT", "INSERT", "UPDATE"), "job_events": ("SELECT", "INSERT"),
 }
+# job_events.id is a bigserial (event pages are read in id order): inserting needs USAGE on its sequence and
+# nothing more. SELECT or UPDATE on it (setval) is excess and stops the release.
+SEQUENCE_PRIVILEGES = ("USAGE", "SELECT", "UPDATE")
+SEQUENCE_GRANTS = {"job_events": {"job_events_id_seq": ("USAGE",)}}
 # Records a migration must leave byte-for-byte alone, digested per row; digests never leave the controller.
 FROZEN_QUERIES = {
     "enhance_runs": "SELECT id::text,md5(jsonb_build_object('name',name,'base',base_model_id,'datasets',datasets,'steps',steps,'compute',compute,'cap',spend_cap_usd,'by',requested_by,'at',requested_at,'workspace',workspace_id)::text) AS digest FROM enhance_runs WHERE status='requested' ORDER BY id",
@@ -300,6 +308,14 @@ def privilege_gap(rows, required):
     return sorted(p for p in required if not values[p]), sorted(p for p in values if values[p] and p not in required)
 
 
+def sequence_gap(rows, required):
+    """Return (missing, excess) for one contract sequence over every reported sequence privilege."""
+    values = {row["privilege"]: row["ok"] is True for row in rows}
+    if set(values) != set(SEQUENCE_PRIVILEGES) or len(rows) != len(values) or not set(required) <= set(SEQUENCE_PRIVILEGES):
+        raise ReleaseError("Incomplete privilege verification")
+    return sorted(p for p in required if not values[p]), sorted(p for p in values if values[p] and p not in required)
+
+
 def verify_tables(ledger, present):
     """The ledger decides which table groups must exist: a listed migration requires its whole group, an unlisted one forbids it."""
     present = set(present)
@@ -332,7 +348,8 @@ def grant_check_program(role, table):
             "const owner=(await pool.query(\"SELECT pg_has_role($2,c.relowner,'USAGE') OR pg_has_role($2,c.relowner,'SET') AS owner FROM pg_class c WHERE c.oid=to_regclass($1)\",['public.'+table,role])).rows.some(r=>r.owner===true);"
             "const superuser=(await pool.query('SELECT rolsuper FROM pg_roles WHERE rolname=$1',[role])).rows.some(r=>r.rolsuper===true);"
             "const sequences=(await pool.query(\"SELECT s.relname AS name FROM pg_class s JOIN pg_depend d ON d.objid=s.oid AND d.deptype IN ('a','i') JOIN pg_class t ON t.oid=d.refobjid WHERE s.relkind='S' AND t.relname=$1 AND t.relnamespace='public'::regnamespace\",[table])).rows;"
-            "console.log(JSON.stringify({present:true,rows,owner,superuser,sequences}));}")
+            "const sequenceRows={};for(const s of sequences)sequenceRows[s.name]=(await pool.query('SELECT p AS privilege,has_sequence_privilege($1,$2,p) AS ok FROM unnest($3::text[]) p',[role,'public.'+s.name," + json.dumps(SEQUENCE_PRIVILEGES) + "])).rows;"
+            "console.log(JSON.stringify({present:true,rows,owner,superuser,sequences,sequenceRows}));}")
 
 
 def grant_program(role, table, privileges):
@@ -341,6 +358,14 @@ def grant_program(role, table, privileges):
         raise ReleaseError("Refusing a grant outside the release contract")
     return ("const role=" + json.dumps(role) + ";const q=(await pool.query('SELECT quote_ident($1) AS q',[role])).rows[0].q;"
             "await pool.query('GRANT " + ",".join(privileges) + " ON TABLE " + table + " TO '+q);console.log(JSON.stringify({granted:true}));")
+
+
+def sequence_grant_program(role, table, sequence, privileges):
+    # Sequence and privilege names come only from the fixed contract; the role is identifier-quoted by Postgres.
+    if not set(privileges) <= set(SEQUENCE_GRANTS.get(table, {}).get(sequence, ())):
+        raise ReleaseError("Refusing a grant outside the release contract")
+    return ("const role=" + json.dumps(role) + ";const q=(await pool.query('SELECT quote_ident($1) AS q',[role])).rows[0].q;"
+            "await pool.query('GRANT " + ",".join(privileges) + " ON SEQUENCE " + sequence + " TO '+q);console.log(JSON.stringify({granted:true}));")
 
 
 ROLE_FLAGS = ("superuser", "createdb", "createrole", "bypassrls", "replication")
@@ -747,7 +772,7 @@ class Release:
     def ensure_grants(self):
         """Grant only the contract's statements on tables that exist now; any broader effective access stops the release."""
         app_role = unquote(urlsplit(env_map(self.web)["DATABASE_URL"]).username or "")
-        tables, checked = {}, []
+        tables, checked, sequences = {}, [], {}
         for table, required in GRANTS.items():
             check = grant_check_program(app_role, table)
             state = self.node(check, self.images["migrate"])
@@ -758,8 +783,13 @@ class Release:
             # current ACL says, so it is refused before the ACL is even compared. Never revoke or re-own here.
             if state["owner"] is True or state["superuser"] is True:
                 raise ReleaseError("Application role owns, or can act as owner of, a contract table; use a separate least-privilege role")
-            if state["sequences"]:
+            allowed = SEQUENCE_GRANTS.get(table, {})
+            if {s["name"] for s in state["sequences"]} != set(allowed):
                 raise ReleaseError("Feature table uses a sequence outside the grant contract")
+            for sequence, wanted in allowed.items():
+                missing, excess = sequence_gap(state["sequenceRows"][sequence], wanted)
+                if excess:
+                    raise ReleaseError("Application role holds privileges beyond the release contract; revoke them before deploying")
             missing, excess = privilege_gap(state["rows"], required)
             if excess:
                 raise ReleaseError("Application role holds privileges beyond the release contract; revoke them before deploying")
@@ -768,9 +798,17 @@ class Release:
                 missing, excess = privilege_gap(self.node(check, self.images["migrate"])["rows"], required)
             if missing or excess:
                 raise ReleaseError("Application privileges remain incomplete")
+            for sequence, wanted in allowed.items():
+                missing, _ = sequence_gap(state["sequenceRows"][sequence], wanted)
+                if missing:
+                    self.node(sequence_grant_program(app_role, table, sequence, missing), self.images["migrate"])
+                    missing, excess = sequence_gap(self.node(check, self.images["migrate"])["sequenceRows"][sequence], wanted)
+                    if missing or excess:
+                        raise ReleaseError("Application privileges remain incomplete")
+                sequences[sequence] = list(wanted)
             tables[table] = list(required)
             checked = sorted(row["privilege"] for row in state["rows"])
-        self.receipt["grants"] = {"privileges_checked": checked, "tables": tables}
+        self.receipt["grants"] = {"privileges_checked": checked, "tables": tables, "sequences": sequences}
 
     def build(self):
         releases = child_path(self.root, "releases")

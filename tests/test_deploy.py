@@ -331,7 +331,7 @@ class SourcePaths(unittest.TestCase):
 
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
-FEATURE_NUMBERS = ("011", "012", "013")
+FEATURE_NUMBERS = ("011", "012", "013", "014")
 ALL_PRIVILEGES = deploy.TABLE_PRIVILEGES + ("MAINTAIN",)
 
 
@@ -372,7 +372,7 @@ class FeatureGuards(unittest.TestCase):
         verified, absent = deploy.verify_tables(ledger_through("010"), tables_through("010"))
         self.assertIn("annotations", verified)
         self.assertEqual(absent, sorted(sum((deploy.TABLE_GROUPS[n] for n in FEATURE_NUMBERS), ())))
-        later = ledger_through("010") + ["011_models.sql", "012_devices.sql", "013_capital.sql"]
+        later = ledger_through("010") + ["011_models.sql", "012_devices.sql", "013_capital.sql", "014_jobs.sql"]
         self.assertEqual(deploy.verify_tables(later, deploy.KNOWN_TABLES), (sorted(deploy.KNOWN_TABLES), []))
 
     def test_ledger_and_tables_must_agree_from_the_baseline_up(self):
@@ -444,12 +444,17 @@ class FeatureGuards(unittest.TestCase):
             if granted:
                 present[granted.group(2)]["held"] |= set(granted.group(1).split(","))
                 return {"granted": True}
+            granted = re.search(r"GRANT ([A-Z,]+) ON SEQUENCE ([a-z_]+) TO", code)
+            if granted:
+                next(t for t in present.values() if granted.group(2) in t.get("seq_held", {}))["seq_held"][granted.group(2)] |= set(granted.group(1).split(","))
+                return {"granted": True}
             table = re.search(r'table="([a-z_]+)"', code).group(1)
             if table not in present:
                 return {"present": False}
             state = present[table]
             return {"present": True, "sequences": state.get("sequences", []), "owner": state.get("owner", False), "superuser": state.get("superuser", False),
-                    "rows": [{"privilege": p, "ok": p in state["held"]} for p in ALL_PRIVILEGES]}
+                    "rows": [{"privilege": p, "ok": p in state["held"]} for p in ALL_PRIVILEGES],
+                    "sequenceRows": {name: [{"privilege": p, "ok": p in held} for p in deploy.SEQUENCE_PRIVILEGES] for name, held in state.get("seq_held", {}).items()}}
         release.node = node
         return release
 
@@ -491,6 +496,36 @@ class FeatureGuards(unittest.TestCase):
         release = self.grant_release({"devices": {"held": {"SELECT", "INSERT", "UPDATE"}, "sequences": [{"name": "devices_id_seq"}]}})
         with self.assertRaises(deploy.ReleaseError):
             release.ensure_grants()
+
+    def test_job_events_get_usage_on_their_one_sequence_and_nothing_more(self):
+        self.assertEqual(deploy.GRANTS["job_events"], ("SELECT", "INSERT"))
+        self.assertEqual(deploy.SEQUENCE_GRANTS, {"job_events": {"job_events_id_seq": ("USAGE",)}})
+        seq = [{"name": "job_events_id_seq"}]
+        release = self.grant_release({"job_events": {"held": {"SELECT", "INSERT"}, "sequences": seq, "seq_held": {"job_events_id_seq": set()}}})
+        release.ensure_grants()
+        grants = [code for code in release.programs if "GRANT " in code]
+        self.assertEqual(len(grants), 1)
+        self.assertIn("GRANT USAGE ON SEQUENCE job_events_id_seq TO", grants[0])
+        self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
+        # SELECT or UPDATE (setval) on the sequence is excess; another sequence, or one on another table, is refused.
+        for extra in ("SELECT", "UPDATE"):
+            release = self.grant_release({"job_events": {"held": {"SELECT", "INSERT"}, "sequences": seq, "seq_held": {"job_events_id_seq": {"USAGE", extra}}}})
+            with self.subTest(extra=extra), self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("beyond the release contract", str(failure.exception))
+            self.assertFalse(any("GRANT " in code for code in release.programs))
+        for state in ({"held": {"SELECT", "INSERT"}, "sequences": [{"name": "other_seq"}], "seq_held": {"other_seq": set()}},
+                      {"held": {"SELECT", "INSERT"}, "sequences": []}):
+            release = self.grant_release({"job_events": state})
+            with self.assertRaises(deploy.ReleaseError):
+                release.ensure_grants()
+        release = self.grant_release({"jobs": {"held": {"SELECT", "INSERT", "UPDATE"}, "sequences": seq, "seq_held": {"job_events_id_seq": set()}}})
+        with self.assertRaises(deploy.ReleaseError):
+            release.ensure_grants()
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.sequence_grant_program("app", "job_events", "job_events_id_seq", ["UPDATE"])
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.sequence_grant_program("app", "jobs", "job_events_id_seq", ["USAGE"])
 
     def test_frozen_feature_records_are_digested_only_when_present_and_never_recorded(self):
         release = object.__new__(deploy.Release)
@@ -962,14 +997,16 @@ class PostgresSemantics(unittest.TestCase):
 
     def landed_feature_schema(self, app):
         """With 011-013 applied as on master: every contract table exists, is granted for real, fingerprinted and frozen-checked."""
-        self.assertEqual(self.migrate("013"), [name for name in ledger_through("013") if name[:3] > "010"])
+        self.assertEqual(self.migrate("014"), [name for name in ledger_through("014") if name[:3] > "010"])
         record = self.snapshot(self.urls["migrator"])
         self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(deploy.KNOWN_TABLES), []))
         release = self.release_as(app)
         release.ensure_grants()
         self.assertEqual(set(release.receipt["grants"]["tables"]), set(deploy.GRANTS))
         self.assertNotIn("absent", release.receipt["grants"]["tables"].values())
-        self.assertEqual(sum("GRANT " in code for code in release.programs), len(deploy.GRANTS) - 2)
+        self.assertEqual(sum("ON TABLE" in code and "GRANT " in code for code in release.programs), len(deploy.GRANTS) - 2)
+        self.assertEqual(sum("ON SEQUENCE job_events_id_seq" in code for code in release.programs), 1)
+        self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
         # The frozen-record queries run as the app role against the landed schema, so every column they name must exist.
         release = self.release_as(app, via=self.urls["app"])
         before = release.protected_snapshot()
