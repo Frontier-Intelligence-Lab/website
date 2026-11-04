@@ -1,121 +1,81 @@
 import hashlib
 import json
-import tempfile
-import threading
 import unittest
-from pathlib import Path
 
+from fixtures_runner import EXPORT_JOB, SYSTEM, Box, Ctx, Ollama, export_spec, trained
 from valcairn_runner import export as exporter
-from valcairn_runner.runner import Settings
+from valcairn_runner.sandbox import Cancelled
 from valcairn_runner.training import JobFailure
 
-ADAPTER = b"adapter-bytes"
 ORIGINAL_LOAD_TEST = exporter.load_test
 
 
-class Ctx:
-    def __init__(self, home, sha=None, location="jobs/t1/attempt-1/out/adapter"):
-        self.settings = Settings(home=str(home))
-        self.capabilities = {"gpus": [{"name": "GPU", "memoryMb": 1}]}
-        self.job = {"id": "e1234567-0000-4000-8000-000000000000", "attempt": 1}
-        self.spec = {"source": {"trainJobId": "t1", "adapterSha256": sha or hashlib.sha256(ADAPTER).hexdigest(), "adapterLocation": location},
-                     "baseModel": {"id": "m", "source": "org/model", "license": "Apache 2.0"}}
-        self.cancelled = threading.Event()
-        self.events = []
-        self.sandbox = Box()
-
-    def emit(self, kind, **data):
-        self.events.append((kind, data))
-
-    def log(self, message, level="info"):
-        self.emit("log", level=level, message=message)
-
-
-class Box:
-    def __init__(self):
-        self.steps = []
-
-    def run(self, step, on_line, cancelled):
-        self.steps.append(step)
-        out = Path(step.output)
-        if step.command[-1] == "merge.py":
-            (out / "merged").mkdir(parents=True, exist_ok=True)
-        else:
-            (out / step.command[-1].split("/")[-1]).write_bytes(b"gguf")
-        return 0
-
-
-def layout(home: Path):
-    train = home / "jobs" / "t1" / "attempt-1"
-    (train / "out" / "adapter").mkdir(parents=True)
-    (train / "out" / "adapter" / "adapter_model.safetensors").write_bytes(ADAPTER)
-    (train / "data").mkdir()
-    rows = [{"messages": [{"role": "system", "content": "Be Acme support."}, {"role": "user", "content": f"question {i}"}, {"role": "assistant", "content": "answer"}]} for i in range(4)]
-    # Lines training skipped as unusable must not break the held-out lookup either.
-    junk = ['{"messages": "not a list"}', '{"messages": [{"role": "assistant", "content": "no question"}]}', "not json", "[1, 2]"]
-    (train / "data" / "000-x.jsonl").write_text("\n".join([*junk, *(json.dumps(r) for r in rows)]), encoding="utf-8")
-    digest = lambda r: hashlib.sha256(json.dumps(r, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    (train / "out" / "split.json").write_text(json.dumps({"train": [digest(rows[0])], "heldOut": [digest(r) for r in rows[1:]]}))
-    model = home / "models" / "org-model" / "model"
-    model.mkdir(parents=True)
-    (model / "model.safetensors").write_bytes(b"w")
-    (model / "LICENSE").write_text("license")
-    (model / ".valcairn-weights.json").write_text(json.dumps({"model.safetensors": hashlib.sha256(b"w").hexdigest()}))
+def run_export(test, home, result, job_id=EXPORT_JOB, attempt=1, sandbox=None, spec=None):
+    ctx = Ctx(home, job_id, attempt, spec=spec or export_spec(result), sandbox=sandbox, kind="export")
+    return ctx, exporter.export(ctx)
 
 
 class ExportTests(unittest.TestCase):
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
-        layout(self.home)
-        self.created = []
-        exporter.ollama_create = lambda name, folder: self.created.append((name, (folder / "Modelfile").read_text()))
-        exporter.load_test = lambda host, model, convs, opener=None: {"model": model, "tokensPerSec": 100.0, "answers": [f"{model} says {c[-1]['content']}" for c in convs]}
+        self.home, self.result = trained(self)
+        self.ollama = Ollama().install(self)
 
-    def test_exports_tuned_and_base_alike_and_writes_a_manifest(self):
-        ctx = Ctx(self.home)
-        result = exporter.export(ctx)
+    def test_exports_tuned_and_base_alike_and_publishes_only_after_the_load_test(self):
+        ctx, result = run_export(self, self.home, self.result)
         merge, tuned, base = ctx.sandbox.steps
         self.assertTrue(all(s.network == "none" for s in ctx.sandbox.steps), "no export step has network access")
         self.assertEqual(tuned.entrypoint, "", "the converter runs directly, not through the image's launcher")
         self.assertIn("q8_0", tuned.command)
         self.assertIn("q8_0", base.command, "base and tuned use the same quantization")
-        tag = hashlib.sha256(b"org/model").hexdigest()[:6]
-        self.assertEqual([n for n, _ in self.created], ["valcairn-e1234567", f"valcairn-base-org-model-{tag}"])
-        self.assertTrue(all(m.startswith("FROM ./") for _, m in self.created))
-        self.assertIn('SYSTEM """Be Acme support."""', self.created[0][1], "the training system prompt becomes the model's default")
-        self.assertEqual(result["gguf"]["sha256"], hashlib.sha256(b"gguf").hexdigest())
-        self.assertEqual(len(result["samples"]), 3, "held-out prompts only, from the training run's split")
-        self.assertTrue(all(s["prompt"] != "question 0" for s in result["samples"]), "a trained example is never used to show the result")
+        final, provisional = f"valcairn-{EXPORT_JOB}-a1", f"valcairn-p-{EXPORT_JOB}-a1"
+        base_name = f"valcairn-base-{hashlib.sha256(b'gguf-base').hexdigest()[:16]}"
+        kinds = [c[0] + ":" + c[-1] for c in self.ollama.calls if c[0] != "has"]
+        self.assertEqual(kinds, [f"create:{provisional}", f"create:{base_name}", f"load:{provisional}", f"load:{base_name}", f"copy:{final}", f"delete:{provisional}"],
+                         "the final name appears only after both load tests")
+        self.assertEqual(set(self.ollama.models), {final, base_name})
+        self.assertIn(f'SYSTEM """{SYSTEM}"""', self.ollama.models[final], "the training system prompt becomes the model's default")
+        self.assertEqual(result["ollamaModel"], final)
+        self.assertEqual(result["gguf"]["sha256"], hashlib.sha256(b"gguf-tuned").hexdigest())
+        self.assertEqual(result["baseGgufSha256"], hashlib.sha256(b"gguf-base").hexdigest())
+        self.assertEqual(result["trainingManifestSha256"], self.result["trainingManifestSha256"])
+        split = json.loads((self.home / "jobs" / self.result["adapter"]["location"].split("/")[1] / "attempt-1" / "out" / "split.json").read_text())
+        self.assertTrue(result["samples"], "held-out prompts only, from the training run's split")
+        trained_prompts = {f"question {i}" for i in range(30)} - {s["prompt"] for s in result["samples"]}
+        self.assertEqual(len(trained_prompts), 30 - len(result["samples"]))
+        self.assertFalse(set(split["train"]) & set(split["heldOut"]))
         folder = self.home / result["location"]
         manifest = json.loads((folder / "manifest.json").read_text())
-        self.assertEqual(manifest["adapter"]["sha256"], hashlib.sha256(ADAPTER).hexdigest())
+        self.assertEqual(manifest["adapter"]["sha256"], hashlib.sha256(b"adapter").hexdigest())
         self.assertTrue((folder / "MODEL_CARD.md").exists() and (folder / "LICENSE").exists())
-        # The base GGUF is made once per runner.
-        ctx2 = Ctx(self.home)
-        ctx2.job = {**ctx2.job, "id": "f1234567-0000-4000-8000-000000000000"}
-        exporter.export(ctx2)
+        self.assertFalse((self.home / "jobs" / EXPORT_JOB / "attempt-1" / "merged").exists(), "merged full weights are not kept")
+        # The base GGUF is made once per runner for the same inputs, converter and quantization.
+        ctx2, _ = run_export(self, self.home, self.result, job_id=EXPORT_JOB[:-1] + "c")
         self.assertEqual(len(ctx2.sandbox.steps), 2)
 
     def test_refuses_an_adapter_that_is_missing_changed_or_outside_the_runner_home(self):
-        for ctx, why in [(Ctx(self.home, sha="0" * 64), "changed"), (Ctx(self.home, location="jobs/none/out/adapter"), "missing"),
-                         (Ctx(self.home, location="../../../etc"), "outside")]:
+        good = export_spec(self.result)
+        cases = {
+            "changed": {**good["source"], "adapterSha256": "0" * 64},
+            "missing": {**good["source"], "adapterLocation": "jobs/none/out/adapter"},
+            "outside": {**good["source"], "adapterLocation": "../../../etc"},
+            "no manifest hash": {k: v for k, v in good["source"].items() if k != "trainingManifestSha256"},
+        }
+        for why, source in cases.items():
             with self.assertRaises(JobFailure, msg=why) as e:
-                exporter.export(ctx)
-            self.assertEqual(e.exception.category, "model_unavailable")
+                run_export(self, self.home, self.result, spec={**good, "source": source})
+            self.assertEqual(e.exception.category, "model_unavailable", why)
 
     def test_a_failed_conversion_leaves_nothing_a_later_export_would_reuse(self):
-        class Failing(Box):
-            def run(self, step, on_line, cancelled):
-                if "/app/convert_hf_to_gguf.py" in step.command:
-                    Path(step.output, step.command[-1].split("/")[-1]).write_bytes(b"half")
-                    return 1
-                return super().run(step, on_line, cancelled)
-        ctx = Ctx(self.home)
-        ctx.sandbox = Failing()
+        def fail_convert(step, cancelled):
+            if "/app/convert_hf_to_gguf.py" in step.command:
+                (__import__("pathlib").Path(step.output) / step.command[-1].split("/")[-1]).write_bytes(b"half")
+                return 1
+            return None
         with self.assertRaises(JobFailure):
-            exporter.export(ctx)
+            run_export(self, self.home, self.result, sandbox=Box(fail_convert))
         self.assertFalse(list(self.home.rglob("*.gguf")), "no partial GGUF is kept under its final name")
         self.assertFalse(list(self.home.rglob("*.part")))
+        self.assertFalse((self.home / "jobs" / EXPORT_JOB).exists() and any((self.home / "jobs" / EXPORT_JOB).rglob("*")), "the failed attempt keeps nothing")
 
     def test_ollama_not_answering_is_a_clear_failure(self):
         def down(*args, **kwargs):
@@ -128,6 +88,19 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(e.exception.category, "runtime_error")
         finally:
             exporter.ollama_chat = real
+
+    def test_a_cancel_during_the_load_test_publishes_nothing(self):
+        real = self.ollama.load_test
+
+        def cancel_after_tuned(host, model, conversations, cancelled=None, opener=None):
+            out = real(host, model, conversations, cancelled)
+            cancelled.set()
+            return out
+        exporter.load_test = cancel_after_tuned
+        with self.assertRaises(Cancelled):
+            run_export(self, self.home, self.result)
+        self.assertNotIn(f"valcairn-{EXPORT_JOB}-a1", self.ollama.models)
+        self.assertNotIn(f"valcairn-p-{EXPORT_JOB}-a1", self.ollama.models, "the provisional model is removed")
 
 
 if __name__ == "__main__":

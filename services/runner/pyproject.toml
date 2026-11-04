@@ -1,6 +1,6 @@
 [project]
 name = "valcairn-runner"
-version = "0.3.0"
+version = "0.4.0"
 description = "Runs Valcairn jobs on your own machine: sandboxed, GPU-aware, with native Ollama."
 requires-python = ">=3.11"
 # Standard library only: HTTP through urllib, the sandbox through the docker CLI, GPUs through nvidia-smi.

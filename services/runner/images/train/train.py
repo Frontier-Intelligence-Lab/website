@@ -5,11 +5,12 @@ Output: /out/adapter (LoRA adapter, safetensors), /out/report.json, /out/split.j
 Progress lines start with "@@valcairn " followed by one JSON event; the runner forwards them to Valcairn.
 
 Examples are JSON lines with either {"messages": [{"role": ..., "content": ...}, ...]} or {"prompt": ..., "completion": ...}.
-About 10% of examples (chosen by a hash of their content, so the split is reproducible) are held out and never
-trained on. Held-out loss is measured on the unchanged base model first, then on the tuned model.
+About one distinct example in ten (chosen by a hash of its content, so the split is reproducible) is held out.
+Identical examples stay together on one side, so a held-out example is never also in the training split
+(examples.py). Held-out loss is measured on the unchanged base model first, then on the tuned model. These scores
+show how the model does on withheld examples from this dataset only, not general quality.
 """
 
-import hashlib
 import json
 import math
 import os
@@ -18,52 +19,14 @@ import sys
 import time
 from pathlib import Path
 
+from examples import SplitError, digest, load_examples, prompt_turns, split
+
 
 def say(kind, **data):
     # Under `accelerate launch` on several GPUs every process runs this script; only the first one reports.
     if os.environ.get("RANK", "0") != "0":
         return
     print("@@valcairn " + json.dumps({"kind": kind, **data}), flush=True)
-
-
-def normalise(row):
-    if isinstance(row.get("messages"), list) and all(isinstance(m, dict) and m.get("role") in ("system", "user", "assistant") and isinstance(m.get("content"), str) for m in row["messages"]):
-        roles = [m["role"] for m in row["messages"]]
-        if "assistant" in roles and "user" in roles:
-            return {"messages": row["messages"]}
-    if isinstance(row.get("prompt"), str) and isinstance(row.get("completion"), str):
-        return {"messages": [{"role": "user", "content": row["prompt"]}, {"role": "assistant", "content": row["completion"]}]}
-    return None
-
-
-def load_examples(folder):
-    examples, skipped = [], 0
-    for path in sorted(Path(folder).rglob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                ex = normalise(json.loads(line))
-            except ValueError:
-                ex = None
-            if ex is None:
-                skipped += 1
-            else:
-                examples.append(ex)
-    return examples, skipped
-
-
-def digest(ex):
-    return hashlib.sha256(json.dumps(ex, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-
-
-def split(examples, holdout_every=10):
-    train, held = [], []
-    for ex in examples:
-        (held if int(digest(ex)[:8], 16) % holdout_every == 0 else train).append(ex)
-    if not held and len(train) >= 5:  # tiny sets: still keep one example out
-        held.append(train.pop())
-    return train, held
 
 
 def tokens(text):
@@ -88,7 +51,7 @@ def generate(model, tokenizer, rows, max_new_tokens=160):
     answers = []
     model.eval()
     for row in rows:
-        turns = row["messages"][: max(i for i, m in enumerate(row["messages"]) if m["role"] == "assistant")]
+        turns = prompt_turns(row)
         inputs = tokenizer.apply_chat_template(turns, add_generation_prompt=True, return_tensors="pt", return_dict=True, enable_thinking=False).to(model.device)
         with torch.no_grad():
             out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
@@ -109,9 +72,10 @@ def main() -> int:
     say("metric", name="examples", value=len(examples))
     if skipped:
         say("log", level="warn", message=f"Skipped {skipped} line(s) that are not chat or prompt/completion examples.")
-    train_rows, held_rows = split(examples)
-    if len(train_rows) < 4 or not held_rows:
-        say("log", level="error", message="Not enough usable examples: need at least 5 chat or prompt/completion lines.")
+    try:
+        train_rows, held_rows = split(examples)
+    except SplitError as err:
+        say("log", level="error", message=f"Cannot hold examples out of training: {err}")
         return 4
     if os.environ.get("RANK", "0") == "0":
         Path("/out/split.json").write_text(json.dumps({"train": [digest(e) for e in train_rows], "heldOut": [digest(e) for e in held_rows]}))

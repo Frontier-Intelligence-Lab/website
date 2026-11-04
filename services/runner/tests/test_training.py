@@ -8,17 +8,20 @@ from pathlib import Path
 
 from valcairn_runner import training
 from valcairn_runner.runner import Settings
-from valcairn_runner.training import JobFailure, download, forward, safe_name
+from valcairn_runner.training import JobFailure, download, safe_name
+
+JOB = "a1b2c3d4-0000-4000-8000-000000000001"
+DATA = b'{"prompt":"a","completion":"b"}\n'
 
 
 class Ctx:
     """Just enough of JobContext for the train handler."""
 
-    def __init__(self, api, sandbox, home, caps=None, steps=("sft",)):
+    def __init__(self, api, sandbox, home, caps=None, steps=("sft",), job_id=JOB, attempt=1):
         self.api, self.sandbox = api, sandbox
         self.settings = Settings(home=str(home))
         self.capabilities = caps if caps is not None else {"gpus": [{"name": "GPU", "memoryMb": 24000}]}
-        self.job = {"id": "j1", "attempt": 1, "leaseToken": "t", "kind": "train"}
+        self.job = {"id": job_id, "attempt": attempt, "leaseToken": "t", "kind": "train"}
         self.spec = {"plan": {"steps": list(steps)}}
         self.cancelled = threading.Event()
         self.events = []
@@ -30,22 +33,19 @@ class Ctx:
         self.emit("log", level=level, message=message)
 
 
-DATA = b'{"prompt":"a","completion":"b"}\n'
-
-
 class Api:
-    def __init__(self, files):
-        self.files = files
+    def __init__(self, files, source="org/model"):
+        self.files, self.source = files, source
 
     def inputs(self, job_id, token):
-        return {"baseModel": {"id": "m", "source": "org/model"}, "datasets": [{"projectId": "p", "version": 1, "files": self.files}]}
+        return {"baseModel": {"id": "m", "source": self.source}, "datasets": [{"projectId": "p", "version": 1, "files": self.files}]}
 
 
 class FakeSandbox:
     """Writes what the real image would, and records each step."""
 
-    def __init__(self, train_code=0, fetch_ok=True):
-        self.steps, self.train_code, self.fetch_ok = [], train_code, fetch_ok
+    def __init__(self, train_code=0, fetch_ok=True, weights=b"w"):
+        self.steps, self.train_code, self.fetch_ok, self.weights = [], train_code, fetch_ok, weights
 
     def stop(self):
         pass
@@ -56,7 +56,9 @@ class FakeSandbox:
             if self.fetch_ok:
                 model = Path(step.output) / "model"
                 model.mkdir(parents=True, exist_ok=True)
-                (model / "model.safetensors").write_bytes(b"w")
+                (model / "model.safetensors").write_bytes(self.weights)
+                (model / "config.json").write_text("{}")
+                (Path(step.output) / "source.json").write_text(json.dumps({"source": step.env["VALCAIRN_MODEL_SOURCE"], "resolvedRevision": "c" * 40}))
             return 0 if self.fetch_ok else 3
         on_line("loss bar 50%|#####\r@@valcairn " + json.dumps({"kind": "metric", "name": "train_loss", "value": 0.5, "step": 5}))
         on_line("ordinary output that stays local")
@@ -66,7 +68,8 @@ class FakeSandbox:
         out = Path(step.output)
         (out / "adapter").mkdir()
         (out / "adapter" / "adapter_model.safetensors").write_bytes(b"adapter")
-        (out / "split.json").write_text("{}")
+        (out / "adapter" / "adapter_config.json").write_text("{}")
+        (out / "split.json").write_text(json.dumps({"train": [], "heldOut": []}))
         (out / "report.json").write_text(json.dumps({"method": "sft-lora", "rank": 32, "alpha": 64, "epochs": 2, "steps": 10, "trainExamples": 9, "heldOutExamples": 1,
                                                      "skippedLines": 0, "baseHeldOutLoss": 2.0, "tunedHeldOutLoss": 1.0, "trainSeconds": 3.0, "gpus": ["GPU"], "peakGpuMemoryMb": 10}))
         return 0
@@ -79,7 +82,7 @@ def opener_for(body):
 class TrainTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
-        self.files = [{"filename": "chats.jsonl", "sha256": hashlib.sha256(DATA).hexdigest(), "url": "http://ingest/x"}]
+        self.files = [{"id": "f1", "filename": "chats.jsonl", "sha256": hashlib.sha256(DATA).hexdigest(), "url": "http://ingest/x"}]
         training.urllib.request.urlopen, self._open = opener_for(DATA), training.urllib.request.urlopen
 
     def tearDown(self):
@@ -96,17 +99,22 @@ class TrainTests(unittest.TestCase):
         self.assertTrue(all(inside.startswith("/in/") for inside in train.inputs.values()), "inputs are mounted read-only under /in")
         self.assertEqual(result["tunedHeldOutLoss"], 1.0)
         self.assertEqual(result["adapter"]["sha256"], hashlib.sha256(b"adapter").hexdigest())
+        self.assertEqual(result["adapter"]["configSha256"], hashlib.sha256(b"{}").hexdigest())
         self.assertIn(("stage", {"name": "dpo", "status": "skipped"}), ctx.events, "steps that do not run yet are shown as skipped")
         self.assertIn(("metric", {"name": "train_loss", "value": 0.5, "step": 5}), ctx.events, "a progress line glued to a bar redraw still arrives")
         self.assertFalse(any("ordinary output" in json.dumps(e) for e in ctx.events), "other output stays on the machine")
         self.assertEqual(result["baseModel"]["weightsSha256"], {"model.safetensors": hashlib.sha256(b"w").hexdigest()})
+        self.assertEqual(result["baseModel"]["revision"], "c" * 40, "the exact fetched revision is reported")
+        self.assertEqual(result["baseModel"]["configSha256"], hashlib.sha256(b"{}").hexdigest())
+        manifest = self.home / "jobs" / JOB / "attempt-1" / "out" / "manifest.json"
+        self.assertEqual(result["trainingManifestSha256"], hashlib.sha256(manifest.read_bytes()).hexdigest())
         box2 = FakeSandbox()
-        training.train(Ctx(Api(self.files), box2, self.home))
+        training.train(Ctx(Api(self.files), box2, self.home, job_id=JOB[:-1] + "2"))
         self.assertEqual([s.command[-1] for s in box2.steps], ["train.py"], "cached weights are not fetched again")
         weights = next((self.home / "models").rglob("model.safetensors"))
         weights.write_bytes(b"tampered")
         box3 = FakeSandbox()
-        training.train(Ctx(Api(self.files), box3, self.home))
+        training.train(Ctx(Api(self.files), box3, self.home, job_id=JOB[:-1] + "3"))
         self.assertEqual(box3.steps[0].command[-1], "fetch.py", "altered cached weights are fetched again, never trained on")
         self.assertFalse(list((self.home / "models").rglob("fetching-*")), "no staging folder is left behind")
 
@@ -133,6 +141,7 @@ class TrainTests(unittest.TestCase):
         with self.assertRaises(JobFailure) as e:
             training.train(Ctx(Api(self.files), FakeSandbox(train_code=1), self.home))
         self.assertEqual(e.exception.category, "out_of_memory")
+        self.assertFalse((self.home / "jobs" / JOB / "attempt-1").exists(), "a failed attempt keeps no dataset bytes")
 
     def test_a_file_that_does_not_match_its_checksum_is_refused(self):
         dest = self.home / "x.jsonl"

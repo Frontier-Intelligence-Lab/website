@@ -5,9 +5,9 @@ The Valcairn Runner runs Valcairn jobs on your own machine: a workstation, a GPU
 | Job | Status |
 | --- | --- |
 | `probe`: start a sandbox with no network, read the GPUs from inside it, check Ollama | Implemented and run against a real RTX 5090 with Docker Desktop and Ollama 0.40.13. |
-| `train`: LoRA fine-tuning of an approved plan's base model on its frozen dataset versions, with held-out loss of the base and the tuned model | Implemented (runner 0.2). Run against a real RTX 5090: on a synthetic 252-example support set with Qwen3-0.6B, held-out loss fell from 4.4707 on the base model to 0.0785 after 58 steps (38 s), with the same adapter hash on a second run. |
-| Held-out answers (part of `train`): base and tuned each answer the held-out examples; token F1 and exact match against the reference | Implemented. Same run: token F1 21.7% → 99.1%, exact match 0% → 83% on 24 held-out examples. |
-| `export`: merge the adapter, convert base and tuned to GGUF (Q8_0), load both into Ollama on this machine, load-test them on held-out conversations, write a manifest, checksums and a model card | Implemented (runner 0.3). Same run: a 639 MB GGUF, loaded natively into Ollama 0.40.13, 468 tok/s tuned against 453 tok/s base. |
+| `train`: LoRA fine-tuning of an approved plan's base model on its frozen dataset versions, with held-out loss of the base and the tuned model | Implemented (runner 0.2). Author-reported run on a real RTX 5090, before the lineage and split repairs of runner 0.4: on a synthetic 252-example support set with Qwen3-0.6B, held-out loss fell from 4.4707 on the base model to 0.0785 after 58 steps (38 s). Not independently reproduced. |
+| Held-out answers (part of `train`): base and tuned each answer the held-out examples; token F1 and exact match against the reference | Implemented. Same author-reported run: token F1 21.7% → 99.1%, exact match 0% → 83% on 24 held-out examples. These show adaptation to a narrow, templated synthetic task; token F1 is not the customer's acceptance rule. |
+| `export`: merge the adapter, convert base and tuned to GGUF (Q8_0), load both into Ollama on this machine, load-test them on held-out conversations, write a manifest, checksums and a model card | Implemented (runner 0.3; lineage checks, provisional names and local-only Ollama in 0.4). Same author-reported run: a 639 MB GGUF, loaded natively into Ollama 0.40.13, 468 tok/s tuned against 453 tok/s base. |
 | `evaluate` (re-evaluating a finished run later) | **Planned**. Ends as `unsupported`. |
 
 ## Requirements
@@ -26,15 +26,15 @@ The image pins PyTorch 2.15 (CUDA 13.4), transformers 5.22.1, peft 0.21.2, trl 1
 
 ## Export to Ollama
 
-An export job names a finished training run on the same runner (Valcairn freezes the adapter's SHA-256 into the job, and the runner refuses an adapter that does not match). It then:
+An export job names a finished training run on the same runner. Valcairn freezes the adapter's SHA-256 and the training manifest's SHA-256 into the job. Before anything else the runner checks that the training manifest is that one, and that the adapter (weights, config, tokenizer), the split, the dataset files and the cached base model (source, revision and every file) all still match it. Any difference stops the export with `model_unavailable`. It then:
 
 1. Merges the adapter into the base model in the training image, with no network. The base model's tokenizer files are copied unchanged.
-2. Converts the tuned model and, once per runner, the base model to GGUF Q8_0. This uses llama.cpp's published image, pinned by digest (`VALCAIRN_CONVERT_IMAGE`), with no network.
-3. Loads both into the Ollama on this machine with `ollama create`, as `valcairn-<job>` and `valcairn-base-<model>`. If every training example used the same system prompt, it becomes the tuned model's default.
-4. Load-tests both on up to three held-out conversations (greedy decoding), using Ollama's own token counters for speed.
+2. converts the tuned model and the base model to GGUF q8_0. The base GGUF is made once per runner for the same base files, converter and quantization, and its SHA-256 is checked on every reuse; an altered one stops the export. This uses llama.cpp's published image, pinned by digest (`VALCAIRN_CONVERT_IMAGE`), with no network.
+3. loads both into the Ollama on this machine with `ollama create`: the tuned model under a provisional name, `valcairn-p-<job>-a<attempt>`, and the base model as `valcairn-base-<GGUF hash>`. `OLLAMA_HOST_URL` must be plain `http` on this machine (127.0.0.1, localhost or ::1); the CLI is given that address explicitly, so an inherited `OLLAMA_HOST` cannot send the weights elsewhere. If every training example used the same system prompt, it becomes the tuned model's default.
+4. load-tests both on up to three held-out conversations (greedy decoding), using Ollama's own token counters for speed. Only then is the tuned model copied to its final name, `valcairn-<job>-a<attempt>`, and the provisional one removed. Nothing is created over an existing name, so a retry never replaces an earlier result or a model made by hand.
 5. Writes `manifest.json` (base, adapter and GGUF hashes, quantization, Ollama names), `MODEL_CARD.md` and the base model's `LICENSE` next to the GGUF.
 
-Earlier exports stay in Ollama under their own names, so rolling back means using the previous name; `ollama rm <name>` removes one.
+Earlier exports stay in Ollama under their own names, so rolling back means using the previous name; `ollama rm <name>` removes one. Cancellation and lost authority are checked before each conversion, model creation and load test, and a running `ollama create` is stopped. A failed or cancelled export removes its provisional model and its working files.
 
 ## Link and run
 
@@ -71,17 +71,19 @@ VALCAIRN_URL=https://your-valcairn-site VALCAIRN_RUNNER_KEY_FILE=~/.valcairn-run
 | `VALCAIRN_TRAIN_IMAGE` | `valcairn-train:0.1` | The training image built above. |
 | `VALCAIRN_RUNNER_HOME` | `~/.valcairn-runner` | Where job inputs, model caches (`models/`) and outputs (`jobs/<id>/attempt-<n>/out`) are kept. |
 | `VALCAIRN_TRAIN_MEMORY` | `32g` | Memory limit of the training container. |
-| `HF_TOKEN` | none | Not read by the runner today; gated models are not fetched. |
+| `HF_TOKEN` | none | not read by the runner today; gated models are not fetched. |
+
+Not yet verified: the writable output folders under the sandbox user (UID 65534) on Linux hosts, and the pinned packages and images resolving together on a fresh machine. Record the image digests you built before claiming a run is reproducible.
 
 ## How a training job runs
 
-1. **Inputs.** The runner asks Valcairn for the job's inputs: the base model's source and short-lived signed links to the frozen files of each dataset version. It downloads the `.jsonl` files, checks each file's SHA-256 against the version's manifest, and refuses any file that does not match.
-2. **Weights.** If the base model is not cached, a **fetch** step downloads it into `models/`. This is the only step with network access. It downloads only safetensors weights and plain config and tokenizer files: no pickled weights and no custom code (`trust_remote_code` is off).
+1. **Inputs.** The runner checks that the job id is a Valcairn UUID and the attempt a small number before any path is built from them, and every folder it writes or removes must stay inside the runner home without passing through a link. It asks Valcairn for the job's inputs: the base model's source and short-lived signed links to the frozen files of each dataset version. It downloads the `.jsonl` files (any letter case; up to 2 GB each and 20 GB together), checks each file's SHA-256 against the version's manifest, and refuses any file that does not match. Partial downloads are deleted.
+2. **Weights.** If the base model is not cached, a **fetch** step resolves the revision to one commit and downloads it into `models/<name>-<hash of source and revision>/`, recording the source, the commit and every file's SHA-256. Each later use checks that record, so another source, a changed config or tokenizer, or altered weights are fetched again rather than trained on. This is the only step with network access. It downloads only safetensors weights and plain config and tokenizer files: no pickled weights and no custom code (`trust_remote_code` is off).
 3. **Training** runs with `--network none`, with the weights and data mounted read-only. It uses LoRA (rank 32, alpha 64, all linear layers, 2 epochs, bf16). With more than one GPU it runs through `accelerate launch --multi_gpu`.
-4. **Held-out comparison.** About 10% of the examples, chosen by a hash of each example's content so the split is reproducible, are never trained on. Their loss is measured on the unchanged base model first, then on the tuned model. The split's hashes are saved as `split.json`.
-5. **Result.** The adapter stays on this machine in safetensors. Valcairn receives its SHA-256, size and location, the report (example counts, steps, time, GPUs, peak GPU memory, both held-out losses) and the live loss curve.
+4. **Held-out comparison.** About one distinct example in ten, chosen by a hash of its content so the split is reproducible, is held out. Identical examples stay together on one side, so no held-out example is also in the training split; with fewer than five distinct usable examples the job fails with `dataset_error` instead. The rules are in `valcairn_runner/examples.py`, which the image ships unchanged (`images/train/examples.py`). Their loss is measured on the unchanged base model first, then on the tuned model. The split's hashes are saved as `split.json`.
+5. **Result.** The adapter stays on this machine in safetensors, with `manifest.json`: the base model's source, revision and file hashes, the dataset files, the split, the settings and the adapter's files. Valcairn receives the adapter's SHA-256, size and location, the manifest's SHA-256, the base model's revision and hashes, the report (example counts, steps, time, GPUs, peak GPU memory, both held-out losses) and the live loss curve. These numbers are measured and reported by the runner. A successful run's dataset files stay under `jobs/<id>/` so export can find the held-out prompts; a failed or cancelled attempt keeps none of them.
 
-Examples are JSON lines: `{"messages": [{"role": "user", "content": "…"}, {"role": "assistant", "content": "…"}]}` or `{"prompt": "…", "completion": "…"}`. Other lines are counted as skipped. Only fine-tuning (`sft`) runs today; preference tuning and reinforcement learning steps in a plan are shown as skipped.
+Examples are JSON lines: `{"messages": [{"role": "user", "content": "…"}, {"role": "assistant", "content": "…"}]}`, with a non-empty user turn before the last assistant answer, or `{"prompt": "…", "completion": "…"}` with a non-empty prompt. Other lines, including JSON that is not an object, are counted as skipped. Only fine-tuning (`sft`) runs today; preference tuning and reinforcement learning steps in a plan are shown as skipped.
 
 Training steps also get a scratch `/cache` tmpfs where executables are allowed, because Triton compiles GPU kernels there and loads them. It is not persisted, and `/tmp` stays `noexec`.
 
@@ -91,7 +93,7 @@ Each step runs with `docker run --rm --network none --read-only --cap-drop ALL -
 
 ## Stopping, cancelling and lost authority
 
-- **Cancellation.** The runner learns of a cancel on its next heartbeat or event upload, at most every 15 seconds. It then stops the container within about a second, even if the container prints nothing. A job that was already cancelled before a step starts launches nothing. Once the runner has seen the cancel, it reports the job as cancelled, even if the work had finished. Valcairn records the same (`docs/RUNNERS.md`, *Cancellation*).
+- **Cancellation.** The runner learns of a cancel on its next heartbeat or event upload, at most every 15 seconds. It then stops the container within about a second, even if the container prints nothing. A job that was already cancelled before a step starts launches nothing. Once the runner has seen the cancel, it reports the job as cancelled, even if the work had finished. One exception: if a container could not be confirmed stopped, it reports `sandbox_error` instead, because the machine then needs a person (see below). Valcairn still records a job whose cancel was stored as cancelled. Valcairn records the same (`docs/RUNNERS.md`, *Cancellation*).
 - **Confirmed stops.** A stop counts only when Docker itself reports the container gone or not running (`docker inspect`). A failed `docker kill`, or a Docker client that exited, is not proof. A Docker client that has to be killed never counts as success. If a container cannot be confirmed stopped after three attempts, the runner reports `sandbox_error`, keeps the container's name and takes no more work. It exits with status 3 until a person checks the machine.
 - **Lost authority.** If Valcairn says the runner no longer holds the job (an expired lease, or a cancel that has completed), the runner stops the container and reports nothing more for that job. If Valcairn refuses the key itself (revoked, or its linker no longer manages the workspace), the runner also stops heartbeats, event uploads and the finish report under that key. It then exits with status 2.
 - **Redirects.** Requests that carry the key never follow a redirect. Python's default handler would re-send the `Authorization` header to the new location, including another origin or plain `http`. The runner API never redirects, so any redirect is refused as an error.
