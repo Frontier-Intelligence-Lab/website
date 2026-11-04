@@ -73,6 +73,14 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 | `createEnhanceRun({ workspaceId, createdBy, run })` / `updateEnhanceRun({ workspaceId, runId, run })` | run, a `draft`. The route validates `run` (`validateEnhanceRun` in `src/lib/models.js`). Updating a requested run throws `invalid_state`. |
 | `requestEnhanceRun({ workspaceId, runId, requestedBy })` | run, now `requested`, with `requestedBy` and `requestedAt`, plus an `enhance_run.requested` audit event. Needs datasets, steps, compute and a cap, and a draft, else `invalid_state`. The plan never changes afterwards. |
 | `listDatasetVersions({ workspaceId, projectId })` | versions, oldest first |
+| `createDevice({ workspaceId, ownerId, label, runtime })` | device `{ id, workspaceId, ownerId, label, runtime: 'ollama', status: 'active'\|'revoked', lastSeenAt, revokedAt, createdAt, latestReport: null }`, plus a `device.registered` audit event. A device belongs to one user in one workspace. |
+| `listDevices({ workspaceId, ownerId })` / `getDevice({ workspaceId, ownerId, deviceId })` | the owner's devices, each with `latestReport` / one device or null. Any other user, owners and admins included, gets an empty list or null. |
+| `revokeDevice({ workspaceId, ownerId, deviceId })` | device, now `revoked`, plus `device.revoked`. History is kept. `not_found`; `invalid_state` if already revoked. |
+| `recordDeviceReport({ workspaceId, ownerId, deviceId, report })` | report `{ id, deviceId, reachable, runtimeVersion, models, running, browser, provenance: 'client_reported', createdAt }`; sets the device's `lastSeenAt`. `not_found`; `invalid_state` when revoked. The route validates `report` (`validateReport` in `src/lib/devices.js`). |
+| `saveModelInstall({ workspaceId, ownerId, deviceId, install })` | install `{ id, deviceId, runtimeRef, catalogId, digest, sizeBytes, details, state, failure, verifiedAt, provenance, createdAt, updatedAt }`, one per `(deviceId, runtimeRef)`. `state` is `downloading`, `installed`, `verified`, `ready`, `failed` or `removed`; `verified` and `ready` need a digest, and `verifiedAt` is kept while the same digest stays verified or ready. A state change writes `model_install.<state>`. `not_found`; `invalid_state` when revoked. |
+| `listModelInstalls({ workspaceId, ownerId, deviceId })` | installs by `runtimeRef`; empty for any other user. |
+| `recordExecutionRun({ workspaceId, ownerId, deviceId, run })` | run `{ id, deviceId, installId, modelRef, modelDigest, location: 'local_runtime', kind: 'chat'\|'compat_test', warm, status: 'completed'\|'stopped'\|'failed', failure, settings, metrics, task, promptSha256, provenance, createdAt }`. `installId` must be an install on the same device (`not_found`); `invalid_state` when revoked. Prompts and replies are never stored. |
+| `listExecutionRuns({ workspaceId, ownerId, deviceId, limit })` | runs, newest first, at most 200. |
 | `upsertReviewer({ username, name, role, passwordHash })` | reviewer `{ username, name, role, enabled }`. `passwordHash` is required for a new account; omitted, the existing hash is kept. External demo reviewers only, separate from users and staff. |
 | `getReviewer(username)` / `getReviewerAuth(username)` | reviewer / `{ account, passwordHash }`, or null |
 | `setReviewerEnabled({ username, enabled })` / `listReviewers()` | reviewer · `not_found` / reviewers |
@@ -97,6 +105,8 @@ project    { id, workspaceId, createdBy, name, task, modalities: string[], start
 `profile`, `success`, `dataSource` and `model` are JSON objects that the routes validate before they're stored. Store them as `jsonb`.
 
 ## Changelog
+
+- **v12:** Run on this device: `devices`, `device_reports`, `model_installs` and `execution_runs` (`012_devices.sql`), all scoped to one owner and marked `client_reported`. Failures store only an error category, never runtime text.
 
 - **v10:** Models. `model_pulls` and `enhance_runs` (`011_models.sql`). A requested run is frozen by a trigger, including against direct SQL updates and deletes. Copying weights and running on GPUs are not automated: a pull stays `requested` and a run stays `requested` until Valcairn acts on it.
 - **v9:**

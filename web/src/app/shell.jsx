@@ -83,6 +83,7 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
               ))}
             </div>
           )}
+          <Link to={`/w/${entry.slug}/device`} title="Run on this device" aria-current={current === 'device' ? 'page' : undefined}><Tile icon="play" tone="green" size="sm" /><span className="ob-side-label">Run on this device</span></Link>
           {entry.kind === 'organization' && <a aria-disabled="true" title="Financing: planned, not available yet"><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Financing</span> <span className="ob-badge">Planned</span></a>}
           {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`} title="Team"><Tile icon="people" tone="violet" size="sm" /><span className="ob-side-label">Team</span></Link>}
           {account.isStaff && <Link to="/staff" title="Review queue"><Tile icon="shield" tone="green" size="sm" /><span className="ob-side-label">Review queue</span></Link>}

@@ -28,11 +28,23 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const reviewerAccounts = new Map();
   const modelPulls = [];
   const enhanceRuns = [];
+  const devices = [];
+  const deviceReports = [];
+  const modelInstalls = [];
+  const executionRuns = [];
   const pickRun = ({ name, baseModelId, datasets, steps, compute, spendCapUsd }) => ({ name, baseModelId, datasets: structuredClone(datasets), steps: [...steps], compute, spendCapUsd });
   const copy =(value) => (value == null ? null : structuredClone(value));
   const stamp = () => now().toISOString();
   const publicUser = ({ passwordHash, ...user }) => copy(user);
   const publicReviewer = ({ passwordHash, ...account }) => copy(account);
+  const ownDevice = ({ workspaceId, ownerId, deviceId }) => devices.find((d) => d.id === deviceId && d.workspaceId === workspaceId && d.ownerId === ownerId) ?? null;
+  const activeDevice = (where) => {
+    const d = ownDevice(where);
+    if (!d) throw new StoreError('not_found');
+    if (d.status !== 'active') throw new StoreError('invalid_state');
+    return d;
+  };
+  const latestReport = (deviceId) => copy(deviceReports.filter((r) => r.deviceId === deviceId).at(-1) ?? null);
   const editableProject = (workspaceId, projectId) => {
     const project = projects.get(projectId);
     if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
@@ -450,6 +462,65 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       Object.assign(row, { status: 'requested', requestedBy, requestedAt: stamp(), updatedAt: stamp() });
       audit.push({ id: audit.length + 1, workspaceId, actorId: requestedBy, action: 'enhance_run.requested', targetType: 'enhance_run', targetId: runId, metadata: { spendCapUsd: row.spendCapUsd }, createdAt: stamp() });
       return copy(row);
+    },
+
+    // Devices belong to one person in one workspace; every read and write is filtered on both.
+    async createDevice({ workspaceId, ownerId, label, runtime = 'ollama' }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const device = { id: randomUUID(), workspaceId, ownerId, label, runtime, status: 'active', lastSeenAt: null, revokedAt: null, createdAt: stamp() };
+      devices.push(device);
+      audit.push({ id: audit.length + 1, workspaceId, actorId: ownerId, action: 'device.registered', targetType: 'device', targetId: device.id, metadata: { runtime }, createdAt: stamp() });
+      return { ...copy(device), latestReport: null };
+    },
+    async listDevices({ workspaceId, ownerId }) {
+      return devices.filter((d) => d.workspaceId === workspaceId && d.ownerId === ownerId).map((d) => ({ ...copy(d), latestReport: latestReport(d.id) }));
+    },
+    async getDevice({ workspaceId, ownerId, deviceId }) {
+      const d = ownDevice({ workspaceId, ownerId, deviceId });
+      return d ? { ...copy(d), latestReport: latestReport(d.id) } : null;
+    },
+    async revokeDevice({ workspaceId, ownerId, deviceId }) {
+      const d = ownDevice({ workspaceId, ownerId, deviceId });
+      if (!d) throw new StoreError('not_found');
+      if (d.status === 'revoked') throw new StoreError('invalid_state');
+      Object.assign(d, { status: 'revoked', revokedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId: ownerId, action: 'device.revoked', targetType: 'device', targetId: deviceId, metadata: {}, createdAt: stamp() });
+      return { ...copy(d), latestReport: latestReport(d.id) };
+    },
+    async recordDeviceReport({ workspaceId, ownerId, deviceId, report }) {
+      const d = activeDevice({ workspaceId, ownerId, deviceId });
+      const row = { id: randomUUID(), deviceId, ...copy(report), provenance: 'client_reported', createdAt: stamp() };
+      deviceReports.push(row);
+      d.lastSeenAt = row.createdAt;
+      return copy(row);
+    },
+    async saveModelInstall({ workspaceId, ownerId, deviceId, install }) {
+      activeDevice({ workspaceId, ownerId, deviceId });
+      const at = stamp();
+      let row = modelInstalls.find((i) => i.deviceId === deviceId && i.runtimeRef === install.runtimeRef);
+      const verified = ['verified', 'ready'].includes(install.state);
+      const keepVerified = verified && row?.verifiedAt && row.digest === install.digest;
+      const fields = { ...copy(install), verifiedAt: verified ? (keepVerified ? row.verifiedAt : at) : null, provenance: 'client_reported', updatedAt: at };
+      const previous = row?.state ?? null;
+      if (row) Object.assign(row, fields);
+      else modelInstalls.push(row = { id: randomUUID(), deviceId, ...fields, createdAt: at });
+      if (previous !== row.state) audit.push({ id: audit.length + 1, workspaceId, actorId: ownerId, action: `model_install.${row.state}`, targetType: 'model_install', targetId: row.id, metadata: { runtimeRef: row.runtimeRef, digest: row.digest }, createdAt: at });
+      return copy(row);
+    },
+    async listModelInstalls({ workspaceId, ownerId, deviceId }) {
+      if (!ownDevice({ workspaceId, ownerId, deviceId })) return [];
+      return modelInstalls.filter((i) => i.deviceId === deviceId).sort((a, b) => a.runtimeRef.localeCompare(b.runtimeRef)).map(copy);
+    },
+    async recordExecutionRun({ workspaceId, ownerId, deviceId, run }) {
+      activeDevice({ workspaceId, ownerId, deviceId });
+      if (run.installId && !modelInstalls.some((i) => i.id === run.installId && i.deviceId === deviceId)) throw new StoreError('not_found');
+      const row = { id: randomUUID(), deviceId, ...copy(run), provenance: 'client_reported', createdAt: stamp() };
+      executionRuns.push(row);
+      return copy(row);
+    },
+    async listExecutionRuns({ workspaceId, ownerId, deviceId, limit = 50 }) {
+      if (!ownDevice({ workspaceId, ownerId, deviceId })) return [];
+      return executionRuns.filter((r) => r.deviceId === deviceId).slice(-limit).reverse().map(copy);
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {

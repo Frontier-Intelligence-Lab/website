@@ -459,6 +459,61 @@ export function runStoreContract(test, makeStore, label) {
     assert.ok((await store.listAudit(ws.id)).some((e) => e.action === 'enhance_run.requested'));
   });
 
+  withStore('devices belong to one person in one workspace; revoked devices accept no new records', async (store) => {
+    const alice = await store.createUser({ email: 'a@acme.com', name: 'A', passwordHash: 'h' });
+    const bob = await store.createUser({ email: 'b@acme.com', name: 'B', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: alice.id });
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: alice.id });
+    const device = await store.createDevice({ workspaceId: ws.id, ownerId: alice.id, label: 'Work laptop' });
+    const mine = { workspaceId: ws.id, ownerId: alice.id, deviceId: device.id };
+    assert.equal(device.status, 'active');
+    assert.equal(device.latestReport, null);
+    // Another person, or the same person in another workspace, cannot see or use it.
+    for (const where of [{ ...mine, ownerId: bob.id }, { ...mine, workspaceId: other.id }]) {
+      assert.equal(await store.getDevice(where), null);
+      assert.deepEqual(await store.listModelInstalls(where), []);
+      assert.deepEqual(await store.listExecutionRuns(where), []);
+      await assert.rejects(store.recordDeviceReport({ ...where, report: { reachable: false, runtimeVersion: null, models: [], running: [], browser: {} } }), { code: 'not_found' });
+      await assert.rejects(store.revokeDevice(where), { code: 'not_found' });
+    }
+    assert.deepEqual(await store.listDevices({ workspaceId: ws.id, ownerId: bob.id }), []);
+
+    const report = await store.recordDeviceReport({ ...mine, report: { reachable: true, runtimeVersion: '0.40.13', models: [{ name: 'demo-chat:0.6b', digest: 'a'.repeat(64), sizeBytes: 522653767 }], running: [], browser: { hardwareConcurrency: 16 } } });
+    assert.equal(report.provenance, 'client_reported');
+    const listed = (await store.listDevices({ workspaceId: ws.id, ownerId: alice.id }))[0];
+    assert.equal(listed.latestReport.runtimeVersion, '0.40.13');
+    assert.equal(listed.lastSeenAt, report.createdAt);
+
+    const install = { runtimeRef: 'demo-chat:0.6b', catalogId: 'demo-chat-0.6b', digest: 'a'.repeat(64), sizeBytes: 522653767, details: { family: 'demo' }, failure: null };
+    const installed = await store.saveModelInstall({ ...mine, install: { ...install, state: 'installed' } });
+    assert.equal(installed.verifiedAt, null);
+    const verified = await store.saveModelInstall({ ...mine, install: { ...install, state: 'verified' } });
+    assert.equal(verified.id, installed.id, 'one row per model reference on a device');
+    assert.ok(verified.verifiedAt);
+    assert.equal((await store.saveModelInstall({ ...mine, install: { ...install, state: 'ready' } })).verifiedAt, verified.verifiedAt, 'the same digest keeps its verification');
+    const removed = await store.saveModelInstall({ ...mine, install: { ...install, state: 'removed' } });
+    assert.equal(removed.verifiedAt, null);
+    const actions = (await store.listAudit(ws.id)).map((e) => e.action);
+    for (const a of ['device.registered', 'model_install.installed', 'model_install.verified', 'model_install.ready', 'model_install.removed']) assert.ok(actions.includes(a), a);
+
+    const run = { installId: installed.id, modelRef: 'demo-chat:0.6b', modelDigest: 'a'.repeat(64), location: 'local_runtime', kind: 'compat_test', warm: false, status: 'completed', failure: null, settings: { numCtx: 2048 }, metrics: { wallMs: 812, outputTokens: 3, evalMs: 40 }, task: { id: 'arithmetic', passed: true }, promptSha256: null };
+    const recorded = await store.recordExecutionRun({ ...mine, run });
+    assert.equal(recorded.provenance, 'client_reported');
+    assert.deepEqual(recorded.task, { id: 'arithmetic', passed: true });
+    const foreign = await store.createDevice({ workspaceId: ws.id, ownerId: bob.id, label: 'Bob' });
+    const bobInstall = await store.saveModelInstall({ workspaceId: ws.id, ownerId: bob.id, deviceId: foreign.id, install: { ...install, state: 'installed' } });
+    await assert.rejects(store.recordExecutionRun({ ...mine, run: { ...run, installId: bobInstall.id } }), { code: 'not_found' }, 'a run cannot cite another device’s install');
+    assert.equal((await store.listExecutionRuns(mine)).length, 1);
+
+    const revoked = await store.revokeDevice(mine);
+    assert.equal(revoked.status, 'revoked');
+    assert.ok(revoked.revokedAt);
+    await assert.rejects(store.revokeDevice(mine), { code: 'invalid_state' });
+    await assert.rejects(store.recordExecutionRun({ ...mine, run }), { code: 'invalid_state' });
+    await assert.rejects(store.saveModelInstall({ ...mine, install: { ...install, state: 'installed' } }), { code: 'invalid_state' });
+    assert.equal((await store.listExecutionRuns(mine)).length, 1, 'history is kept after revocation');
+  });
+
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {
     await store.upsertReviewer({ username: 'YCInsider', name: 'YC reviewer', role: 'viewer', passwordHash: 'scrypt$a' });
     await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'admin', passwordHash: 'scrypt$b' });

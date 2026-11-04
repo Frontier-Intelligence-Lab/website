@@ -14,6 +14,8 @@ Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, co
 | Onboarding: accounts, organizations, personal workspaces, invitations, join requests, roles | Implemented and tested against Postgres. Not yet deployed. |
 | Projects: goal, acceptance rule, rights record, existing-model intake, scoping call | Implemented. |
 | Sample uploads (Rust `services/ingest`), staff review, dataset versions | Implemented. Submitted content is frozen; versions contain exactly the approved snapshot. |
+| Run on this device (`/w/:slug/device`): connect a local Ollama, download, verify, run, measure | Implemented and tested against a real local Ollama 0.40.13. The browser talks to Ollama on the visitor's own loopback address; the server stores only client-reported records (devices, model installs with digests, measured runs). Not yet deployed. |
+| In-browser (WebGPU) and remote-GPU execution | **Planned.** Labelled planned on the device screen. |
 | Provider onboarding, training, evaluation, deployment, financing | **Planned.** Shown as planned in the app; nothing executes. |
 | `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
 | Light / dark mode | Follows the system setting; a toggle stores the visitor's choice in `localStorage`. |
@@ -77,6 +79,12 @@ See `.env.example`. Key values:
 | `CONTACT_PUBLIC_EMAIL`, `BOOKING_URL` | Returned by `/api/config` and shown on the contact page. |
 | `REVIEWERS_FILE` or `REVIEWERS_JSON` | Reviewer accounts. Unset means sign-in is disabled. |
 | `SIGNIN_LOG_FILE` | Where the sign-in log is appended (JSON Lines). Unset keeps only the latest 200 events in memory, lost on restart. |
+| `LOCAL_MODEL_CATALOG_FILE` | JSON catalog of models offered for download on Run on this device, validated at startup. Example: `docs/local-models.example.json`. Unset means no downloads are offered; installed models still work. |
+| `LOCAL_RUNTIME_ORIGINS` | Loopback origins of the visitor's own model runtime, added to the CSP `connect-src`. Default `http://127.0.0.1:11434,http://localhost:11434`. Non-loopback values are refused at startup. |
+
+### Run on this device
+
+The browser, not the server, connects to Ollama on the visitor's computer, and the server never accepts or proxies a runtime URL. Ollama answers only origins it allows. `http://localhost:*` and `http://127.0.0.1:*` are allowed by default, so local development works as is. For a deployed site each user adds that exact origin to their own Ollama, for example `setx OLLAMA_ORIGINS "https://frontierintelligencelab.com"` on Windows, then restarts Ollama. Never use `*`, and keep Ollama bound to 127.0.0.1. Chrome may ask whether the site may reach apps on this device (local network access); the screen explains it. Models that Ollama marks as cloud, for example `glm-5:cloud`, run on ollama.com, so local mode lists them as excluded and never calls them, not even `/api/show`. Prompts and replies never go to Valcairn; the screen's "What leaves this computer" section lists exactly what does.
 
 ### Sign-in accounts
 

@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { parseReviewers } from './lib/reviewers.js';
+import { parseCatalog } from './lib/devices.js';
 
 const truthy = (value, fallback) =>
   value == null || value === '' ? fallback : ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -82,6 +83,16 @@ export function loadConfig(env = process.env) {
   // Valcairn staff who may use the internal review queue; each must also confirm their email.
   const staffEmails = String(env.STAFF_EMAILS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
+  // Origins of a local model runtime on the visitor's own machine (Ollama by default). The browser connects to them;
+  // the server never does. Only loopback http origins are accepted, so this can never point at another host.
+  const localRuntimeOrigins = String(env.LOCAL_RUNTIME_ORIGINS ?? 'http://127.0.0.1:11434,http://localhost:11434').split(',').map((s) => s.trim()).filter(Boolean);
+  for (const origin of localRuntimeOrigins) {
+    if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{1,5}$/.test(origin)) throw new Error(`LOCAL_RUNTIME_ORIGINS entry "${origin}" must be a loopback origin such as http://127.0.0.1:11434`);
+  }
+
+  // Models a person may download on Run on this device. Unset: no catalog; installed models still work.
+  const localModelCatalog = env.LOCAL_MODEL_CATALOG_FILE ? parseCatalog(readFileSync(env.LOCAL_MODEL_CATALOG_FILE, 'utf8')) : [];
+
   let reviewers = [];
   if (env.REVIEWERS_FILE) reviewers = parseReviewers(readFileSync(env.REVIEWERS_FILE, 'utf8'));
   else if (env.REVIEWERS_JSON) reviewers = parseReviewers(env.REVIEWERS_JSON);
@@ -116,5 +127,7 @@ export function loadConfig(env = process.env) {
       projectMaxBytes: Number(env.PROJECT_MAX_BYTES ?? 20 * 1024 ** 3),
     } : null,
     staffEmails,
+    localRuntimeOrigins,
+    localModelCatalog,
   };
 }
