@@ -167,6 +167,23 @@ test('closing a client or forgetting every connection aborts in-flight calls and
   await gw.close();
 });
 
+test('a closed client refuses before any request leaves the page, closing is idempotent, and each client created from a connection is its own instance', async (t) => {
+  // A page owns one client per effect setup and closes exactly that one in its cleanup (see use-memory-client.js);
+  // a client that was closed must never be reused silently, and closing one instance must not touch another.
+  const gw = await fakeGateway(t, { 'GET /v1/memories/a': (_b, res) => reply(res, record('a')) });
+  const first = createMemoryClient({ origin: gw.origin, key: KEY, scope: SCOPE });
+  const second = createMemoryClient({ origin: gw.origin, key: KEY, scope: SCOPE });
+  assert.notEqual(first, second, 'two setups get two clients');
+  first.close();
+  first.close(); // a second close (hook cleanup after an explicit Disconnect) is harmless
+  await assert.rejects(first.get('a'), (e) => e.kind === 'aborted' && e.message === 'Disconnected.', 'the closed client refuses locally');
+  assert.equal(gw.seen.length, 0, 'the refused call never reached the gateway, so nothing was sent with the key');
+  assert.equal((await second.get('a')).memory_id, 'a', 'the other instance stays open');
+  assert.equal(gw.seen.length, 1);
+  second.close();
+  await gw.close();
+});
+
 test('only the newest run of an action is current; stopped, replaced and late runs are not', () => {
   const ops = newest();
   const first = ops.start();
