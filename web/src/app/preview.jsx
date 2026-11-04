@@ -120,8 +120,9 @@ export function BoxedImage({ url, alt, boxes = [], selected, onSelect, onDraw })
     <span ref={frame} className="ds-boxed">
       <img src={url} alt={alt} onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} style={fit ? { width: fit.w, height: fit.h, left: fit.left, top: fit.top } : undefined} />
       {fit && (
-        <span className={`ds-box-layer${onDraw ? ' is-drawing' : ''}`} style={{ width: fit.w, height: fit.h, left: fit.left, top: fit.top }}
-          onPointerDown={onDraw ? (e) => { if (e.button !== 0 || e.target !== e.currentTarget) return; e.currentTarget.setPointerCapture(e.pointerId); const p = at(e); setDrag({ a: p, b: p }); } : undefined}
+        // One save at a time: a new box can be drawn only after the previous save has settled.
+        <span className={`ds-box-layer${onDraw ? (pending ? ' is-busy' : ' is-drawing') : ''}`} style={{ width: fit.w, height: fit.h, left: fit.left, top: fit.top }}
+          onPointerDown={onDraw ? (e) => { if (pending || e.button !== 0 || e.target !== e.currentTarget) return; e.currentTarget.setPointerCapture(e.pointerId); const p = at(e); setDrag({ a: p, b: p }); } : undefined}
           onPointerMove={drag ? (e) => setDrag({ ...drag, b: at(e) }) : undefined}
           onPointerUp={drag ? (e) => {
             // Use the release point too: a quick drag may end before any move event arrives.

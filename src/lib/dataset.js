@@ -1,4 +1,5 @@
 import { StoreError } from '../store/errors.js';
+import { ruleProblem } from './onboarding.js';
 
 // Data types, preview rules, label rules and the issue list for a project's dataset.
 // Shared by the stores (which apply them under the project lock), the API routes and tests.
@@ -16,6 +17,13 @@ const invalid = (message) => new StoreError('invalid_label', message);
 const BOX_DECIMALS = 1e6;
 export const MIN_BOX_SIDE = 0.001;
 const EDGE_UNITS = 1000001; // 1 + 1e-6, in millionths
+
+/**
+ * Whether a stored box is exactly { x, y, w, h }: an object with those four keys and no others, each a number.
+ * Key order is irrelevant (Postgres returns jsonb keys in its own order). Values are compared separately.
+ */
+export const isStoredBox = (box) => box != null && typeof box === 'object' && !Array.isArray(box)
+  && Object.keys(box).sort().join(',') === 'h,w,x,y' && ['x', 'y', 'w', 'h'].every((k) => typeof box[k] === 'number');
 
 /** Whether the stored bytes are an image a browser can draw on. Ingest refuses SVG, so every image/* type is raster. */
 export const isImageContent = (upload) => /^image\/[\w.+-]+$/.test(upload?.contentType ?? '') && upload.contentType !== 'image/svg+xml';
@@ -118,8 +126,7 @@ export function findInvalid({ uploads, annotations, labelSet = [] }) {
       if (!label) throw invalid('Its label is no longer in the label set.');
       // Compare against what a fresh write of this label would need; whole-file labels must carry no times or box.
       const fit = checkAnnotation({ label, upload, startMs: a.startMs, endMs: a.endMs, box: a.box });
-      // Postgres returns jsonb keys in its own order, so compare the fields, not the serialised object.
-      const sameBox = (fit.box == null && a.box == null) || (fit.box != null && a.box != null && ['x', 'y', 'w', 'h'].every((k) => fit.box[k] === a.box[k]));
+      const sameBox = (fit.box == null && a.box == null) || (fit.box != null && isStoredBox(a.box) && ['x', 'y', 'w', 'h'].every((k) => fit.box[k] === a.box[k]));
       if (fit.startMs !== a.startMs || fit.endMs !== a.endMs || !sameBox) throw invalid('Its stored times or box are not in the supported form.');
     } catch (err) {
       bad.push({ annotation: a, upload, reason: err.message });
@@ -149,9 +156,10 @@ export function computeIssues({ project, uploads, annotations, notes }) {
   // A label that no longer fits its file does not count as labelling it.
   const labelled = new Set(annotations.filter((a) => !invalidIds.has(a.id)).map((a) => a.uploadId));
 
-  // Review is against the bar set before training, so the bar has to exist first.
-  if (!project.success) {
-    add({ key: 'acceptance', group: 'rights', blocking: true, title: 'No acceptance rule yet', detail: 'Set how this work will be judged. Review locks the rule with the data, so it has to exist first.', fix: { label: 'Set the acceptance rule', page: 'success' } });
+  // Review is against the bar set before training, so the bar has to exist and say something.
+  const rule = ruleProblem(project.success);
+  if (rule) {
+    add({ key: 'acceptance', group: 'rights', blocking: true, title: project.success ? 'The acceptance rule is incomplete' : 'No acceptance rule yet', detail: `${rule} Review locks the rule with the data, so it has to be complete first.`, fix: { label: 'Set the acceptance rule', page: 'success' } });
   }
   for (const { upload, reason } of invalidFound.kinds) {
     add({ key: `kind:${upload.id}`, group: 'labels', blocking: true, uploadId: upload.id, title: `${upload.filename} is typed as Image`, detail: `${reason} Delete any box labels on it, then reset its data type.`, fix: { label: 'Reset the data type', action: 'reset-kind', uploadId: upload.id } });

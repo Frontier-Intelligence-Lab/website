@@ -283,3 +283,19 @@ test('the API refuses an Image type for text bytes and boxes on them, with a mes
   assert.match(tiny.json().error, /at least 0\.1%/);
   await app.close();
 });
+
+test('saving an acceptance rule needs a target or written criteria; data-only projects can set a data-quality bar', async () => {
+  const { app, owner, ws } = await setup();
+  const { project } = (await owner.post(`/api/workspaces/${ws.id}/projects`, { task: 'Curate a damage dataset for line 2.', modalities: ['Images'], startingPoint: 'own' })).json();
+  const url = `/api/workspaces/${ws.id}/projects/${project.id}`;
+  const empty = await owner.post(url, { success: {} });
+  assert.equal(empty.statusCode, 400);
+  assert.match(empty.json().errors.target, /good enough/);
+  const rubric = await owner.post(url, { success: { measure: 'rubric', target: '95%' } });
+  assert.equal(rubric.statusCode, 400);
+  assert.match(rubric.json().errors.criteria, /criteria/);
+  const quality = await owner.post(url, { success: { measure: 'data_quality', criteria: 'Every image has a box for each visible tear.', target: 'ignored' } });
+  assert.equal(quality.statusCode, 200, quality.body);
+  assert.deepEqual([quality.json().project.success.measure, quality.json().project.success.target, quality.json().project.success.criteria], ['data_quality', null, 'Every image has a box for each visible tear.']);
+  await app.close();
+});

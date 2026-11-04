@@ -25,15 +25,13 @@ Ingest needs `INGEST_SHARED_SECRET`, `INGEST_STORAGE=s3://…`, `INGEST_ALLOWED_
 
 **Dataset workspace (migrations 007 to 010).** All four must be applied, in order, before the matching web build. 008 and 009 each correct the freeze guard before them (008 adds the parent lock, 009 covers every upload column), and 010 adds the stored-form box constraint, so none may be skipped, even where 007 is already applied.
 
-010 is added `NOT VALID`: it checks every new or changed box but leaves rows already stored alone, so it cannot fail on, delete or rewrite existing data. After the upgrade, list any boxes outside the stored form (read-only):
+010 is installed `NOT VALID`. Installing it checks every box that is written or changed from then on, but leaves rows already stored alone, so the upgrade cannot fail on, delete or rewrite existing data, including frozen, approved history. Validating it is a separate, later step that checks every existing row too, and it fails while any non-conforming box remains.
 
-```sql
-SELECT a.id, a.project_id, p.status, a.box FROM annotations a JOIN projects p ON p.id = a.project_id
-WHERE a.box IS NOT NULL AND NOT (a.box ?& array['x','y','w','h'] AND a.box - 'x' - 'y' - 'w' - 'h' = '{}'::jsonb
-  AND (a.box ->> 'w')::numeric >= 0.001 AND (a.box ->> 'h')::numeric >= 0.001);
-```
+After the upgrade, list every box the constraint would refuse with the read-only query in `scripts/sql/annotation-box-violations.sql`. It is the constraint's own predicate, negated, so it catches every case the constraint does (missing or extra keys, non-number values, more than six decimals, sides under 0.001, out-of-bounds or overrunning boxes) and never fails on a non-number value. An empty result means validation will succeed; a tested equivalence in `tests/store-postgres.test.js` keeps the two in step.
 
-Rows in draft projects show up on Resolve as blocking issues with a delete action. Rows in frozen projects stay as approved, and the Versions and staff pages flag them. Run `ALTER TABLE annotations VALIDATE CONSTRAINT annotations_box_stored_form;` only once the query returns no rows. Neither needs new environment variables. Migrations create tables as the migrator role, so confirm the app role can `SELECT, INSERT, UPDATE, DELETE` on `annotations` and `issue_notes` (grant it explicitly if your database does not use default privileges). Ingest must be rebuilt for `/v1/preview` (inline, sandboxed previews with byte ranges) before web links to it. The web CSP now allows `blob:` for images and media only, to preview files a person has picked before upload.
+- Rows in draft projects show up on Resolve as blocking issues; editors delete or redraw them before the next review.
+- Rows in frozen projects (in review, approved, versioned) stay exactly as approved. The Versions and staff pages flag them. Do not delete or rewrite approved data to make validation pass.
+- Run `ALTER TABLE annotations VALIDATE CONSTRAINT annotations_box_stored_form;` only when the query returns no rows. If frozen history still holds non-conforming boxes, leave the constraint `NOT VALID`: new writes are protected either way. Neither needs new environment variables. Migrations create tables as the migrator role, so confirm the app role can `SELECT, INSERT, UPDATE, DELETE` on `annotations` and `issue_notes` (grant it explicitly if your database does not use default privileges). Ingest must be rebuilt for `/v1/preview` (inline, sandboxed previews with byte ranges) before web links to it. The web CSP now allows `blob:` for images and media only, to preview files a person has picked before upload.
 
 Previews give viewers the original bytes: anyone who can preview a file can save it. Hiding Download from viewer and finance roles is not access control over the content. If some roles must see less than the original, that needs deliberately designed derivatives (for example thumbnails or redacted copies), which do not exist yet.
 

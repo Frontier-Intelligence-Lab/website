@@ -804,3 +804,4 @@ html:has(.ob), html:has(.ob-split) { background: var(--bg); }
 @media (max-width: 820px) { .ds-image-stage { height: 280px; } }
 
 .ds-box--pending > span { display: block; background: #ffffff; color: #141416; }
+.ds-box-layer.is-busy { cursor: progress; }

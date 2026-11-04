@@ -812,7 +812,7 @@ withStore('labels stored before today\'s rules block review until repaired; appr
   const ws = await workspace(store, owner.id);
   const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Legacy', task: 'Spot tears', modalities: ['Images'], startingPoint: 'own' });
   const where = { workspaceId: ws.id, projectId: p.id };
-  await store.updateProject({ ...where, patch: { success: { measure: 'recall' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
+  await store.updateProject({ ...where, patch: { success: { measure: 'recall', target: '95%' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
   await store.setLabelSet({ ...where, labelSet: [{ id: 'box', name: 'tear', scope: 'box', tone: 'orange' }, { id: 'ok', name: 'ok', scope: 'file', tone: 'plain' }] });
   const text = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'legacy-t', sha256: 'a'.repeat(64), sizeBytes: 5, contentType: 'text/plain', filename: 'notes.txt' });
   const png = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'legacy-p', sha256: 'b'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'carton.png' });
@@ -820,10 +820,8 @@ withStore('labels stored before today\'s rules block review until repaired; appr
   await pool.query("UPDATE uploads SET kind = 'image' WHERE id = $1", [text.id]);
   const onText = (await pool.query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by)
     VALUES ($1, $2, $3, 'box', '{"x":0.1,"y":0.1,"w":0.2,"h":0.2}', $4) RETURNING id`, [ws.id, p.id, text.id, owner.id])).rows[0].id;
-  await pool.query('ALTER TABLE annotations DROP CONSTRAINT annotations_box_stored_form');
-  const tiny = (await pool.query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by)
-    VALUES ($1, $2, $3, 'box', '{"x":0.1,"y":0.1,"w":0.0000001,"h":0.2}', $4) RETURNING id`, [ws.id, p.id, png.id, owner.id])).rows[0].id;
-  await pool.query(`ALTER TABLE annotations ADD CONSTRAINT annotations_box_stored_form CHECK (box IS NULL OR CASE WHEN jsonb_typeof(box) = 'object' AND box - 'x' - 'y' - 'w' - 'h' = '{}'::jsonb AND jsonb_typeof(box -> 'x') = 'number' AND jsonb_typeof(box -> 'y') = 'number' AND jsonb_typeof(box -> 'w') = 'number' AND jsonb_typeof(box -> 'h') = 'number' THEN (box ->> 'x')::numeric * 1000000 = trunc((box ->> 'x')::numeric * 1000000) AND (box ->> 'y')::numeric * 1000000 = trunc((box ->> 'y')::numeric * 1000000) AND (box ->> 'w')::numeric * 1000000 = trunc((box ->> 'w')::numeric * 1000000) AND (box ->> 'h')::numeric * 1000000 = trunc((box ->> 'h')::numeric * 1000000) AND (box ->> 'x')::numeric BETWEEN 0 AND 1 AND (box ->> 'y')::numeric BETWEEN 0 AND 1 AND (box ->> 'w')::numeric >= 0.001 AND (box ->> 'h')::numeric >= 0.001 AND (box ->> 'x')::numeric + (box ->> 'w')::numeric <= 1.000001 AND (box ->> 'y')::numeric + (box ->> 'h')::numeric <= 1.000001 ELSE false END) NOT VALID`);
+  const tiny = await withoutBoxConstraint(pool, async () => (await pool.query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by)
+    VALUES ($1, $2, $3, 'box', '{"x":0.1,"y":0.1,"w":0.0000001,"h":0.2}', $4) RETURNING id`, [ws.id, p.id, png.id, owner.id])).rows[0].id);
   await store.createAnnotation({ ...where, uploadId: png.id, labelId: 'ok', createdBy: owner.id });
 
   await assert.rejects(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open >= 3);
@@ -856,4 +854,76 @@ withStore('migration 010: the database refuses boxes outside the stored form, fo
   await assert.rejects(pool.query(`UPDATE annotations SET box = '{"x":0.1,"y":0.1,"w":0,"h":0.2}' WHERE id = $1`, [id]), (err) => err.code === '23514', 'updates are checked too');
   const constraint = (await pool.query("SELECT convalidated FROM pg_constraint WHERE conname = 'annotations_box_stored_form'")).rows[0];
   assert.equal(constraint.convalidated, false, 'NOT VALID: existing rows were not rewritten or rejected at upgrade');
+});
+
+// The 010 constraint's predicate, as text, so tests can drop and re-add it to simulate rows stored before 010.
+const BOX_010 = (await import('node:fs')).readFileSync(new URL('../migrations/010_annotation_box_stored_form.sql', import.meta.url), 'utf8')
+  .match(/ADD CONSTRAINT annotations_box_stored_form ([\s\S]*?);\s*$/)[1];
+const VIOLATIONS_SQL = (await import('node:fs')).readFileSync(new URL('../scripts/sql/annotation-box-violations.sql', import.meta.url), 'utf8');
+async function withoutBoxConstraint(pool, fn) {
+  await pool.query('ALTER TABLE annotations DROP CONSTRAINT annotations_box_stored_form');
+  try { return await fn(); } finally { await pool.query(`ALTER TABLE annotations ADD CONSTRAINT annotations_box_stored_form ${BOX_010}`); }
+}
+
+withStore('an extra-key box stored before 010 blocks a new review after the upgrade; frozen history is flagged, unchanged', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Extra key', task: 'Spot tears', modalities: ['Images'], startingPoint: 'own' });
+  const where = { workspaceId: ws.id, projectId: p.id };
+  await store.updateProject({ ...where, patch: { success: { measure: 'recall', target: '95%' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
+  await store.setLabelSet({ ...where, labelSet: [{ id: 'box', name: 'tear', scope: 'box', tone: 'orange' }] });
+  const png = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'xk-p', sha256: 'd'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'p.png' });
+  const legacy = await withoutBoxConstraint(pool, async () => (await pool.query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by)
+    VALUES ($1, $2, $3, 'box', '{"x":0,"y":0,"w":0.5,"h":0.5,"extra":true}', $4) RETURNING id`, [ws.id, p.id, png.id, owner.id])).rows[0].id);
+  // Two issues: the box itself, and the PNG, which an invalid box no longer counts as labelling.
+  await assert.rejects(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open === 2);
+  assert.equal((await pool.query('SELECT box FROM annotations WHERE id = $1', [legacy])).rows[0].box.extra, true, 'the legacy row itself is untouched');
+
+  // Approved history holding such a box (made before this check) is flagged on read and never rewritten.
+  await store.deleteAnnotation({ ...where, annotationId: legacy });
+  await store.createAnnotation({ ...where, uploadId: png.id, labelId: 'box', box: { x: 0, y: 0, w: 0.5, h: 0.5 }, createdBy: owner.id });
+  const review = await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+  const version = await store.createDatasetVersion({ ...where, createdBy: owner.id });
+  await pool.query(`UPDATE dataset_versions SET manifest = jsonb_set(manifest, '{annotations,0,box}', '{"x":0,"y":0,"w":0.5,"h":0.5,"extra":true}') WHERE id = $1`, [version.id]);
+  const before = (await pool.query('SELECT manifest::text FROM dataset_versions WHERE id = $1', [version.id])).rows[0].manifest;
+  const [stored] = await store.listDatasetVersions(where);
+  const { countInvalid } = await import('../src/lib/dataset.js');
+  assert.deepEqual(countInvalid(stored.manifest), { labels: 1, kinds: 0 });
+  assert.equal((await pool.query('SELECT manifest::text FROM dataset_versions WHERE id = $1', [version.id])).rows[0].manifest, before);
+});
+
+withStore('the operator query lists exactly the rows that make VALIDATE CONSTRAINT fail', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Query', task: 't', modalities: [], startingPoint: 'own' });
+  const png = await store.createUpload({ workspaceId: ws.id, projectId: p.id, uploadedBy: owner.id, objectKey: 'q-p', sha256: 'e'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'p.png' });
+  const rows = {
+    ok: '{"x":0,"y":0,"w":1,"h":1}', okMin: '{"x":0.1,"y":0.2,"w":0.001,"h":0.001}', okEdge: '{"x":0.333334,"y":0,"w":0.666667,"h":1}',
+    extraKey: '{"x":0,"y":0,"w":0.5,"h":0.5,"extra":true}', sevenDecimals: '{"x":0.1234567,"y":0,"w":0.5,"h":0.5}',
+    numericString: '{"x":"0.1","y":0,"w":0.5,"h":0.5}', missingKey: '{"x":0.1,"y":0.1,"w":0.2}', tiny: '{"x":0.1,"y":0.1,"w":0.0000001,"h":0.2}',
+    belowMin: '{"x":0.1,"y":0.1,"w":0.0009,"h":0.2}', empty: '{}',
+  };
+  // Only rows 008's older check allowed can predate 010: overrunning boxes were already refused, so they are not legacy.
+  const ids = {};
+  await withoutBoxConstraint(pool, async () => {
+    // 008's own check casts with ::numeric, so a non-numeric string like "abc" could never have been stored; numeric strings could.
+    for (const [name, box] of Object.entries(rows)) {
+      ids[name] = (await pool.query('INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by) VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING id', [ws.id, p.id, png.id, 'box', box, owner.id])).rows[0].id;
+    }
+  });
+  const flagged = new Set((await pool.query(VIOLATIONS_SQL)).rows.map((r) => r.id));
+  const invalid = Object.keys(rows).filter((n) => !n.startsWith('ok'));
+  assert.deepEqual([...flagged].sort(), invalid.map((n) => ids[n]).sort(), 'every invalid row and no valid one');
+  await assert.rejects(pool.query('ALTER TABLE annotations VALIDATE CONSTRAINT annotations_box_stored_form'), (err) => err.code === '23514');
+  // Remove one flagged row at a time: VALIDATE keeps failing until the query is empty, then succeeds.
+  for (const name of invalid) {
+    await pool.query('DELETE FROM annotations WHERE id = $1', [ids[name]]);
+    const left = (await pool.query(VIOLATIONS_SQL)).rowCount;
+    const validated = await pool.query('ALTER TABLE annotations VALIDATE CONSTRAINT annotations_box_stored_form').then(() => true, () => false);
+    assert.equal(validated, left === 0, `after removing ${name}: ${left} left, validate ${validated}`);
+  }
+  // Leave the constraint NOT VALID for later tests, as a real upgrade would.
+  await pool.query('ALTER TABLE annotations DROP CONSTRAINT annotations_box_stored_form');
+  await pool.query(`ALTER TABLE annotations ADD CONSTRAINT annotations_box_stored_form ${BOX_010}`);
 });

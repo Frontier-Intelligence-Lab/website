@@ -133,7 +133,9 @@ export async function modelLoader(args) {
 }
 export const projectHomeLoader = projectLoader;
 
-const MEASURES = [['recall', 'Catches real problems (recall)'], ['precision', 'Few false alarms (precision)'], ['accuracy', 'Overall accuracy'], ['success_rate', 'Task success rate'], ['rubric', 'Scored by reviewers against a rubric']];
+const MEASURES = [['recall', 'Catches real problems (recall)'], ['precision', 'Few false alarms (precision)'], ['accuracy', 'Overall accuracy'], ['success_rate', 'Task success rate'], ['rubric', 'Scored by reviewers against a rubric'], ['data_quality', 'The data meets a written quality bar']];
+// Mirrors WRITTEN_MEASURES in src/lib/onboarding.js: these are judged against criteria, not a number.
+const WRITTEN = ['rubric', 'data_quality'];
 const BASELINES = [['current', 'How you do it today', 'people checking, rules, an older system'], ['off_the_shelf', 'An off-the-shelf model, unchanged', ''], ['none', 'No baseline yet', "we'll help you set one"]];
 const WHERE = [['cloud', 'Our cloud account'], ['servers', 'Our own servers'], ['device', 'On a device'], ['later', 'Decide later']];
 
@@ -143,6 +145,9 @@ export function ProjectSuccess() {
   const s = project.success ?? {};
   const [measure, setMeasure] = useState(s.measure ?? 'recall');
   const [target, setTarget] = useState(s.target ?? '');
+  const [criteria, setCriteria] = useState(s.criteria ?? '');
+  const [fieldErrors, setFieldErrors] = useState({});
+  const written = WRITTEN.includes(measure);
   const [baseline, setBaseline] = useState(s.baseline ?? 'current');
   const [runsOn, setRunsOn] = useState(s.runsOn ?? 'later');
   const [device, setDevice] = useState(s.device ?? '');
@@ -155,8 +160,9 @@ export function ProjectSuccess() {
   async function submit(event) {
     event.preventDefault();
     const form = Object.fromEntries(new FormData(event.currentTarget));
-    const res = await api.updateProject(entry.id, project.id, { success: { ...form, measure, target, baseline, runsOn, device } }).catch(() => null);
+    const res = await api.updateProject(entry.id, project.id, { success: { ...form, measure, target, criteria, baseline, runsOn, device } }).catch(() => null);
     if (res?.ok) return navigate(next);
+    setFieldErrors(res?.data.errors ?? {});
     setMessage(res?.data.error ?? 'Could not save. Please try again.');
   }
 
@@ -173,7 +179,14 @@ export function ProjectSuccess() {
             <div className="ob-field"><label htmlFor="measure">What to measure</label>
               <select id="measure" value={measure} onChange={(e) => setMeasure(e.target.value)}>{MEASURES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select>
             </div>
-            <div className="ob-field"><label htmlFor="target">Good enough means at least</label><input id="target" type="text" maxLength={40} placeholder="e.g. 95%" value={target} onChange={(e) => setTarget(e.target.value)} /></div>
+            {written ? (
+              <div className="ob-field" style={{ gridColumn: '1 / -1' }}><label htmlFor="criteria">{measure === 'data_quality' ? 'The data is good enough when' : 'Reviewers accept it when'}</label>
+                <textarea id="criteria" rows={3} maxLength={1000} placeholder={measure === 'data_quality' ? 'e.g. every image has a box for each visible tear, and no two files are copies' : 'e.g. two reviewers rate at least 9 of 10 answers as correct and complete'} value={criteria} aria-invalid={fieldErrors.criteria ? 'true' : undefined} aria-describedby={fieldErrors.criteria ? 'criteria-error' : undefined} onChange={(e) => setCriteria(e.target.value)} />
+                <FieldError id="criteria-error">{fieldErrors.criteria}</FieldError></div>
+            ) : (
+              <div className="ob-field"><label htmlFor="target">Good enough means at least</label><input id="target" type="text" maxLength={40} placeholder="e.g. 95%" value={target} aria-invalid={fieldErrors.target ? 'true' : undefined} aria-describedby={fieldErrors.target ? 'target-error' : undefined} onChange={(e) => setTarget(e.target.value)} />
+                <FieldError id="target-error">{fieldErrors.target}</FieldError></div>
+            )}
           </div>
           <fieldset>
             <legend className="ob-legend">Compared with</legend>
@@ -215,7 +228,11 @@ export function ProjectSuccess() {
         <aside className="ob-aside">
           <div className="ob-card">
             <h2>Your acceptance rule</h2>
-            <p style={{ lineHeight: 1.6 }}>Accept a model when it scores <strong>{target || '[target]'}</strong> on <strong>{measureLabel}</strong> against held-out examples, does better than <strong>{baselineLabel}</strong>{runsOn === 'device' ? <>, and runs on <strong>{device || '[your device]'}</strong></> : ''}.</p>
+            {measure === 'data_quality'
+              ? <p style={{ lineHeight: 1.6 }}>Accept the dataset when <strong>{criteria || '[your quality bar]'}</strong>.</p>
+              : measure === 'rubric'
+                ? <p style={{ lineHeight: 1.6 }}>Accept a model when reviewers find that <strong>{criteria || '[your criteria]'}</strong>, and it does better than <strong>{baselineLabel}</strong>.</p>
+                : <p style={{ lineHeight: 1.6 }}>Accept a model when it scores <strong>{target || '[target]'}</strong> on <strong>{measureLabel}</strong> against held-out examples, does better than <strong>{baselineLabel}</strong>{runsOn === 'device' ? <>, and runs on <strong>{device || '[your device]'}</strong></> : ''}.</p>}
             <span className="ob-muted">You can change this until you send the project for review. Reopening the project lets you change it again.</span>
           </div>
           <div className="ob-card">
@@ -532,7 +549,7 @@ function AcademicCard({ entry, profile, onDone }) {
   return (
     <section className="ob-card">
       <h2>Verify your academic email</h2>
-      <p className="ob-muted">Unlocks datasets licensed only for non-commercial research. Your sign-in email stays the same.</p>
+      <p className="ob-muted">Records that you are at a university. Access to datasets licensed only for non-commercial research is planned, not available yet. Your sign-in email stays the same.</p>
       {error && <p className="ob-alert" role="alert">{error}</p>}
       {stage === 'email' ? (
         <form className="ob-intro" style={{ gap: 10 }} onSubmit={send}>

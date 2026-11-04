@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeIssues, countInvalid, findInvalid } from '../src/lib/dataset.js';
+import { computeIssues, countInvalid, findInvalid, isStoredBox } from '../src/lib/dataset.js';
+import { ruleProblem } from '../src/lib/onboarding.js';
 
 // Rows as the earlier code could leave them: shared by both stores, so these rules hold for memory and Postgres alike.
 const labelSet = [{ id: 'box', name: 'tear', scope: 'box', tone: 'orange' }, { id: 'tag', name: 'ok', scope: 'file', tone: 'plain' }];
 const text = { id: 't', filename: 'notes.txt', contentType: 'text/plain', kind: 'image', sizeBytes: 5, duplicateOf: null };
 const png = { id: 'p', filename: 'carton.png', contentType: 'image/png', kind: null, sizeBytes: 5, duplicateOf: null };
-const project = { success: { measure: 'recall' }, dataSource: { mode: 'upload' }, labelSet };
+const project = { success: { measure: 'recall', target: '95%' }, dataSource: { mode: 'upload' }, labelSet };
 
 test('a missing acceptance rule is a blocking issue that a note cannot clear', () => {
   const issues = computeIssues({ project: { ...project, success: null }, uploads: [png], annotations: [{ id: 'a', uploadId: 'p', labelId: 'tag', startMs: null, endMs: null, box: null }], notes: [{ key: 'acceptance', note: 'later' }] });
@@ -44,4 +45,32 @@ test('frozen history is counted for a warning, not rewritten', () => {
   assert.deepEqual(countInvalid(manifest), { labels: 1, kinds: 1 });
   assert.equal(JSON.stringify(manifest), before);
   assert.deepEqual(countInvalid({}), { labels: 0, kinds: 0 });
+});
+
+test('a stored box must be exactly { x, y, w, h }: extra or missing keys are invalid, key order is not', () => {
+  assert.equal(isStoredBox({ h: 0.5, w: 0.5, y: 0, x: 0 }), true, 'any key order');
+  for (const bad of [{ x: 0, y: 0, w: 0.5, h: 0.5, extra: true }, { x: 0, y: 0, w: 0.5 }, { x: '0', y: 0, w: 0.5, h: 0.5 }, [0, 0, 0.5, 0.5], null, 'box']) {
+    assert.equal(isStoredBox(bad), false, JSON.stringify(bad));
+  }
+  const annotations = [{ id: 'xk', uploadId: 'p', labelId: 'box', startMs: null, endMs: null, box: { x: 0, y: 0, w: 0.5, h: 0.5, extra: true } }];
+  const found = findInvalid({ uploads: [png], annotations, labelSet });
+  assert.deepEqual(found.annotations.map((x) => x.annotation.id), ['xk'], 'an extra key fails even though the four values are valid');
+  assert.ok(computeIssues({ project, uploads: [png], annotations, notes: [] }).some((i) => i.key === 'label:xk' && i.blocking));
+  const manifest = { files: [png], labelSet, annotations };
+  const before = JSON.stringify(manifest);
+  assert.deepEqual(countInvalid(manifest), { labels: 1, kinds: 0 });
+  assert.equal(JSON.stringify(manifest), before, 'history is flagged, not rewritten');
+});
+
+test('an acceptance rule needs a target for a metric, or written criteria for a rubric or a data-quality bar', () => {
+  assert.match(ruleProblem(null), /how this work will be judged/);
+  assert.match(ruleProblem({}), /score is good enough/);
+  assert.match(ruleProblem({ measure: 'recall', target: null }), /score is good enough/);
+  assert.equal(ruleProblem({ measure: 'recall', target: '95%' }), null);
+  assert.match(ruleProblem({ measure: 'rubric', target: '95%' }), /criteria/);
+  assert.equal(ruleProblem({ measure: 'rubric', criteria: 'two reviewers agree' }), null);
+  assert.equal(ruleProblem({ measure: 'data_quality', criteria: 'every image has a box for each tear' }), null, 'data-only work needs no model metric');
+  const incomplete = computeIssues({ project: { ...project, success: { measure: 'recall', target: null } }, uploads: [png], annotations: [], notes: [] }).find((i) => i.key === 'acceptance');
+  assert.equal(incomplete.blocking, true);
+  assert.match(incomplete.title, /incomplete/);
 });

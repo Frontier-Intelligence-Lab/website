@@ -111,7 +111,7 @@ export function StaffReview() {
               <li><div><strong>Source</strong><span className="ob-muted">{d.mode === 'upload' ? PROVENANCE[d.provenance] ?? 'Not stated' : d.mode === 'license' ? `License request: ${d.query ?? '—'}` : `Collection brief: ${d.brief ?? '—'}`}</span></div></li>
               {d.mode === 'upload' && <li><div><strong>Allowed uses</strong><span className="ob-muted">{d.allowedUses?.join(', ') || 'None stated'}</span></div></li>}
               {d.mode === 'upload' && <li><div><strong>Personal data</strong><span className="ob-muted">{{ no: 'No', yes: 'Yes', unsure: 'Not sure' }[d.personalData] ?? '—'}</span></div></li>}
-              <li><div><strong>Acceptance rule</strong><span className="ob-muted">{project.success ? `${project.success.measure} ≥ ${project.success.target ?? '—'} vs ${project.success.baseline}` : 'Not set'}</span></div></li>
+              <li><div><strong>Acceptance rule</strong><span className="ob-muted">{!project.success ? 'Not set' : project.success.criteria ? `${project.success.measure === 'data_quality' ? 'Data quality' : 'Rubric'}: ${project.success.criteria}` : `${project.success.measure} ≥ ${project.success.target ?? '—'} vs ${project.success.baseline}`}</span></div></li>
             </ul>
           </section>
           {(warnings.labels > 0 || warnings.kinds > 0) && <p className="ob-alert" role="note"><strong>This snapshot holds {warnings.labels} label{warnings.labels === 1 ? '' : 's'} and {warnings.kinds} file type{warnings.kinds === 1 ? '' : 's'} that today’s checks refuse</strong>, for example a box on a file whose content is not an image. It was sent before those checks existed. Request changes so the customer can repair it.</p>}

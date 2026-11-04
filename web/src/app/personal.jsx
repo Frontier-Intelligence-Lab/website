@@ -60,7 +60,7 @@ export function Personal() {
             </div>
           )}
           {academic && (
-            <div className="ob-note tile--violet"><Tile icon="info" tone="violet" size="sm" /><span>After you create the workspace, you can verify a university email. That unlocks datasets licensed only for non-commercial research.</span></div>
+            <div className="ob-note tile--violet"><Tile icon="info" tone="violet" size="sm" /><span>After you create the workspace, you can verify a university email. That records your academic status today; access to datasets licensed only for non-commercial research is planned.</span></div>
           )}
           <div className="ob-field">
             <label htmlFor="work">What are you working on? <span className="ob-optional">(optional)</span></label>
@@ -77,7 +77,7 @@ export function Personal() {
             <h2>How it differs from an organization</h2>
             <ul className="ob-list">
               <li><Tile icon="check" tone="green" size="sm" /><div><strong>Projects and testing</strong><span className="ob-muted">Same tools, private to you.</span></div></li>
-              <li><Tile icon="study" tone="violet" size="sm" /><div><strong>Research-only datasets</strong><span className="ob-muted">After academic verification. Each license is labelled.</span></div></li>
+              <li><Tile icon="study" tone="violet" size="sm" /><div><strong>Research-only datasets (planned)</strong><span className="ob-muted">Not available yet. When the catalog opens, it will need academic verification.</span></div></li>
               <li><Tile icon="minus" tone="plain" size="sm" /><div><strong>Commercial licenses and financing (planned)</strong><span className="ob-muted">Not available yet. When they open they will need an organization.</span></div></li>
               <li><Tile icon="arrow" tone="blue" size="sm" /><div><strong>Move to an organization later</strong><span className="ob-muted">Projects and their rights records move with you.</span></div></li>
             </ul>

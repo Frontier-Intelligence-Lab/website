@@ -527,7 +527,7 @@ export function DatasetAnnotate() {
           ) : (
             <div className="ob-card" style={{ padding: 0, overflow: 'hidden' }}><Preview item={item} h={320} contain controls /></div>
           )}
-          {drawable && d.canEdit && boxLabels.length > 0 && <p className="ds-kbd-help">Drag on the image to draw a “{d.labelSet.find((l) => l.id === tool)?.name ?? boxLabels[0].name}” box. 1–9 picks the label.</p>}
+          {drawable && d.canEdit && boxLabels.length > 0 && <p className="ds-kbd-help">Drag on the image to draw a “{d.labelSet.find((l) => l.id === tool)?.name ?? boxLabels[0].name}” box. One box saves at a time. 1–9 picks the label.</p>}
           {playable && (
             <div className="ds-transport">
               <button type="button" className="btn-small" onClick={() => seek(time - 5000)} aria-label="Back 5 seconds">−5s</button>

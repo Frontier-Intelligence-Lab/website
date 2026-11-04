@@ -318,6 +318,9 @@ test('an unsure project chooses its starting point once, then continues normally
   assert.equal((await owner.post(`${url}/submit`)).statusCode, 400);
   assert.equal((await owner.post(url, { startingPoint: 'need' })).json().project.startingPoint, 'need');
   assert.equal((await owner.post(url, { startingPoint: 'own' })).statusCode, 400, 'only once');
-  assert.equal((await owner.post(url, { success: { measure: 'recall' } })).statusCode, 200);
+  const measureOnly = await owner.post(url, { success: { measure: 'recall' } });
+  assert.equal(measureOnly.statusCode, 400, 'a rule needs a target, not just a measure');
+  assert.ok(measureOnly.json().errors.target);
+  assert.equal((await owner.post(url, { success: { measure: 'recall', target: '90%' } })).statusCode, 200);
   await app.close();
 });

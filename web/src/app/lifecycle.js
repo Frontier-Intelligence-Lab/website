@@ -7,10 +7,10 @@ export const MANAGERS = ['owner', 'admin'];
 export function nextStepKind({ status, startingPoint, role, hasSuccess, hasData }) {
   const writer = WRITERS.includes(role);
   const manager = MANAGERS.includes(role);
-  if (startingPoint === 'unsure') return writer ? 'book-call' : 'wait-call';
   if (status === 'in_review') return writer ? 'in-review-withdraw' : 'in-review';
   if (status === 'approved') return manager ? 'approve-version' : 'wait-admin';
   if (status === 'versioned') return manager ? 'versioned-manage' : 'versioned';
+  if (startingPoint === 'unsure') return writer ? 'book-call' : 'wait-call';
   if (!hasSuccess) return writer ? 'set-rule' : null;
   if (!hasData) return writer ? (startingPoint === 'model' ? 'describe-model' : 'record-data') : null;
   if (startingPoint !== 'model' && writer) return 'submit';

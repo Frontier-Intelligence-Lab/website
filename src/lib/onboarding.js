@@ -46,11 +46,29 @@ export function validateProjectStart(raw) {
   return Object.keys(errors).length ? { errors } : { values };
 }
 
+// Metrics compare a model against a number; the other two are judged against written criteria. "data_quality"
+// lets a data-only project accept the dataset itself without inventing a model metric.
+export const METRIC_MEASURES = ['recall', 'precision', 'accuracy', 'success_rate'];
+export const WRITTEN_MEASURES = ['rubric', 'data_quality'];
+
+/**
+ * Whether an acceptance rule says what "good enough" means: a target for a metric, or written criteria for a
+ * rubric or a data-quality bar. Review requires one (see computeIssues), and saving checks the same thing.
+ */
+export function ruleProblem(success) {
+  if (!success || typeof success !== 'object') return 'Set how this work will be judged.';
+  if (WRITTEN_MEASURES.includes(success.measure)) return success.criteria ? null : 'Write the criteria reviewers will judge against.';
+  return success.target ? null : 'Say what score is good enough, for example 95%.';
+}
+
 function validateSuccess(raw) {
   const s = raw && typeof raw === 'object' ? raw : {};
+  const measure = oneOf(s.measure, [...METRIC_MEASURES, ...WRITTEN_MEASURES]) ?? 'recall';
+  const written = WRITTEN_MEASURES.includes(measure);
   return {
-    measure: oneOf(s.measure, ['recall', 'precision', 'accuracy', 'success_rate', 'rubric']) ?? 'recall',
-    target: text(s.target, 40) || null,
+    measure,
+    target: written ? null : text(s.target, 40) || null,
+    criteria: written ? text(s.criteria, 1000) || null : null,
     baseline: oneOf(s.baseline, ['current', 'off_the_shelf', 'none']) ?? 'none',
     runsOn: oneOf(s.runsOn, ['cloud', 'servers', 'device', 'later']) ?? 'later',
     device: text(s.device, 120) || null,
@@ -123,7 +141,12 @@ export function validateProjectPatch(raw, project) {
     return next ? { patch: { startingPoint: next, setupStep: 'success' } } : { errors: { startingPoint: 'Choose where you are starting from.' } };
   }
   if (project?.startingPoint === 'unsure') return { errors: { form: 'Choose a starting point after your scoping call first.' } };
-  if (body.success) return { patch: { success: validateSuccess(body.success), setupStep: modelPath ? 'model' : 'data' } };
+  if (body.success) {
+    const success = validateSuccess(body.success);
+    const problem = ruleProblem(success);
+    if (problem) return { errors: { [WRITTEN_MEASURES.includes(success.measure) ? 'criteria' : 'target']: problem } };
+    return { patch: { success, setupStep: modelPath ? 'model' : 'data' } };
+  }
   if (body.model) {
     if (!modelPath) return { errors: { form: 'This project does not start from an existing model.' } };
     const { model, errors } = validateModel(body.model);

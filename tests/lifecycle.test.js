@@ -33,3 +33,10 @@ test('editable projects walk through rule, data, then submit; read-only roles ge
   assert.equal(nextStepKind({ status: 'draft', startingPoint: 'unsure', role: 'member', hasSuccess: false, hasData: false }), 'book-call');
   assert.equal(nextStepKind({ status: 'draft', startingPoint: 'unsure', role: 'viewer', hasSuccess: false, hasData: false }), 'wait-call');
 });
+
+test('a frozen project that was never scoped (startingPoint unsure) still gets its frozen actions', () => {
+  for (const role of ROLES) {
+    assert.equal(nextStepKind({ status: 'versioned', startingPoint: 'unsure', role, hasSuccess: false, hasData: false }), ['owner', 'admin'].includes(role) ? 'versioned-manage' : 'versioned');
+    assert.equal(nextStepKind({ status: 'in_review', startingPoint: 'unsure', role, hasSuccess: false, hasData: false }), ['owner', 'admin', 'member'].includes(role) ? 'in-review-withdraw' : 'in-review');
+  }
+});
