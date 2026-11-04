@@ -997,7 +997,7 @@ withStore('an invalid rule written while submit waits on the lock is seen by the
 withStore('a requested enhance run cannot be changed or deleted, even by direct SQL', async (store, pool) => {
   const owner = await user(store);
   const ws = await workspace(store, owner.id);
-  const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'r', baseModelId: 'qwen3-8b', datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft'], compute: 'nebius', spendCapUsd: 100 } });
+  const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'r', baseModelId: 'example-base', datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft'], compute: 'nebius', spendCapUsd: 100 } });
   await pool.query('UPDATE enhance_runs SET spend_cap_usd = 120 WHERE id = $1', [run.id]);
   const current = await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id });
   await store.requestEnhanceRun({ workspaceId: ws.id, runId: run.id, requestedBy: owner.id, expectedUpdatedAt: current.updatedAt });
@@ -1005,6 +1005,6 @@ withStore('a requested enhance run cannot be changed or deleted, even by direct 
     await assert.rejects(pool.query(sql, [run.id]), (err) => /run_frozen/.test(err.message), sql);
   }
   assert.equal((await store.getEnhanceRun({ workspaceId: ws.id, runId: run.id })).spendCapUsd, 120);
-  await assert.rejects(pool.query("INSERT INTO enhance_runs (workspace_id, name, base_model_id, status, created_by) VALUES ($1, 'x', 'qwen3-8b', 'requested', $2)", [ws.id, owner.id]), (err) => err.code === '23514', 'a requested row needs a complete plan');
+  await assert.rejects(pool.query("INSERT INTO enhance_runs (workspace_id, name, base_model_id, status, created_by) VALUES ($1, 'x', 'example-base', 'requested', $2)", [ws.id, owner.id]), (err) => err.code === '23514', 'a requested row needs a complete plan');
   await assert.rejects(pool.query("INSERT INTO model_pulls (workspace_id, model_id, requested_by) VALUES ($1, 'Bad Id', $2)", [ws.id, owner.id]), (err) => err.code === '23514');
 });
