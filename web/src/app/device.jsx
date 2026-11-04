@@ -4,6 +4,8 @@ import { api } from '../api.js';
 import { FieldError, Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
 import { RuntimeError, browserHints, createRuntime } from './runtime.js';
+import { ReferencePicker } from './reference.jsx';
+import { referencePrompt } from './memory.js';
 import { passesTask, readyAfterTest } from '../../../src/lib/devices.js';
 
 // Which device record this browser is. Not a secret: the server ties every device to its owner.
@@ -133,7 +135,7 @@ export function RunOnDevice() {
   const chatModels = localModels.filter((m) => !m.capabilities.length || m.capabilities.includes('completion'));
   const cloudModels = (conn.models ?? []).filter((m) => m.remote);
   const installOf = (ref) => detail?.installs.find((i) => i.runtimeRef === ref) ?? null;
-  const ctx = { entry, runtime, conn, setConn, probe, refreshDetail, saveInstall, installOf, deviceId, local, selected, setSelected, busy, setBusy };
+  const ctx = { account, entry, runtime, conn, setConn, probe, refreshDetail, saveInstall, installOf, deviceId, local, selected, setSelected, busy, setBusy };
   const others = devices.filter((d) => d.status === 'active' && d.id !== deviceId);
 
   return (
@@ -570,6 +572,7 @@ function RunCard({ ctx, localModels }) {
   const [last, setLast] = useState(null);
   const [error, setError] = useState(null);
   const [unsaved, setUnsaved] = useState([]);
+  const [references, setReferences] = useState([]); // passages from the person's memory, chosen for the next message only
   const abortRef = useRef(null);
   const opRef = useRef(0); // identity of the current chat; late callbacks from an older one are ignored
 
@@ -599,6 +602,9 @@ function RunCard({ ctx, localModels }) {
     if (!model || !draft.trim() || live || busy || !limitsOk) return;
     const op = ++opRef.current;
     const history = [...messages, { role: 'user', content: draft.trim() }];
+    // Chosen passages are quoted ahead of this request only, as data; they are not part of the conversation shown.
+    const quoted = references.map((p) => ({ id: p.id, title: p.title || 'Untitled', kind: p.source?.source_type ?? 'note' }));
+    const request = references.length ? [{ role: 'system', content: referencePrompt(references) }, ...history] : history;
     setMessages(history); setDraft(''); setError(null);
     liveRef.current = { content: '', thinking: '' };
     setLive(liveRef.current);
@@ -606,7 +612,7 @@ function RunCard({ ctx, localModels }) {
     abortRef.current = controller;
     setBusy('chat');
     const out = await timedChat(ctx, {
-      model: model.name, messages: history, numCtx, numPredict: predict, temperature: temp, signal: controller.signal,
+      model: model.name, messages: request, numCtx, numPredict: predict, temperature: temp, signal: controller.signal,
       think: info?.thinking ? think : undefined,
       onToken: (piece, thinking) => {
         if (opRef.current !== op) return;
@@ -624,7 +630,7 @@ function RunCard({ ctx, localModels }) {
     }
     abortRef.current = null;
     const reply = liveRef.current?.content ?? '';
-    if (reply || stopped) setMessages((m) => [...m, { role: 'assistant', content: reply, stopped }]);
+    if (reply || stopped) setMessages((m) => [...m, { role: 'assistant', content: reply, stopped, quoted }]);
     liveRef.current = null;
     setLive(null);
     setLast(out);
@@ -673,7 +679,12 @@ function RunCard({ ctx, localModels }) {
 
       <div className="dev-chat" aria-live="polite" aria-busy={Boolean(live)}>
         {!model && <p className="ob-muted">Choose a model to start. Nothing is sent anywhere until you press Send.</p>}
-        {messages.map((m, i) => <p key={i} className={`dev-msg dev-msg--${m.role}`}><span className="sr-only">{m.role === 'user' ? 'You' : 'Model'}: </span>{m.content}{m.stopped && <em className="ob-muted"> (stopped)</em>}</p>)}
+        {messages.map((m, i) => (
+          <p key={i} className={`dev-msg dev-msg--${m.role}`}>
+            <span className="sr-only">{m.role === 'user' ? 'You' : 'Model'}: </span>{m.content}{m.stopped && <em className="ob-muted"> (stopped)</em>}
+            {m.quoted?.length > 0 && <span className="mem-cited">Quoted with the question, as information: {m.quoted.map((q, n) => `[${n + 1}] ${q.title} (${q.kind})`).join(' · ')}. A [number] in the reply points at one of these; the model may also have ignored them.</span>}
+          </p>
+        ))}
         {live && (
           <div className="dev-msg dev-msg--assistant">
             {live.thinking && <p className="ob-muted" style={{ fontSize: 12.5 }}>{live.thinking}</p>}
@@ -684,6 +695,7 @@ function RunCard({ ctx, localModels }) {
       {busy && <p id="run-busy" className="ob-muted" style={{ fontSize: 12 }}>The model can be changed when the current {busy === 'test' ? 'test' : 'reply'} finishes or is stopped.</p>}
       {error && <p className="ob-alert" role="alert">{error}{/memory/i.test(error) && ' Try a smaller model or context window, or unload other loaded models above.'}</p>}
       <UnsavedNotice retries={unsaved} onDone={setUnsaved} />
+      {model && <ReferencePicker entry={ctx.entry} account={ctx.account} draft={draft} disabled={Boolean(busy)} onChange={setReferences} />}
       <form className="dev-compose" onSubmit={send}>
         <label htmlFor="run-input" className="sr-only">Message</label>
         <textarea id="run-input" rows={2} value={draft} disabled={!model} placeholder={model ? `Message ${model.name}` : 'Choose a model first'} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) send(e); }} />
@@ -830,7 +842,7 @@ function DataNotice() {
     <details>
       <summary>What leaves this computer</summary>
       <div className="ob-muted" style={{ fontSize: 13.5, padding: '0 0 16px', display: 'grid', gap: 8 }}>
-        <p><strong>Stays here:</strong> your prompts, the model’s replies, the models themselves. Requests go from this page straight to Ollama at 127.0.0.1 and never through Valcairn.</p>
+        <p><strong>Stays here:</strong> your prompts, the model’s replies, the models themselves. Requests go from this page straight to Ollama at 127.0.0.1 and never through Valcairn. If you choose passages from your memory, they go to Ollama with that one message and nowhere else; Valcairn does not learn which, or that you did.</p>
         <p><strong>Sent to Valcairn:</strong> this device’s name; Ollama’s version; the names, sizes and digests of installed models; the browser’s hardware hints; and for each run, the model, its settings, timings, token counts and, for the test, pass or fail. All of it is marked client-reported.</p>
         <p><strong>Downloads</strong> come from ollama.com when you choose one. Models marked as cloud in Ollama run on ollama.com, so Valcairn never calls them in local mode.</p>
         <p><strong>Offline:</strong> not claimed. Valcairn’s pages load from its server; running a model uses only this computer once the page is open.</p>

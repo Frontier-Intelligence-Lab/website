@@ -84,12 +84,19 @@ export function loadConfig(env = process.env) {
   // Valcairn staff who may use the internal review queue; each must also confirm their email.
   const staffEmails = String(env.STAFF_EMAILS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
-  // Origins of a local model runtime on the visitor's own machine (Ollama by default). The browser connects to them;
-  // the server never does. Only loopback http origins are accepted, so this can never point at another host.
-  const localRuntimeOrigins = String(env.LOCAL_RUNTIME_ORIGINS ?? 'http://127.0.0.1:11434,http://localhost:11434').split(',').map((s) => s.trim()).filter(Boolean);
-  for (const origin of localRuntimeOrigins) {
-    if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{1,5}$/.test(origin)) throw new Error(`LOCAL_RUNTIME_ORIGINS entry "${origin}" must be a loopback origin such as http://127.0.0.1:11434`);
-  }
+  // Origins of services on the visitor's own machine that the browser connects to directly; the server never does.
+  // Only loopback http origins are accepted, so neither can ever point at another host. Empty turns the feature off.
+  const loopbackOrigins = (name, value, fallback) => {
+    const origins = String(value ?? fallback).split(',').map((s) => s.trim()).filter(Boolean);
+    for (const origin of origins) {
+      if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{1,5}$/.test(origin)) throw new Error(`${name} entry "${origin}" must be a loopback origin such as http://127.0.0.1:${fallback.match(/:(\d+)/)[1]}`);
+    }
+    return origins;
+  };
+  // A local model runtime (Ollama by default) for Run on this device.
+  const localRuntimeOrigins = loopbackOrigins('LOCAL_RUNTIME_ORIGINS', env.LOCAL_RUNTIME_ORIGINS, 'http://127.0.0.1:11434,http://localhost:11434');
+  // A Provena memory gateway in local-store mode for Memory. 8787 keeps clear of a Provena Compose stack on 8080.
+  const localMemoryOrigins = loopbackOrigins('LOCAL_MEMORY_ORIGINS', env.LOCAL_MEMORY_ORIGINS, 'http://127.0.0.1:8787,http://localhost:8787');
 
   // Models a person may download on Run on this device. Unset: no catalog; installed models still work.
   const localModelCatalog = env.LOCAL_MODEL_CATALOG_FILE ? parseCatalog(readFileSync(env.LOCAL_MODEL_CATALOG_FILE, 'utf8')) : [];
@@ -139,6 +146,7 @@ export function loadConfig(env = process.env) {
     } : null,
     staffEmails,
     localRuntimeOrigins,
+    localMemoryOrigins,
     localModelCatalog,
   };
 }
