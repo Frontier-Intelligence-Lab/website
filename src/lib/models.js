@@ -1,53 +1,79 @@
-// The open-weight model catalog, the enhancement methods and the compute options, plus validation for an
-// enhance run plan. The catalog is curated by Valcairn: figures are approximate and are checked against each
-// model's own card before a model is added or updated here.
+// The model catalog's shape and checks, the enhancement methods and the compute options, plus validation for an
+// enhance run plan. The open-weight models themselves are deployment data, not source: the server reads them
+// once from MODEL_CATALOG_FILE (see docs/model-catalog.example.json) and hands the list to the routes and the
+// browser. Figures in a catalog are approximate and should be checked against each model's own card.
+// This module is also bundled into the browser build, so it must stay free of Node imports.
 
 const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
 
-export const MODEL_CATALOG = [
-  {
-    id: 'qwen3-8b', name: 'Qwen3-8B', maker: 'Qwen team', monogram: 'Qw', tone: 'violet', source: 'Qwen/Qwen3-8B',
-    params: '8.2B', architecture: 'dense', active: null, contextK: 128, modalities: ['text'], tags: ['reasoning'],
-    license: 'Apache 2.0', commercial: true, licenseNote: 'Keep the LICENSE and NOTICE files when you share the weights.',
-    formats: [{ format: 'bf16', gb: 16.4 }, { format: 'FP8', gb: 8.2 }, { format: '4-bit', gb: 5.0 }], loraGpus: 1,
-    summary: 'A dense 8B text model, strong at reasoning and following instructions. A good first base for a company assistant: one GPU fine-tunes it.',
-  },
-  {
-    id: 'gpt-oss-20b', name: 'gpt-oss-20b', maker: 'OpenAI', monogram: 'os', tone: 'plain', source: 'openai/gpt-oss-20b',
-    params: '21B', architecture: 'moe', active: '3.6B', contextK: 128, modalities: ['text'], tags: ['reasoning'],
-    license: 'Apache 2.0', commercial: true, licenseNote: 'Keep the LICENSE file and follow the model’s usage policy.',
-    formats: [{ format: 'MXFP4, as shipped', gb: 13 }], loraGpus: 1,
-    summary: 'A mixture-of-experts reasoning model that runs only 3.6B parameters per token, so it is cheap to serve for its size.',
-  },
-  {
-    id: 'llama-3.1-8b-instruct', name: 'Llama 3.1 8B Instruct', maker: 'Meta', monogram: 'Ll', tone: 'blue', source: 'meta-llama/Llama-3.1-8B-Instruct',
-    params: '8B', architecture: 'dense', active: null, contextK: 128, modalities: ['text'], tags: [],
-    license: 'Llama 3.1 Community License', commercial: true, licenseNote: 'Commercial use is allowed with attribution and the acceptable use policy; very large services need a separate license.',
-    formats: [{ format: 'bf16', gb: 16 }, { format: 'FP8', gb: 8 }, { format: '4-bit', gb: 5 }], loraGpus: 1,
-    summary: 'A widely used 8B instruction model with a large ecosystem of tools and adapters.',
-  },
-  {
-    id: 'mistral-small-3.1', name: 'Mistral Small 3.1', maker: 'Mistral AI', monogram: 'Mi', tone: 'orange', source: 'mistralai/Mistral-Small-3.1-24B-Instruct-2503',
-    params: '24B', architecture: 'dense', active: null, contextK: 128, modalities: ['text', 'vision'], tags: [],
-    license: 'Apache 2.0', commercial: true, licenseNote: 'Keep the LICENSE file when you share the weights.',
-    formats: [{ format: 'bf16', gb: 48 }, { format: 'FP8', gb: 24 }, { format: '4-bit', gb: 14 }], loraGpus: 2,
-    summary: 'A 24B model that reads text and images, for tasks that need more capacity than an 8B model.',
-  },
-  {
-    id: 'gemma-3-12b', name: 'Gemma 3 12B', maker: 'Google', monogram: 'Ge', tone: 'teal', source: 'google/gemma-3-12b-it',
-    params: '12B', architecture: 'dense', active: null, contextK: 128, modalities: ['text', 'vision'], tags: [],
-    license: 'Gemma terms of use', commercial: true, licenseNote: 'Commercial use is allowed under the Gemma terms and prohibited use policy, which pass on to your model.',
-    formats: [{ format: 'bf16', gb: 24 }, { format: 'FP8', gb: 12 }, { format: '4-bit', gb: 7 }], loraGpus: 1,
-    summary: 'A 12B model that reads text and images, with good multilingual coverage.',
-  },
-  {
-    id: 'qwen3-30b-a3b', name: 'Qwen3-30B-A3B', maker: 'Qwen team', monogram: 'Qw', tone: 'violet', source: 'Qwen/Qwen3-30B-A3B',
-    params: '30.5B', architecture: 'moe', active: '3.3B', contextK: 128, modalities: ['text'], tags: ['reasoning'],
-    license: 'Apache 2.0', commercial: true, licenseNote: 'Keep the LICENSE and NOTICE files when you share the weights.',
-    formats: [{ format: 'bf16', gb: 61 }, { format: 'FP8', gb: 31 }, { format: '4-bit', gb: 17 }], loraGpus: 4,
-    summary: 'A mixture-of-experts model: 8 of 128 experts run per token, so it knows like a 30B model and runs like a 3B one.',
-  },
-];
+// Same id rule as model_pulls.model_id and enhance_runs.base_model_id in migrations/011_models.sql.
+const MODEL_ID_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+const TONES = ['blue', 'violet', 'teal', 'orange', 'plain'];
+const ARCHITECTURES = ['dense', 'moe'];
+const MODALITIES = ['text', 'vision'];
+const TAGS = ['reasoning'];
+const LORA_GPUS = [1, 2, 4];
+const MAX_CATALOG_MODELS = 200;
+const MAX_FORMATS = 8;
+const MODEL_KEYS = ['id', 'name', 'maker', 'monogram', 'tone', 'source', 'params', 'architecture', 'active', 'contextK', 'contextNote',
+  'modalities', 'tags', 'license', 'commercial', 'licenseNote', 'formats', 'loraGpus', 'summary'];
+
+/**
+ * Parses and checks a model catalog file: a JSON array of models, each with the fields the Models pages show.
+ * Every field is bounded and every id is unique; an unknown field, a repeated id or a value out of range is an
+ * error, so a mistyped file is refused at startup instead of rendering half a catalog.
+ */
+export function parseModelCatalog(json) {
+  let list;
+  try { list = JSON.parse(json); } catch (err) { throw new Error(`Model catalog is not valid JSON: ${err.message}`); }
+  if (!Array.isArray(list)) throw new Error('Model catalog must be a JSON array of models');
+  if (list.length > MAX_CATALOG_MODELS) throw new Error(`Model catalog lists more than ${MAX_CATALOG_MODELS} models`);
+  const seen = new Set();
+  return list.map((entry, i) => {
+    const where = `Model catalog entry ${i}${typeof entry?.id === 'string' ? ` (${entry.id.slice(0, 64)})` : ''}`;
+    const fail = (what) => { throw new Error(`${where}: ${what}`); };
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail('must be an object');
+    const unknown = Object.keys(entry).find((k) => !MODEL_KEYS.includes(k));
+    if (unknown) fail(`unknown field "${unknown.slice(0, 40)}"`);
+    const str = (key, max, optional = false) => {
+      const v = entry[key];
+      if (v == null) return optional ? null : fail(`${key} is required`);
+      if (typeof v !== 'string' || !v.trim() || v.length > max) fail(`${key} must be text of 1 to ${max} characters`);
+      return v.trim();
+    };
+    const oneOf = (key, allowed) => (allowed.includes(entry[key]) ? entry[key] : fail(`${key} must be one of ${allowed.join(', ')}`));
+    const listOf = (key, allowed, min) => {
+      const v = entry[key];
+      if (!Array.isArray(v) || v.length < min || v.some((x) => !allowed.includes(x)) || new Set(v).size !== v.length) {
+        fail(`${key} must be a list of ${allowed.join(', ')} without repeats${min ? ', with at least one' : ''}`);
+      }
+      return [...v];
+    };
+    const id = str('id', 64);
+    if (!MODEL_ID_RE.test(id)) fail('id must be lower-case letters, digits, dots or dashes, starting with a letter or digit');
+    if (seen.has(id)) fail('repeats an id');
+    seen.add(id);
+    const architecture = oneOf('architecture', ARCHITECTURES);
+    const active = str('active', 20, true);
+    if (architecture === 'moe' && !active) fail('a moe model needs active, the parameters used per token');
+    const { contextK, commercial, formats } = entry;
+    if (!Number.isInteger(contextK) || contextK < 1 || contextK > 100000) fail('contextK must be a whole number of thousands of tokens, 1 to 100000');
+    if (typeof commercial !== 'boolean') fail('commercial must be true or false');
+    if (!Array.isArray(formats) || !formats.length || formats.length > MAX_FORMATS) fail(`formats must list 1 to ${MAX_FORMATS} entries`);
+    const checkedFormats = formats.map((f) => {
+      if (!f || typeof f !== 'object' || typeof f.format !== 'string' || !f.format.trim() || f.format.length > 40) fail('each format needs a name of 1 to 40 characters');
+      if (typeof f.gb !== 'number' || !Number.isFinite(f.gb) || f.gb <= 0 || f.gb > 100000) fail('each format needs gb, a number above 0');
+      return { format: f.format.trim(), gb: f.gb };
+    });
+    return {
+      id, name: str('name', 80), maker: str('maker', 80), monogram: str('monogram', 3), tone: oneOf('tone', TONES), source: str('source', 200),
+      params: str('params', 20), architecture, active, contextK, contextNote: str('contextNote', 120, true),
+      modalities: listOf('modalities', MODALITIES, 1), tags: listOf('tags', TAGS, 0),
+      license: str('license', 80), commercial, licenseNote: str('licenseNote', 300),
+      formats: checkedFormats, loraGpus: oneOf('loraGpus', LORA_GPUS), summary: str('summary', 300),
+    };
+  });
+}
 
 // Steps run in this order. Each uses a different kind of data from an approved dataset version.
 export const ENHANCE_METHODS = [
@@ -64,22 +90,31 @@ export const COMPUTE_OPTIONS = [
 ];
 
 export const MAX_SPEND_CAP_USD = 100000;
-export const catalogModel = (id) => MODEL_CATALOG.find((m) => m.id === id) ?? null;
+export const MAX_RUN_DATASETS = 20;
 
+/** A frozen version manifest is training data only if files were delivered under an uploaded rights record that allows training. */
+export const allowsTraining = (manifest) => manifest?.dataSource?.mode === 'upload'
+  && Array.isArray(manifest.dataSource.allowedUses) && manifest.dataSource.allowedUses.includes('training')
+  && Array.isArray(manifest.files) && manifest.files.length > 0;
 /**
- * Validates a draft enhance run. `pulled` is the set of catalog ids pulled into the workspace; `eligible` the
- * approved dataset versions whose rights allow training, as [{ projectId, version }].
+ * Validates a draft enhance run. `catalog` is the current model catalog (an empty one refuses every base model);
+ * `pulled` the set of catalog ids pulled into the workspace; `eligible` the approved dataset versions whose
+ * rights allow training, as [{ projectId, version }].
  * Returns { values } or { errors }. A draft may be incomplete; `forRequest` checks what a request needs.
  */
-export function validateEnhanceRun(raw, { pulled, eligible, forRequest = false }) {
+export function validateEnhanceRun(raw, { catalog, pulled, eligible, forRequest = false }) {
   const body = raw && typeof raw === 'object' ? raw : {};
   const errors = {};
   const baseModelId = typeof body.baseModelId === 'string' ? body.baseModelId : '';
-  if (!catalogModel(baseModelId)) errors.baseModelId = 'Choose a model from the catalog.';
+  const model = catalog.find((m) => m.id === baseModelId) ?? null;
+  if (!model) errors.baseModelId = 'Choose a model from the catalog.';
   else if (!pulled.has(baseModelId)) errors.baseModelId = 'Pull this model into the workspace first.';
 
   const datasets = [];
-  for (const d of Array.isArray(body.datasets) ? body.datasets.slice(0, 20) : []) {
+  const asked = Array.isArray(body.datasets) ? body.datasets : [];
+  // An approval plan is never silently changed: too many versions is an error, not a truncation.
+  if (asked.length > MAX_RUN_DATASETS) errors.datasets = `Choose at most ${MAX_RUN_DATASETS} dataset versions for one run.`;
+  for (const d of asked.length > MAX_RUN_DATASETS ? [] : asked) {
     const version = Number(d?.version);
     const match = eligible.find((e) => e.projectId === d?.projectId && e.version === version);
     if (!match) { errors.datasets = 'Only approved dataset versions that allow training can be used.'; break; }
@@ -93,7 +128,10 @@ export function validateEnhanceRun(raw, { pulled, eligible, forRequest = false }
 
   let spendCapUsd = null;
   if (body.spendCapUsd != null && body.spendCapUsd !== '') {
-    const cap = Number(body.spendCapUsd);
+    // Whole dollars only, written plainly: "12.5", "-5", "1e3" or "0x10" are refused, never rewritten.
+    const raw = body.spendCapUsd;
+    // Only a number or a plain string: an array such as [250] would otherwise stringify to "250".
+    const cap = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
     if (!Number.isInteger(cap) || cap < 1 || cap > MAX_SPEND_CAP_USD) errors.spendCapUsd = `Set a whole-dollar cap between $1 and $${MAX_SPEND_CAP_USD.toLocaleString('en-US')}.`;
     else spendCapUsd = cap;
   }
@@ -103,6 +141,6 @@ export function validateEnhanceRun(raw, { pulled, eligible, forRequest = false }
     if (!compute) errors.compute ??= 'Choose where it runs.';
     if (spendCapUsd == null) errors.spendCapUsd ??= 'Set a spending cap before you request the run.';
   }
-  const name = text(body.name, 80) || `${catalogModel(baseModelId)?.name ?? 'Model'} enhanced`;
+  const name = text(body.name, 80) || `${model?.name ?? 'Model'} enhanced`;
   return Object.keys(errors).length ? { errors } : { values: { name, baseModelId, datasets, steps, compute, spendCapUsd } };
 }

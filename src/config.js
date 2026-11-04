@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { parseReviewers } from './lib/reviewers.js';
 import { parseCatalog } from './lib/devices.js';
+import { parseModelCatalog } from './lib/models.js';
 
 const truthy = (value, fallback) =>
   value == null || value === '' ? fallback : ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -97,6 +98,15 @@ export function loadConfig(env = process.env) {
   if (env.REVIEWERS_FILE) reviewers = parseReviewers(readFileSync(env.REVIEWERS_FILE, 'utf8'));
   else if (env.REVIEWERS_JSON) reviewers = parseReviewers(env.REVIEWERS_JSON);
 
+  // The open-weight model catalog is deployment data (docs/model-catalog.example.json), checked once here.
+  // Unset leaves it empty: Models pages have nothing to pull and new enhance plans are refused, while pulls and
+  // runs already recorded stay readable. An unreadable or invalid file stops startup with the reason.
+  let modelCatalog = [];
+  if (env.MODEL_CATALOG_FILE) {
+    try { modelCatalog = parseModelCatalog(readFileSync(env.MODEL_CATALOG_FILE, 'utf8')); }
+    catch (err) { throw new Error(`MODEL_CATALOG_FILE (${env.MODEL_CATALOG_FILE}): ${err.message}`, { cause: err }); }
+  }
+
   return {
     isProd,
     port: Number(env.PORT ?? 3000),
@@ -112,6 +122,7 @@ export function loadConfig(env = process.env) {
     contactPublicEmail: env.CONTACT_PUBLIC_EMAIL ?? 'contact@frontierintelligencelab.com',
     bookingUrl: env.BOOKING_URL ?? 'https://cal.com/ayushozha/15-min-getting-to-know',
     reviewers,
+    modelCatalog,
     signinLogFile: env.SIGNIN_LOG_FILE || null,
     databaseUrl,
     databaseSsl,

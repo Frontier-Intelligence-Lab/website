@@ -451,13 +451,16 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       const row = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
       if (!row) throw new StoreError('not_found');
       if (row.status !== 'draft') throw new StoreError('invalid_state');
-      Object.assign(row, pickRun(run), { updatedAt: stamp() });
+      // Strictly later than the previous edit, so an approval naming the old version is always detected as stale.
+      const at = new Date(Math.max(now().getTime(), new Date(row.updatedAt).getTime() + 1)).toISOString();
+      Object.assign(row, pickRun(run), { updatedAt: at });
       return copy(row);
     },
-    async requestEnhanceRun({ workspaceId, runId, requestedBy }) {
+    async requestEnhanceRun({ workspaceId, runId, requestedBy, expectedUpdatedAt }) {
       const row = enhanceRuns.find((r) => r.id === runId && r.workspaceId === workspaceId);
       if (!row) throw new StoreError('not_found');
       if (row.status !== 'draft') throw new StoreError('invalid_state');
+      if (expectedUpdatedAt == null || new Date(expectedUpdatedAt).getTime() !== new Date(row.updatedAt).getTime()) throw new StoreError('stale_plan');
       if (!row.datasets.length || !row.steps.length || !row.compute || row.spendCapUsd == null) throw new StoreError('invalid_state');
       Object.assign(row, { status: 'requested', requestedBy, requestedAt: stamp(), updatedAt: stamp() });
       audit.push({ id: audit.length + 1, workspaceId, actorId: requestedBy, action: 'enhance_run.requested', targetType: 'enhance_run', targetId: runId, metadata: { spendCapUsd: row.spendCapUsd }, createdAt: stamp() });

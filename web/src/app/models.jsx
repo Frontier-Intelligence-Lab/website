@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import { Link, useLoaderData, useLocation, useNavigate, useParams, useRevalidator, useSearchParams } from 'react-router';
 import { api } from '../api.js';
+import { MAX_RUN_DATASETS } from '../../../src/lib/models.js';
 import { FieldError, Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
 
-// Memory bars are drawn against one 80 GB H100, the GPU most fine-tunes here run on.
+// Memory bars show approximate weight sizes against one 80 GB H100; runtime and training need more than the weights.
 const GPU_GB = 80;
 const GPU_TONE = { 1: 'blue', 2: 'violet', 4: 'teal' };
 const WRITERS = ['owner', 'admin', 'member'];
@@ -13,6 +14,9 @@ const date = (iso) => new Date(iso).toLocaleDateString(undefined, { day: 'numeri
 const archLabel = (m) => (m.architecture === 'moe' ? `MoE · ${m.active} active` : 'dense');
 const pct = (gb) => `${Math.min(100, (gb / GPU_GB) * 100).toFixed(1)}%`;
 const gpuLabel = (n) => `${n} GPU${n === 1 ? '' : 's'}`;
+// Pulls and runs keep their model id after the model leaves the catalog: they stay listed and say so.
+const UNLISTED = 'not in the current catalog';
+const modelLabel = (catalog, id) => catalog.find((m) => m.id === id)?.name ?? `${id} (${UNLISTED})`;
 
 export async function modelsLoader({ params }) {
   const { account, entry } = await requireWorkspace(params.slug);
@@ -53,7 +57,7 @@ function PullState({ pull }) {
   return <span className="mdl-requested">Pull requested</span>;
 }
 
-const pullNote = 'Requested. Valcairn copies the weights into your workspace storage and checks them; automatic copying is planned.';
+const pullNote = 'Requested only: no weights have been copied. Copying into workspace storage is planned.';
 
 /* ---------------- Catalog ---------------- */
 
@@ -73,22 +77,39 @@ export function ModelCatalog() {
   const pullOf = (id) => pulls.find((p) => p.modelId === id);
   const active = FILTERS.find(([id]) => id === filter);
   const shown = active ? catalog.filter(active[2]) : catalog;
-  const selected = catalog.find((m) => m.id === selectedId) ?? shown[0];
+  const selected = shown.find((m) => m.id === selectedId) ?? shown[0];
   const counts = [1, 2, 4].map((n) => ({ n, count: catalog.filter((m) => m.loraGpus === n).length }));
-  return (
-    <WorkspaceShell account={account} entry={entry} role={role} title="Model catalog" current="models-catalog">
-      <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
-        <div className="ob-intro" style={{ gap: 8 }}>
-          <span className="ob-eyebrow">Models · {entry.name}</span>
-          <h1 className="ob-h1">Model catalog</h1>
-          <p className="ob-lede">Open-weight models you can pull into this workspace and enhance on your approved datasets. The weights stay yours.</p>
-          <div className="ob-chips" style={{ gap: 6 }}>
-            <span className="ob-badge">{plural(catalog.length, 'model')}</span>
-            {pulls.length > 0 && <span className="ob-badge tile--blue">{pulls.length} pulled</span>}
-          </div>
+  const shell = { account, entry, role, title: 'Model catalog', current: 'models-catalog' };
+  const header = (
+    <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
+      <div className="ob-intro" style={{ gap: 8 }}>
+        <span className="ob-eyebrow">Models · {entry.name}</span>
+        <h1 className="ob-h1">Model catalog</h1>
+        <p className="ob-lede">Open-weight models you can request for this workspace and plan to enhance on your approved datasets. A pull is a recorded request and a run is an approved plan: copying weights and training are planned, and any weights you receive stay under each model's own license.</p>
+        <div className="ob-chips" style={{ gap: 6 }}>
+          <span className="ob-badge">{plural(catalog.length, 'model')}</span>
+          {pulls.length > 0 && <span className="ob-badge tile--blue">{plural(pulls.length, 'pull request')}</span>}
         </div>
-        <Link className="btn-ghost" to={`/w/${entry.slug}/models/mine`}>My models</Link>
       </div>
+      <Link className="btn-ghost" to={`/w/${entry.slug}/models/mine`}>My models</Link>
+    </div>
+  );
+  // The server had no catalog file, or an empty one: say so instead of showing empty filters.
+  if (catalog.length === 0) {
+    return (
+      <WorkspaceShell {...shell}>
+        {header}
+        <section className="ob-card" style={{ alignItems: 'flex-start' }}>
+          <Tile icon="layers" tone="plain" size="lg" />
+          <h2>No models available</h2>
+          <p className="ob-muted">This deployment has no model catalog yet, so there is nothing to pull. Models pulled earlier stay listed under My models.</p>
+        </section>
+      </WorkspaceShell>
+    );
+  }
+  return (
+    <WorkspaceShell {...shell}>
+      {header}
 
       <section className="ob-card">
         <div className="row-between"><h2>What you can fine-tune</h2><span className="ob-muted" style={{ fontSize: 12 }}>GPUs needed for a LoRA fine-tune</span></div>
@@ -167,7 +188,7 @@ function ModelPanel({ entry, role, model, pull }) {
     <section className="ob-card mdl-panel">
       <div className="mdl-panel-top">
         <div className="row-between" style={{ alignItems: 'flex-start' }}><Glyph model={model} size={44} /><span className="mdl-size mdl-size--lg"><strong>{model.params}</strong><span className="ob-muted">parameters, {archLabel(model)}</span></span></div>
-        <div className="cell-stack" style={{ gap: 6 }}><strong style={{ fontSize: 12.5 }}>Memory by format</strong><MemoryBars model={model} /><span className="ob-muted" style={{ fontSize: 11.5 }}>Full bar is one {GPU_GB} GB H100.</span></div>
+        <div className="cell-stack" style={{ gap: 6 }}><strong style={{ fontSize: 12.5 }}>Memory by format</strong><MemoryBars model={model} /><span className="ob-muted" style={{ fontSize: 11.5 }}>Approximate weight size; full bar is one {GPU_GB} GB H100. Running or training needs more.</span></div>
       </div>
       <div className="cell-stack" style={{ gap: 6 }}>
         <span className="ob-chips" style={{ gap: 6 }}>
@@ -178,7 +199,7 @@ function ModelPanel({ entry, role, model, pull }) {
       </div>
       <dl className="ds-dl">
         <dt>License</dt><dd>{model.license}{model.commercial ? ' · commercial use' : ''}</dd>
-        <dt>Context</dt><dd>{model.contextK}K tokens</dd>
+        <dt>Context</dt><dd>{model.contextK}K tokens{model.contextNote ? ` (${model.contextNote})` : ''}</dd>
         <dt>Fine-tune on</dt><dd>{gpuLabel(model.loraGpus)} with LoRA</dd>
         <dt>Source</dt><dd className="mono" style={{ fontSize: 12.5 }}>{model.source}</dd>
         <dt>In workspace</dt><dd><PullState pull={pull} /></dd>
@@ -231,14 +252,14 @@ export function ModelDetail() {
       <div className="ds-split">
         <div className="ds-main">
           <section className="ob-card">
-            <div className="row-between"><h2>Memory by format</h2><span className="ob-muted" style={{ fontSize: 12 }}>Full bar is one {GPU_GB} GB H100</span></div>
+            <div className="row-between"><h2>Memory by format</h2><span className="ob-muted" style={{ fontSize: 12 }}>Approximate weights; full bar is one {GPU_GB} GB H100</span></div>
             <MemoryBars model={model} />
           </section>
           <section className="ob-card">
             <h2>Files in your storage</h2>
             {pull?.status === 'ready'
               ? <p className="ob-muted">Files are listed here with their checksums.</p>
-              : <p className="ob-muted">{pull ? pullNote : 'No files yet. Pull the model to copy its weights, tokenizer and license files into your workspace storage.'}</p>}
+              : <p className="ob-muted">{pull ? pullNote : 'No files in workspace storage. Requesting a pull records interest; copying weights is planned.'}</p>}
           </section>
         </div>
         <aside className="ds-side">
@@ -281,7 +302,7 @@ export function MyModels() {
         <div className="ob-intro" style={{ gap: 8 }}>
           <span className="ob-eyebrow">Models · {entry.name}</span>
           <h1 className="ob-h1">My models</h1>
-          <p className="ob-lede">Every model in this workspace: bases you pulled and the versions you are making from them.</p>
+          <p className="ob-lede">Every model in this workspace: the bases you requested and the enhancement plans drafted or approved on them. No weights have been copied and nothing has been trained yet; both are planned.</p>
         </div>
         <div>
           <Link className="btn-ghost" to={`/w/${entry.slug}/models`}>Model catalog</Link>
@@ -299,27 +320,26 @@ export function MyModels() {
         <>
           <div className="ob-chips">
             <button type="button" className="ob-chip ds-chip" aria-pressed={!filter} onClick={() => setFilter(null)}>All · {pulls.length + runs.length}</button>
-            <button type="button" className="ob-chip ds-chip k-orange" aria-pressed={filter === 'runs'} onClick={() => setFilter(filter === 'runs' ? null : 'runs')}><span className="ds-dot" aria-hidden="true" />Enhanced <span className="ob-muted">{runs.length}</span></button>
-            <button type="button" className="ob-chip ds-chip k-violet" aria-pressed={filter === 'base'} onClick={() => setFilter(filter === 'base' ? null : 'base')}><span className="ds-dot" aria-hidden="true" />Base <span className="ob-muted">{pulls.length}</span></button>
+            <button type="button" className="ob-chip ds-chip k-orange" aria-pressed={filter === 'runs'} onClick={() => setFilter(filter === 'runs' ? null : 'runs')}><span className="ds-dot" aria-hidden="true" />Plans <span className="ob-muted">{runs.length}</span></button>
+            <button type="button" className="ob-chip ds-chip k-violet" aria-pressed={filter === 'base'} onClick={() => setFilter(filter === 'base' ? null : 'base')}><span className="ds-dot" aria-hidden="true" />Pull requests <span className="ob-muted">{pulls.length}</span></button>
           </div>
           <ul className="ob-list ob-card mdl-list">
             {filter !== 'base' && [...runs].reverse().map((r) => (
               <li key={r.id}>
                 <Tile icon={r.status === 'requested' ? 'clock' : 'pen'} tone="orange" size="sm" />
-                <div><strong>{r.name}</strong><span className="ob-muted">From {byId(r.baseModelId)?.name ?? r.baseModelId} · {r.steps.map((s) => methods.find((m) => m.id === s)?.name).filter(Boolean).join(', ') || 'no steps yet'}</span></div>
+                <div><strong>{r.name}</strong><span className="ob-muted">From {modelLabel(catalog, r.baseModelId)} · {r.steps.map((s) => methods.find((m) => m.id === s)?.name).filter(Boolean).join(', ') || 'no steps yet'}</span></div>
                 <RunBadge run={r} />
                 <Link className="btn-ghost" to={`/w/${entry.slug}/models/runs/${r.id}`}>Open</Link>
               </li>
             ))}
             {filter !== 'runs' && [...pulls].reverse().map((p) => {
               const m = byId(p.modelId);
-              if (!m) return null;
               return (
                 <li key={p.id}>
-                  <Glyph model={m} size={28} />
-                  <div><strong>{m.name}</strong><span className="ob-muted">Base · {m.license} · requested {date(p.createdAt)}</span></div>
+                  {m ? <Glyph model={m} size={28} /> : <Tile icon="layers" tone="plain" size="sm" />}
+                  <div><strong>{m?.name ?? p.modelId}</strong><span className="ob-muted">Base · {m?.license ?? UNLISTED} · requested {date(p.createdAt)}</span></div>
                   <span className="ob-badge tile--teal">{p.status === 'ready' ? 'In your storage' : 'Pull requested'}</span>
-                  <Link className="btn-ghost" to={`/w/${entry.slug}/models/catalog/${m.id}`}>Open</Link>
+                  {m ? <Link className="btn-ghost" to={`/w/${entry.slug}/models/catalog/${m.id}`}>Open</Link> : <span className="ob-muted" style={{ fontSize: 12.5 }}>No catalog page</span>}
                 </li>
               );
             })}
@@ -347,7 +367,7 @@ export function EnhanceRuns() {
         <div className="ob-intro" style={{ gap: 8 }}>
           <span className="ob-eyebrow">Models · {entry.name}</span>
           <h1 className="ob-h1">Enhance runs</h1>
-          <p className="ob-lede">Post-train a pulled model on your approved data: fine-tune, preference tuning and reinforcement learning, in order.</p>
+          <p className="ob-lede">Plan post-training of a requested model on your approved data: fine-tune, preference tuning and reinforcement learning, in order. Approving a plan records it; running it on GPUs is planned.</p>
         </div>
         {writer && pulls.length > 0 && <Link className="btn-app" to={`/w/${entry.slug}/models/runs/new`}>New enhance run</Link>}
       </div>
@@ -365,7 +385,7 @@ export function EnhanceRuns() {
           {[...runs].reverse().map((r) => (
             <li key={r.id}>
               <Tile icon="target" tone="orange" size="sm" />
-              <div><strong>{r.name}</strong><span className="ob-muted">{catalog.find((m) => m.id === r.baseModelId)?.name ?? r.baseModelId} · {plural(r.datasets.length, 'dataset')} · {plural(r.steps.length, 'step')} · updated {date(r.updatedAt)}</span></div>
+              <div><strong>{r.name}</strong><span className="ob-muted">{modelLabel(catalog, r.baseModelId)} · {plural(r.datasets.length, 'dataset')} · {plural(r.steps.length, 'step')} · updated {date(r.updatedAt)}</span></div>
               <RunBadge run={r} />
               <Link className="btn-ghost" to={`/w/${entry.slug}/models/runs/${r.id}`}>Open</Link>
             </li>
@@ -385,10 +405,10 @@ export function EnhanceRun() {
   return <RunPlan key={run?.id ?? 'new'} account={account} entry={entry} role={role} options={options} run={run} />;
 }
 
-function Pipeline({ model, steps, methods, name }) {
+function Pipeline({ model, baseModelId = '', steps, methods, name }) {
   return (
     <div className="mdl-pipe">
-      <div className="mdl-pipe-row">{model ? <Glyph model={model} size={28} /> : <Tile icon="layers" tone="plain" size="sm" />}<strong>{model?.name ?? 'Choose a model'}</strong><span className="ob-muted">base</span></div>
+      <div className="mdl-pipe-row">{model ? <Glyph model={model} size={28} /> : <Tile icon="layers" tone="plain" size="sm" />}<strong>{model?.name ?? (baseModelId || 'Choose a model')}</strong><span className="ob-muted">{!model && baseModelId ? UNLISTED : 'base'}</span></div>
       {steps.map((s, i) => {
         const m = methods.find((x) => x.id === s);
         return (
@@ -426,9 +446,11 @@ function RunPlan({ account, entry, role, options, run }) {
   const model = catalog.find((m) => m.id === plan.baseModelId);
   const set = (patch) => { setPlan((p) => ({ ...p, ...patch })); setStatus((s) => ({ ...s, saved: false })); };
   const hasDataset = (d) => plan.datasets.some((x) => x.projectId === d.projectId && x.version === d.version);
+  const atLimit = plan.datasets.length >= MAX_RUN_DATASETS;
   const toggleDataset = (d) => set({ datasets: hasDataset(d) ? plan.datasets.filter((x) => !(x.projectId === d.projectId && x.version === d.version)) : [...plan.datasets, { projectId: d.projectId, version: d.version }] });
   const toggleStep = (id) => set({ steps: plan.steps.includes(id) ? plan.steps.filter((s) => s !== id) : methods.map((m) => m.id).filter((s) => s === id || plan.steps.includes(s)) });
-  const body = () => ({ ...plan, spendCapUsd: plan.spendCapUsd === '' ? null : Number(plan.spendCapUsd) });
+  // The cap is sent as typed; the server refuses anything but whole dollars instead of rewriting it.
+  const body = () => ({ ...plan, spendCapUsd: String(plan.spendCapUsd ?? '').trim() === '' ? null : String(plan.spendCapUsd).trim() });
 
   async function save() {
     const res = run ? await api.updateEnhanceRun(entry.id, run.id, body()).catch(() => null) : await api.createEnhanceRun(entry.id, body()).catch(() => null);
@@ -447,7 +469,7 @@ function RunPlan({ account, entry, role, options, run }) {
     setStatus({ pending: true, error: null, saved: false });
     const saved = await save();
     if (!saved) return;
-    const res = await api.requestEnhanceRun(entry.id, saved.id).catch(() => null);
+    const res = await api.requestEnhanceRun(entry.id, saved.id, saved.updatedAt).catch(() => null);
     if (!res?.ok) {
       const failed = { errors: res?.data.errors ?? {}, error: res?.data.error ?? 'That did not work. Check your connection and try again.' };
       if (!run) return navigate(`/w/${entry.slug}/models/runs/${saved.id}`, { replace: true, state: failed });
@@ -458,12 +480,13 @@ function RunPlan({ account, entry, role, options, run }) {
   }
 
   if (!run && pulledModels.length === 0) {
+    const unlisted = pulls.length > 0;
     return (
       <WorkspaceShell account={account} entry={entry} role={role} title="New enhance run" current="models-runs">
         <section className="ob-card" style={{ alignItems: 'flex-start' }}>
           <Tile icon="layers" tone="blue" size="lg" />
-          <h2>Pull a model first</h2>
-          <p className="ob-muted">Enhance runs start from an open-weight model in your workspace.</p>
+          <h2>{unlisted ? 'No pulled model is in the current catalog' : 'Pull a model first'}</h2>
+          <p className="ob-muted">{unlisted ? 'Enhance runs start from a catalog model in your workspace. The models pulled here are not in the current catalog.' : 'Enhance runs start from an open-weight model in your workspace.'}</p>
           <Link className="btn-app" to={`/w/${entry.slug}/models`}>Browse the catalog</Link>
         </section>
       </WorkspaceShell>
@@ -476,7 +499,7 @@ function RunPlan({ account, entry, role, options, run }) {
         <div className="ob-intro" style={{ gap: 8 }}>
           <Link className="ob-eyebrow" to={`/w/${entry.slug}/models/runs`}>Models · Enhance runs</Link>
           <h1 className="ob-h1">{run ? run.name : 'New enhance run'}</h1>
-          <p className="ob-lede">Post-train {model?.name ?? 'a pulled model'} on your approved data, one step after another.</p>
+          <p className="ob-lede">Plan post-training of {model?.name ?? 'a requested model'} on your approved data, one step after another. Approval records the plan and its cap; training is planned.</p>
           <div className="ob-chips" style={{ gap: 6 }}><span className="ob-badge">{run ? `Draft · saved ${date(run.updatedAt)}` : 'Not saved yet'}</span>{!writer && <span className="ob-badge">Read only</span>}</div>
         </div>
         <Link className="btn-ghost" to={`/w/${entry.slug}/models/runs`}>Back to runs</Link>
@@ -494,6 +517,7 @@ function RunPlan({ account, entry, role, options, run }) {
                 </label>
               ))}
             </div>
+            {plan.baseModelId && !model && <p className="ob-muted" style={{ fontSize: 12.5 }}>This draft started from {plan.baseModelId}, which is {UNLISTED}. Choose another pulled model before you save or request it.</p>}
             <FieldError id="base-error">{errors.baseModelId}</FieldError>
           </section>
 
@@ -506,7 +530,7 @@ function RunPlan({ account, entry, role, options, run }) {
                 {eligible.map((d) => (
                   <li key={`${d.projectId}:${d.version}`}>
                     <label className="mdl-data-row">
-                      <input type="checkbox" checked={hasDataset(d)} disabled={readOnly} onChange={() => toggleDataset(d)} />
+                      <input type="checkbox" checked={hasDataset(d)} disabled={readOnly || (atLimit && !hasDataset(d))} title={atLimit && !hasDataset(d) ? `At most ${MAX_RUN_DATASETS} dataset versions per run` : undefined} onChange={() => toggleDataset(d)} />
                       <Tile icon="data" tone="teal" size="sm" />
                       <span className="cell-stack" style={{ gap: 2 }}><strong>{d.projectName} · v{d.version}</strong><span className="ob-muted">{plural(d.files, 'file')} · {plural(d.labels, 'label')} · approved {date(d.createdAt)}</span></span>
                     </label>
@@ -533,7 +557,7 @@ function RunPlan({ account, entry, role, options, run }) {
           </section>
 
           <section className="ob-card">
-            <div className="mdl-step-head"><span className="ob-num">4</span><div className="cell-stack" style={{ gap: 2 }}><h2>Compute</h2><span className="ob-muted" style={{ fontSize: 13 }}>Rented GPUs, billed through Valcairn. Valcairn confirms availability and a quote before anything runs.</span></div></div>
+            <div className="mdl-step-head"><span className="ob-num">4</span><div className="cell-stack" style={{ gap: 2 }}><h2>Compute</h2><span className="ob-muted" style={{ fontSize: 13 }}>Rented GPUs are planned. Choosing one records a preference: no quote, booking or charge happens yet.</span></div></div>
             <div className="mdl-compute">
               {compute.map((c) => (
                 <label key={c.id} className="ob-option ob-option--row">
@@ -553,7 +577,7 @@ function RunPlan({ account, entry, role, options, run }) {
           <section className="ob-card mdl-panel">
             <div className="mdl-panel-top">
               <h2>What this run makes</h2>
-              <Pipeline model={model} steps={plan.steps} methods={methods} name={plan.name} />
+              <Pipeline model={model} baseModelId={plan.baseModelId} steps={plan.steps} methods={methods} name={plan.name} />
             </div>
             <div className="ob-field">
               <label htmlFor="run-name">Name</label>
@@ -561,13 +585,13 @@ function RunPlan({ account, entry, role, options, run }) {
             </div>
             <div className="ob-field">
               <label htmlFor="cap">Spending cap (US dollars)</label>
-              <input id="cap" type="text" inputMode="numeric" value={plan.spendCapUsd} placeholder="For example 250" disabled={readOnly} aria-invalid={Boolean(errors.spendCapUsd)} aria-describedby="cap-error cap-help" onChange={(e) => set({ spendCapUsd: e.target.value.replace(/[^0-9]/g, '') })} />
+              <input id="cap" type="text" inputMode="numeric" value={plan.spendCapUsd} placeholder="For example 250" disabled={readOnly} aria-invalid={Boolean(errors.spendCapUsd)} aria-describedby="cap-error cap-help" onChange={(e) => set({ spendCapUsd: e.target.value })} />
               <FieldError id="cap-error">{errors.spendCapUsd}</FieldError>
-              <span id="cap-help" className="ob-muted" style={{ fontSize: 12.5 }}>The run stops at the cap and keeps the last finished step.</span>
+              <span id="cap-help" className="ob-muted" style={{ fontSize: 12.5 }}>An approved planning limit. Enforcing it during a run (reservation, metering, stopping at the cap) is planned.</span>
             </div>
             <dl className="ds-dl">
-              <dt>Saved to</dt><dd>{entry.name} storage, after every step</dd>
-              <dt>Trains on</dt><dd>Only the dataset versions you choose above</dd>
+              <dt>Planned outputs</dt><dd>Weights after every step, saved to {entry.name} storage once runs exist</dd>
+              <dt>Planned training data</dt><dd>Only the dataset versions you choose above</dd>
             </dl>
             {status.error && <p className="ob-alert" role="alert">{status.error}</p>}
             {status.saved && <p className="ob-ok" role="status"><Icon name="check" size={14} stroke={2.5} />Draft saved</p>}
@@ -593,11 +617,11 @@ function RequestedRun({ account, entry, role, options, run }) {
         <div className="ob-intro" style={{ gap: 8 }}>
           <Link className="ob-eyebrow" to={`/w/${entry.slug}/models/runs`}>Models · Enhance runs</Link>
           <h1 className="ob-h1">{run.name}</h1>
-          <p className="ob-lede">{model?.name ?? run.baseModelId}, enhanced on {plural(run.datasets.length, 'dataset version')}. Requested {date(run.requestedAt)} with a ${run.spendCapUsd.toLocaleString('en-US')} cap.</p>
+          <p className="ob-lede">Planned enhancement of {modelLabel(catalog, run.baseModelId)} on {plural(run.datasets.length, 'dataset version')}. Requested {date(run.requestedAt)} with a ${run.spendCapUsd.toLocaleString('en-US')} planning limit.</p>
           <div className="ob-chips" style={{ gap: 6 }}><span className="ob-badge tile--orange">Requested · waiting for Valcairn</span><span className="ob-badge">Plan frozen</span></div>
         </div>
       </div>
-      <p className="ob-alert ob-alert--info" role="note">Valcairn confirms GPU availability and a quote within your cap, then starts the run. Live training curves, checkpoints and automatic runs are planned; nothing has been trained yet.</p>
+      <p className="ob-alert ob-alert--info" role="note">This is an approved plan, not a running job. Nothing has been trained: GPU quotes, booking, training, checkpoints and charges are planned.</p>
 
       <section className="ob-card mdl-progress">
         {run.steps.map((s, i) => {
@@ -627,14 +651,14 @@ function RequestedRun({ account, entry, role, options, run }) {
           <section className="ob-card">
             <h2>Plan</h2>
             <dl className="ds-dl">
-              <dt>Base</dt><dd>{model?.name ?? run.baseModelId}</dd>
+              <dt>Base</dt><dd>{modelLabel(catalog, run.baseModelId)}</dd>
               <dt>Data</dt><dd>{run.datasets.map((d) => `${datasetName(d)} v${d.version}`).join(' · ')}</dd>
               <dt>Steps</dt><dd>{run.steps.map((s) => methods.find((m) => m.id === s)?.name).join(' → ')}</dd>
               <dt>Compute</dt><dd>{where ? `${where.name} · ${where.gpus} · ${where.region}` : run.compute}</dd>
               <dt>Cap</dt><dd>${run.spendCapUsd.toLocaleString('en-US')}</dd>
             </dl>
           </section>
-          <section className="ob-card mdl-panel"><div className="mdl-panel-top"><h2>What this run makes</h2><Pipeline model={model} steps={run.steps} methods={methods} name={run.name} /></div></section>
+          <section className="ob-card mdl-panel"><div className="mdl-panel-top"><h2>What this run makes</h2><Pipeline model={model} baseModelId={run.baseModelId} steps={run.steps} methods={methods} name={run.name} /></div></section>
         </aside>
       </div>
     </WorkspaceShell>
