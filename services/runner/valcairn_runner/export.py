@@ -4,6 +4,7 @@ manifest with checksums and a model card. Every container step runs with no netw
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .sandbox import Limits, Step
-from .training import JobFailure, cached_model, forward, safe_name, sha256_file
+from .training import JobFailure, cached_model, forward, normalise, safe_name, sha256_file
 
 QUANT = "q8_0"
 MAX_PROMPTS = 3
@@ -31,7 +32,10 @@ def load_test(host: str, model: str, conversations: list[list[dict]], opener=Non
     """The same held-out conversations, greedy decoding; speed from Ollama's own counters (nanoseconds)."""
     answers, tokens, eval_ns = [], 0, 0
     for turns in conversations:
-        r = ollama_chat(host, model, turns, opener)
+        try:
+            r = ollama_chat(host, model, turns, opener)
+        except (OSError, ValueError):
+            raise JobFailure("runtime_error", f"Ollama on this machine did not answer for {model}.") from None
         answers.append(r.get("message", {}).get("content", "").strip()[:600])
         tokens += r.get("eval_count", 0)
         eval_ns += r.get("eval_duration", 0)
@@ -48,20 +52,20 @@ def ollama_create(name: str, folder: Path, run=subprocess.run) -> None:
 def held_out(train_dir: Path) -> tuple[list[list[dict]], str | None]:
     """Held-out conversations (never trained on) without their reference answers, found through the training run's
     own split file (the same example hashing as train.py), and the system prompt if every example used the same one."""
-    import hashlib
     split = json.loads((train_dir / "out" / "split.json").read_text(encoding="utf-8"))
     held = set(split["heldOut"])
     conversations, systems = [], set()
     for path in sorted((train_dir / "data").glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
-                row = json.loads(line)
+                ex = normalise(json.loads(line))
             except ValueError:
-                continue
-            ex = {"messages": row["messages"]} if "messages" in row else {"messages": [{"role": "user", "content": row.get("prompt", "")}, {"role": "assistant", "content": row.get("completion", "")}]}
+                ex = None
+            if ex is None:
+                continue  # skipped by training as well
             messages = ex["messages"]
-            systems.add(messages[0]["content"] if messages and messages[0].get("role") == "system" else None)
-            last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=None)
+            systems.add(messages[0]["content"] if messages[0]["role"] == "system" else None)
+            last = max(i for i, m in enumerate(messages) if m["role"] == "assistant")
             if last and len(conversations) < MAX_PROMPTS and hashlib.sha256(json.dumps(ex, sort_keys=True, ensure_ascii=False).encode()).hexdigest() in held:
                 conversations.append(messages[:last])
     return conversations, (next(iter(systems)) if len(systems) == 1 else None)
@@ -69,14 +73,16 @@ def held_out(train_dir: Path) -> tuple[list[list[dict]], str | None]:
 
 def convert(ctx, src: Path, out: Path, name: str) -> Path:
     out.mkdir(parents=True, exist_ok=True)
-    step = Step(image=ctx.settings.convert_image, command=["python3", "/app/convert_hf_to_gguf.py", "/in/hf", "--outtype", QUANT, "--outfile", f"/out/{name}"],
+    step = Step(image=ctx.settings.convert_image, command=["python3", "/app/convert_hf_to_gguf.py", "/in/hf", "--outtype", QUANT, "--outfile", f"/out/{name}.part"],
                 inputs={str(src): "/in/hf"}, output=str(out), env={"HOME": "/tmp", "HF_HOME": "/tmp/hf"},
                 # The llama.cpp image's entrypoint is its own tool launcher; the converter is run directly instead.
                 entrypoint="", limits=Limits(cpus=8, memory="16g", seconds=3600, tmpfs_mb=1024))
     code = ctx.sandbox.run(step, lambda line: forward(ctx, line), ctx.cancelled)
-    gguf = out / name
-    if code != 0 or not gguf.exists():
+    part, gguf = out / f"{name}.part", out / name
+    if code != 0 or not part.exists():
+        part.unlink(missing_ok=True)
         raise JobFailure("runtime_error", f"GGUF conversion failed with exit code {code}.")
+    part.replace(gguf)
     return gguf
 
 
@@ -120,7 +126,9 @@ def export(ctx) -> dict:
     ctx.emit("stage", name="convert", status="finished")
 
     short = ctx.job["id"].split("-")[0]
-    tuned_name, base_name = f"valcairn-{short}", f"valcairn-base-{safe_name(base_source).lower()}"
+    # Ollama names are lower case; a short hash of the source keeps two sources that differ only in case apart.
+    tag = hashlib.sha256(base_source.encode()).hexdigest()[:6]
+    tuned_name, base_name = f"valcairn-{short}", f"valcairn-base-{safe_name(base_source).lower()[:60]}-{tag}"
     ctx.emit("stage", name="ollama_create", status="started")
     conversations, system = held_out(adapter_dir.parent.parent)
     modelfile(tuned_dir, tuned, system)
@@ -159,6 +167,6 @@ def export(ctx) -> dict:
         "ollamaModel": tuned_name, "gguf": manifest["gguf"], "manifestSha256": sha256_file(tuned_dir / "manifest.json"),
         "loadTest": {"conversations": len(conversations), "seconds": round(time.time() - started, 1),
                      "tuned": {"model": tuned_name, "tokensPerSec": tuned_test["tokensPerSec"]}, "base": {"model": base_name, "tokensPerSec": base_test["tokensPerSec"]}},
-        "samples": [{"prompt": turns[-1]["content"][:300], "base": b[:400], "tuned": t[:400]} for turns, b, t in zip(conversations, base_test["answers"], tuned_test["answers"])],
+        "samples": [{"prompt": next(m["content"] for m in reversed(turns) if m["role"] == "user")[:300], "base": b[:400], "tuned": t[:400]} for turns, b, t in zip(conversations, base_test["answers"], tuned_test["answers"])],
         "location": f"jobs/{ctx.job['id']}/attempt-{ctx.job['attempt']}/gguf",
     }

@@ -60,6 +60,21 @@ def download(url: str, dest: Path, expected_sha: str, opener=None) -> None:
 WEIGHTS = ".valcairn-weights.json"
 
 
+def normalise(row) -> dict | None:
+    """The example rule train.py uses (kept identical, so hashes and held-out lookups agree): a chat with a user turn
+    and an assistant answer, or a prompt/completion pair."""
+    if not isinstance(row, dict):
+        return None
+    messages = row.get("messages")
+    if isinstance(messages, list) and all(isinstance(m, dict) and m.get("role") in ("system", "user", "assistant") and isinstance(m.get("content"), str) for m in messages):
+        roles = [m["role"] for m in messages]
+        if "assistant" in roles and "user" in roles:
+            return {"messages": messages}
+    if isinstance(row.get("prompt"), str) and isinstance(row.get("completion"), str):
+        return {"messages": [{"role": "user", "content": row["prompt"]}, {"role": "assistant", "content": row["completion"]}]}
+    return None
+
+
 def weight_hashes(folder: Path) -> dict:
     return {p.name: sha256_file(p) for p in sorted(folder.glob("*.safetensors"))}
 

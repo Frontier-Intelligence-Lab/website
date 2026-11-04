@@ -10,6 +10,7 @@ from valcairn_runner.runner import Settings
 from valcairn_runner.training import JobFailure
 
 ADAPTER = b"adapter-bytes"
+ORIGINAL_LOAD_TEST = exporter.load_test
 
 
 class Ctx:
@@ -50,7 +51,9 @@ def layout(home: Path):
     (train / "out" / "adapter" / "adapter_model.safetensors").write_bytes(ADAPTER)
     (train / "data").mkdir()
     rows = [{"messages": [{"role": "system", "content": "Be Acme support."}, {"role": "user", "content": f"question {i}"}, {"role": "assistant", "content": "answer"}]} for i in range(4)]
-    (train / "data" / "000-x.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    # Lines training skipped as unusable must not break the held-out lookup either.
+    junk = ['{"messages": "not a list"}', '{"messages": [{"role": "assistant", "content": "no question"}]}', "not json", "[1, 2]"]
+    (train / "data" / "000-x.jsonl").write_text("\n".join([*junk, *(json.dumps(r) for r in rows)]), encoding="utf-8")
     digest = lambda r: hashlib.sha256(json.dumps(r, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     (train / "out" / "split.json").write_text(json.dumps({"train": [digest(rows[0])], "heldOut": [digest(r) for r in rows[1:]]}))
     model = home / "models" / "org-model" / "model"
@@ -76,7 +79,8 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(tuned.entrypoint, "", "the converter runs directly, not through the image's launcher")
         self.assertIn("q8_0", tuned.command)
         self.assertIn("q8_0", base.command, "base and tuned use the same quantization")
-        self.assertEqual([n for n, _ in self.created], ["valcairn-e1234567", "valcairn-base-org-model"])
+        tag = hashlib.sha256(b"org/model").hexdigest()[:6]
+        self.assertEqual([n for n, _ in self.created], ["valcairn-e1234567", f"valcairn-base-org-model-{tag}"])
         self.assertTrue(all(m.startswith("FROM ./") for _, m in self.created))
         self.assertIn('SYSTEM """Be Acme support."""', self.created[0][1], "the training system prompt becomes the model's default")
         self.assertEqual(result["gguf"]["sha256"], hashlib.sha256(b"gguf").hexdigest())
@@ -98,6 +102,32 @@ class ExportTests(unittest.TestCase):
             with self.assertRaises(JobFailure, msg=why) as e:
                 exporter.export(ctx)
             self.assertEqual(e.exception.category, "model_unavailable")
+
+    def test_a_failed_conversion_leaves_nothing_a_later_export_would_reuse(self):
+        class Failing(Box):
+            def run(self, step, on_line, cancelled):
+                if "/app/convert_hf_to_gguf.py" in step.command:
+                    Path(step.output, step.command[-1].split("/")[-1]).write_bytes(b"half")
+                    return 1
+                return super().run(step, on_line, cancelled)
+        ctx = Ctx(self.home)
+        ctx.sandbox = Failing()
+        with self.assertRaises(JobFailure):
+            exporter.export(ctx)
+        self.assertFalse(list(self.home.rglob("*.gguf")), "no partial GGUF is kept under its final name")
+        self.assertFalse(list(self.home.rglob("*.part")))
+
+    def test_ollama_not_answering_is_a_clear_failure(self):
+        def down(*args, **kwargs):
+            raise OSError("connection refused")
+        real = exporter.ollama_chat
+        exporter.ollama_chat = down
+        try:
+            with self.assertRaises(JobFailure) as e:
+                ORIGINAL_LOAD_TEST("http://127.0.0.1:11434", "m", [[{"role": "user", "content": "q"}]])
+            self.assertEqual(e.exception.category, "runtime_error")
+        finally:
+            exporter.ollama_chat = real
 
 
 if __name__ == "__main__":

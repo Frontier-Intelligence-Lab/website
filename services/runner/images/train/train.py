@@ -28,7 +28,8 @@ def say(kind, **data):
 
 def normalise(row):
     if isinstance(row.get("messages"), list) and all(isinstance(m, dict) and m.get("role") in ("system", "user", "assistant") and isinstance(m.get("content"), str) for m in row["messages"]):
-        if any(m["role"] == "assistant" for m in row["messages"]):
+        roles = [m["role"] for m in row["messages"]]
+        if "assistant" in roles and "user" in roles:
             return {"messages": row["messages"]}
     if isinstance(row.get("prompt"), str) and isinstance(row.get("completion"), str):
         return {"messages": [{"role": "user", "content": row["prompt"]}, {"role": "assistant", "content": row["completion"]}]}
@@ -112,7 +113,8 @@ def main() -> int:
     if len(train_rows) < 4 or not held_rows:
         say("log", level="error", message="Not enough usable examples: need at least 5 chat or prompt/completion lines.")
         return 4
-    Path("/out/split.json").write_text(json.dumps({"train": [digest(e) for e in train_rows], "heldOut": [digest(e) for e in held_rows]}))
+    if os.environ.get("RANK", "0") == "0":
+        Path("/out/split.json").write_text(json.dumps({"train": [digest(e) for e in train_rows], "heldOut": [digest(e) for e in held_rows]}))
     say("metric", name="train_examples", value=len(train_rows))
     say("metric", name="held_out_examples", value=len(held_rows))
 
@@ -176,18 +178,22 @@ def main() -> int:
     say("metric", name="base_answer_f1", value=evaluation["base"]["f1"])
     say("metric", name="tuned_answer_f1", value=evaluation["tuned"]["f1"])
     say("stage", name="answer_eval", status="finished")
-    samples = [{"prompt": next(m["content"] for m in r["messages"] if m["role"] == "user")[:300], "base": b[:400], "tuned": t[:400]}
+    samples = [{"prompt": next(m["content"] for m in reversed(r["messages"]) if m["role"] == "user")[:300], "base": b[:400], "tuned": t[:400]}
                for r, b, t in list(zip(held_rows, base_answers, tuned_answers))[:3]]
 
+    peak = torch.tensor(max(torch.cuda.max_memory_allocated(i) for i in range(torch.cuda.device_count())), device=trainer.model.device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(peak, op=torch.distributed.ReduceOp.MAX)
+    if os.environ.get("RANK", "0") != "0":
+        return 0
     trainer.model.save_pretrained("/out/adapter", safe_serialization=True)
     tokenizer.save_pretrained("/out/adapter")
     report = {
         "method": "sft-lora", "rank": lora.r, "alpha": lora.lora_alpha, "epochs": config.num_train_epochs, "steps": int(result.global_step),
         "trainExamples": len(train_rows), "heldOutExamples": len(held_rows), "skippedLines": skipped,
         "baseHeldOutLoss": float(base_loss), "tunedHeldOutLoss": float(tuned_loss), "trainSeconds": round(seconds, 1),
-        "gpus": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
-        # This process's devices: under accelerate each process holds one GPU, so this is the reporting process's GPU.
-        "peakGpuMemoryMb": max(int(torch.cuda.max_memory_allocated(i) / 2**20) for i in range(torch.cuda.device_count())),
+        "gpus": [torch.cuda.get_device_name(0)] * int(os.environ.get("WORLD_SIZE", torch.cuda.device_count())),
+        "peakGpuMemoryMb": int(peak.item() / 2**20),  # the highest of any GPU used
         "evaluation": evaluation, "samples": samples,
     }
     Path("/out/report.json").write_text(json.dumps(report, indent=2))
