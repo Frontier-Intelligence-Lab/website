@@ -41,7 +41,8 @@ function useDataset() {
     const res = await fn().catch(() => null);
     setPending(false);
     if (!res?.ok) { setError(res?.data.error ?? 'That did not work. Check your connection and try again.'); return null; }
-    revalidator.revalidate();
+    // Wait for the fresh page data, so whatever showed the change as pending can hand over to the saved state.
+    await revalidator.revalidate();
     return res.data;
   }, [revalidator]);
   const base = `/w/${data.entry.slug}/projects/${data.project.id}`;
@@ -632,7 +633,12 @@ function IssueCard({ d, issue }) {
   const [writing, setWriting] = useState(false);
   const [note, setNote] = useState('');
   const item = issue.uploadId ? d.items.find((it) => it.id === issue.uploadId) : null;
-  const fixTo = issue.fix && ({ data: `${d.base}/data`, import: `${d.base}/dataset/import`, annotate: `${d.base}/dataset/annotate${issue.fix.uploadId ? `/${issue.fix.uploadId}` : ''}` })[issue.fix.page];
+  const fixTo = issue.fix?.page && ({ success: `${d.base}/success`, data: `${d.base}/data`, import: `${d.base}/dataset/import`, annotate: `${d.base}/dataset/annotate${issue.fix.uploadId ? `/${issue.fix.uploadId}` : ''}` })[issue.fix.page];
+  // In-place repairs for labels or types stored before today's rules; the store re-checks each one.
+  const fixAction = issue.fix?.action && ({
+    'reset-kind': () => api.updateItem(d.entry.id, d.project.id, issue.fix.uploadId, { kind: null }),
+    'delete-annotation': () => api.deleteAnnotation(d.entry.id, d.project.id, issue.fix.annotationId),
+  })[issue.fix.action];
   const saveNote = async (e) => {
     e.preventDefault();
     if (await d.act(() => api.noteIssue(d.entry.id, d.project.id, issue.key, note))) { setWriting(false); setNote(''); }
@@ -649,6 +655,7 @@ function IssueCard({ d, issue }) {
           <div className="ob-row-actions" style={{ paddingTop: 4 }}>
             {issue.note ? <button type="button" className="btn-text" disabled={d.pending} onClick={() => d.act(() => api.deleteIssueNote(d.entry.id, d.project.id, issue.key))}>Remove note</button> : <>
               {fixTo && <Link className="btn-app" to={fixTo} style={{ minHeight: 38, fontSize: 13 }}>{issue.fix.label}</Link>}
+              {fixAction && <button type="button" className="btn-app" style={{ minHeight: 38, fontSize: 13 }} disabled={d.pending} onClick={() => d.act(fixAction)}>{issue.fix.label}</button>}
               {issue.remove && item && <button type="button" className="btn-app" style={{ minHeight: 38, fontSize: 13 }} disabled={d.pending} onClick={() => d.act(() => api.deleteUpload(d.entry.id, d.project.id, item.id))}>Remove this file</button>}
               {!issue.blocking && !writing && <button type="button" className="btn-ghost" style={{ minHeight: 38, fontSize: 13 }} onClick={() => setWriting(true)}>Keep it, add a note</button>}
             </>}
@@ -917,6 +924,7 @@ export function DatasetVersions() {
               {shown ? <>
                 <span className="ob-badge">SHA-256 for every file</span><span className="ob-badge">{plural(shown.labels, 'label')}</span>
                 <span className="ob-badge">label set · {plural(shown.labelSet.length, 'label')}</span><span className="ob-badge">{plural(shown.notes, 'note')} for staff</span>
+                {(shown.warnings?.labels > 0 || shown.warnings?.kinds > 0) && <p className="ob-alert" style={{ flexBasis: '100%' }}>This version holds {plural(shown.warnings.labels, 'label')} and {plural(shown.warnings.kinds, 'file type')} that today’s checks would refuse, such as a box on a file whose content is not an image. They were approved before those checks existed and are kept exactly as approved.</p>}
               </> : base ? <>
                 <span className="ob-badge tile--green">+{added} file{added === 1 ? '' : 's'}</span>
                 {removed > 0 && <span className="ob-badge tile--orange">−{removed} file{removed === 1 ? '' : 's'}</span>}

@@ -95,6 +95,7 @@ export function BoxedImage({ url, alt, boxes = [], selected, onSelect, onDraw })
   const [natural, setNatural] = useState(null);
   const [size, setSize] = useState(null);
   const [drag, setDrag] = useState(null);
+  const [pending, setPending] = useState(null);
   useLayoutEffect(() => {
     const el = frame.current;
     if (!el) return undefined;
@@ -127,7 +128,8 @@ export function BoxedImage({ url, alt, boxes = [], selected, onSelect, onDraw })
             const b = at(e);
             const done = { x: Math.min(drag.a.x, b.x), y: Math.min(drag.a.y, b.y), w: Math.abs(b.x - drag.a.x), h: Math.abs(b.y - drag.a.y) };
             setDrag(null);
-            if (done.w > 0.01 && done.h > 0.01) onDraw(done);
+            // Keep a dashed "saving" outline until the server answers; it is never shown as saved before then.
+            if (done.w > 0.01 && done.h > 0.01) { setPending(done); Promise.resolve(onDraw(done)).finally(() => setPending(null)); }
           } : undefined}
           onPointerCancel={drag ? () => setDrag(null) : undefined}>
           {boxes.map((b) => (
@@ -138,6 +140,7 @@ export function BoxedImage({ url, alt, boxes = [], selected, onSelect, onDraw })
               <span>{b.label?.name ?? 'box'}</span>
             </button>
           ))}
+          {pending && <span className="ds-box ds-box--draft ds-box--pending" style={{ left: `${pending.x * 100}%`, top: `${pending.y * 100}%`, width: `${pending.w * 100}%`, height: `${pending.h * 100}%` }} role="status" aria-label="Saving box"><span>Saving…</span></span>}
           {rect && <span className="ds-box ds-box--draft" style={{ left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.w * 100}%`, height: `${rect.h * 100}%` }} aria-hidden="true" />}
         </span>
       )}

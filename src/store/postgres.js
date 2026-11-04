@@ -523,7 +523,7 @@ export function createPostgresStore(options) {
       return transaction(async (client) => {
         const project = await lockProject(client, workspaceId, projectId);
         if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
-        if (requireResolved && project.data_source?.mode === 'upload') {
+        if (requireResolved) {
           // The gate reads files, labels and notes under the lock every write to them takes, so nothing slips in after the check.
           // One transaction client runs one query at a time, so these are sequential awaits.
           const uploads = await query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId], client);

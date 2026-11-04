@@ -77,7 +77,7 @@ export async function reviewLoader({ params }) {
 }
 
 export function StaffReview() {
-  const { review, workspace, project, uploads, labelSet = [], annotations = [], issueNotes = [] } = useLoaderData();
+  const { review, workspace, project, uploads, labelSet = [], annotations = [], issueNotes = [], warnings = { labels: 0, kinds: 0 } } = useLoaderData();
   const labelOf = (id) => labelSet.find((l) => l.id === id);
   const navigate = useNavigate();
   const [checks, setChecks] = useState(review.checks ?? {});
@@ -114,6 +114,7 @@ export function StaffReview() {
               <li><div><strong>Acceptance rule</strong><span className="ob-muted">{project.success ? `${project.success.measure} ≥ ${project.success.target ?? '—'} vs ${project.success.baseline}` : 'Not set'}</span></div></li>
             </ul>
           </section>
+          {(warnings.labels > 0 || warnings.kinds > 0) && <p className="ob-alert" role="note"><strong>This snapshot holds {warnings.labels} label{warnings.labels === 1 ? '' : 's'} and {warnings.kinds} file type{warnings.kinds === 1 ? '' : 's'} that today’s checks refuse</strong>, for example a box on a file whose content is not an image. It was sent before those checks existed. Request changes so the customer can repair it.</p>}
           {issueNotes.length > 0 && (
             <section className="ob-card">
               <h2>Kept with a note · {issueNotes.length}</h2>

@@ -3,13 +3,14 @@ import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'reac
 import { api, uploadFile } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural, roleName } from './shell.jsx';
+import { nextStepKind } from './lifecycle.js';
 
 const STEPS = ['Goal', "How you'll judge it", 'Data'];
 const MODALITIES = ['Text', 'Documents', 'Images', 'Video', 'Audio', 'Sensor or time series', 'Robot trajectories'];
 const STARTS = [
   { id: 'own', icon: 'data', tone: 'teal', title: 'We have our own data', body: 'Describe it and record its rights. It stays private to your workspace.' },
   { id: 'need', icon: 'store', tone: 'green', title: 'We need data', body: 'License an existing dataset, or have one collected and labeled.' },
-  { id: 'model', icon: 'layers', tone: 'blue', title: 'We already have a model', body: 'Test it on your task and deploy it. No training required.' },
+  { id: 'model', icon: 'layers', tone: 'blue', title: 'We already have a model', body: 'Record it and how you want it tested. Testing and deployment are planned, not running yet.' },
   { id: 'unsure', icon: 'question', tone: 'violet', title: 'Not sure yet', body: 'Book a short call and we will scope it with you.' },
 ];
 const PLANS = {
@@ -381,7 +382,7 @@ export function ProjectModel() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">Tell us about your model</h1>
-            <p className="ob-lede">We test it against your acceptance rule before anything is deployed. Nothing is retrained unless you ask.</p>
+            <p className="ob-lede">Record it now. When evaluation opens (planned), it will be tested against your acceptance rule before anything is deployed, and nothing is retrained unless you ask.</p>
           </div>
           {errors.form && <p className="ob-alert" role="alert">{errors.form}</p>}
           <fieldset aria-describedby="source-error">
@@ -656,21 +657,25 @@ export function ProjectHome() {
     ) : <button className="btn-text" type="button" onClick={() => setConfirmReopen(true)}>Need changes? Reopen the project</button>
   );
 
-  let next = null;
-  if (unsure) next = writer ? {
-    title: 'Book your scoping call',
-    body: 'Thirty minutes with our team to pin down the data, the approach and how to test it. You get a written plan afterwards.',
-    custom: <>
-      {bookingUrl ? <a className="btn-app" href={bookingUrl} target="_blank" rel="noreferrer">Book a 30-minute call</a> : <Link className="btn-app" to="/contact">Contact us to book</Link>}
-      <p className="ob-muted">Already know how you want to start?</p>
-      <div className="ob-chips">{START_CHOICES.map(([id, label]) => <button key={id} type="button" className="ob-chip" disabled={pending} onClick={() => chooseStart(id)}>{label}</button>)}</div>
-    </>,
-  } : { title: 'Waiting for a scoping call', body: 'Someone on the team is arranging a call with Valcairn.' };
-  else if (!taskDone) next = writer ? { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` } : null;
-  else if (!dataDone) next = !writer ? null : modelPath ? { title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.', to: `${base}/model` } : { title: 'Record your data and its rights', body: 'Where it came from and how it may be used.', to: `${base}/data` };
-  else if (!modelPath && editable && writer) {
-    const needsFiles = mode === 'upload' && uploads.length === 0;
-    next = {
+  // Lifecycle first (see lifecycle.js): frozen projects always keep their reopen, withdraw and version actions.
+  const kind = nextStepKind({ status: s, startingPoint: project.startingPoint, role, hasSuccess: taskDone, hasData: dataDone });
+  const noRule = !taskDone && !unsure && <p className="ob-alert">This project has no acceptance rule. {s === 'in_review' ? 'Withdraw it from review to set one.' : manager ? 'Reopen it to set one before the next review.' : 'An owner or admin can reopen it to set one.'}</p>;
+  const needsFiles = mode === 'upload' && uploads.length === 0;
+  const steps_ = {
+    'book-call': {
+      title: 'Book your scoping call',
+      body: 'Thirty minutes with our team to pin down the data, the approach and how to test it. You get a written plan afterwards.',
+      custom: <>
+        {bookingUrl ? <a className="btn-app" href={bookingUrl} target="_blank" rel="noreferrer">Book a 30-minute call</a> : <Link className="btn-app" to="/contact">Contact us to book</Link>}
+        <p className="ob-muted">Already know how you want to start?</p>
+        <div className="ob-chips">{START_CHOICES.map(([id, label]) => <button key={id} type="button" className="ob-chip" disabled={pending} onClick={() => chooseStart(id)}>{label}</button>)}</div>
+      </>,
+    },
+    'wait-call': { title: 'Waiting for a scoping call', body: 'Someone on the team is arranging a call with Valcairn.' },
+    'set-rule': { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` },
+    'describe-model': { title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.', to: `${base}/model` },
+    'record-data': { title: 'Record your data and its rights', body: 'Where it came from and how it may be used.', to: `${base}/data` },
+    submit: {
       title: needsFiles ? 'Upload a sample' : s === 'changes_requested' ? 'Fix and resubmit' : 'Submit for review',
       body: needsFiles ? 'A few hundred representative files is enough to check fit and rights.' : mode === 'upload' ? 'Submitting locks the files, rights record and acceptance rule for Valcairn’s review.' : 'Valcairn reviews your request and comes back with options and terms.',
       custom: (
@@ -682,18 +687,19 @@ export function ProjectHome() {
             : <button className="btn-app" type="button" disabled={pending || needsFiles} onClick={() => act(() => api.submitReview(entry.id, project.id))}>{pending ? 'Submitting…' : 'Submit for review'}</button>}
         </>
       ),
-    };
-  } else if (s === 'in_review') next = {
-    title: 'In review with Valcairn',
-    body: 'The files, rights record and acceptance rule are locked while the review is open. You’ll see the decision here.',
-    custom: writer && <button className="btn-text" type="button" disabled={pending} onClick={() => act(() => api.reopenProject(entry.id, project.id))}>Withdraw from review to make changes</button>,
+    },
+    'in-review-withdraw': {
+      title: 'In review with Valcairn',
+      body: 'The files, rights record and acceptance rule are locked while the review is open. You’ll see the decision here.',
+      custom: <>{noRule}<button className="btn-text" type="button" disabled={pending} onClick={() => act(() => api.reopenProject(entry.id, project.id))}>Withdraw from review to make changes</button></>,
+    },
+    'in-review': { title: 'In review with Valcairn', body: 'The files, rights record and acceptance rule are locked while the review is open.' },
+    'approve-version': { title: `Approve dataset version ${(latest?.number ?? 0) + 1}`, body: 'This freezes exactly the reviewed files, rights record and acceptance rule. Training will only use an approved version.', custom: <>{noRule}<button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : `Approve version ${(latest?.number ?? 0) + 1}`}</button>{reopenBlock}</> },
+    'wait-admin': { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.', custom: noRule },
+    'versioned-manage': { title: `Dataset version ${latest?.number} approved`, body: `${plural(latest?.files ?? 0, 'file')} and their rights record are frozen in this version. Training and evaluation are planned; nothing runs yet.`, custom: <>{noRule}{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}{reopenBlock}</> },
+    versioned: { title: `Dataset version ${latest?.number} approved`, body: 'Training and evaluation are planned; nothing runs yet.', custom: noRule },
   };
-  else if (s === 'approved') next = manager
-    ? { title: `Approve dataset version ${(latest?.number ?? 0) + 1}`, body: 'This freezes exactly the reviewed files, rights record and acceptance rule. Training will only use an approved version.', custom: <><button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : `Approve version ${(latest?.number ?? 0) + 1}`}</button>{reopenBlock}</> }
-    : { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.' };
-  else if (s === 'versioned') next = manager
-    ? { title: `Dataset version ${latest.number} approved`, body: `${plural(latest.files, 'file')} and their rights record are frozen in this version. Training and evaluation are planned; nothing runs yet.`, custom: <>{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}{reopenBlock}</> }
-    : { title: `Dataset version ${latest.number} approved`, body: 'Training and evaluation are planned; nothing runs yet.' };
+  const next = kind ? steps_[kind] : null;
 
   return (
     <WorkspaceShell account={account} entry={entry} role={role} title={project.name} project={project} current="project">

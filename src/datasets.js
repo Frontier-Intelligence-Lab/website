@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { StoreError } from './store/index.js';
 import { signToken, verifyToken } from './lib/tokens.js';
 import { createIngestClient } from './lib/ingest-client.js';
-import { detectKind, kindOf, previewType } from './lib/dataset.js';
+import { countInvalid, detectKind, kindOf, previewType } from './lib/dataset.js';
 
 const GRANT_TTL_S = 10 * 60;
 const DOWNLOAD_TTL_S = 5 * 60;
@@ -160,6 +160,7 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
       labelSet: reviewed.labelSet ?? [],
       annotations: reviewed.annotations ?? [],
       issueNotes: reviewed.issueNotes ?? [],
+      warnings: countInvalid(reviewed),
       uploads: reviewed.files.map(({ objectKey, ...u }) => {
         const type = previewType(u.contentType);
         return {

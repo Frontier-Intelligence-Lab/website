@@ -306,7 +306,7 @@ export function runStoreContract(test, makeStore, label) {
     const fresh = async (name) => {
       const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name, task: 'Spot jams', modalities: ['Video'], startingPoint: 'own' });
       const where = { workspaceId: ws.id, projectId: p.id };
-      await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'ours' } } });
+      await store.updateProject({ ...where, patch: { success: { measure: 'recall', target: '95%', baseline: 'current' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
       await store.setLabelSet({ ...where, labelSet: [{ id: 'l_jam', name: 'jam', scope: 'span', tone: 'green' }, { id: 'l_ok', name: 'ok', scope: 'file', tone: 'plain' }, { id: 'l_box', name: 'tear', scope: 'box', tone: 'orange' }] });
       const video = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: `${name}-v`, sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'video/mp4', filename: 'dock.mp4' });
       await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', startMs: 0, endMs: 10, createdBy: owner.id });
@@ -379,6 +379,25 @@ export function runStoreContract(test, makeStore, label) {
     await assert.rejects(store.updateAnnotation({ ...where, annotationId: ok.id, patch: { box: { x: 0.25, y: 0.5, w: 0.0000001, h: 0.25 } } }), { code: 'invalid_label' });
     await assert.rejects(store.updateAnnotation({ ...where, annotationId: ok.id, patch: { box: { x: 0.25, y: 0.5, w: 0.8, h: 0.25 } } }), { code: 'invalid_label' });
     assert.deepEqual((await store.updateAnnotation({ ...where, annotationId: ok.id, patch: { box: { x: 0.1234564, y: 0.5, w: 0.2, h: 0.25 } } })).box, { x: 0.123456, y: 0.5, w: 0.2, h: 0.25 });
+  });
+
+  withStore('review needs an acceptance rule, checked by the store in the submit transaction', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    for (const dataSource of [{ mode: 'upload', provenance: 'ours' }, { mode: 'license', query: 'retail shelf images' }]) {
+      const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: dataSource.mode, task: 'Spot tears', modalities: ['Images'], startingPoint: dataSource.mode === 'upload' ? 'own' : 'need' });
+      const where = { workspaceId: ws.id, projectId: p.id };
+      await store.updateProject({ ...where, patch: { dataSource } });
+      if (dataSource.mode === 'upload') {
+        await store.setLabelSet({ ...where, labelSet: [{ id: 'ok', name: 'ok', scope: 'file', tone: 'plain' }] });
+        const file = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: `${p.id}-f`, sha256: 'a'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'a.png' });
+        await store.createAnnotation({ ...where, uploadId: file.id, labelId: 'ok', createdBy: owner.id });
+      }
+      await assert.rejects(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open === 1, `${dataSource.mode}: no rule`);
+      assert.equal((await store.getProject(where)).status, 'draft');
+      await store.updateProject({ ...where, patch: { success: { measure: 'recall', target: '95%', baseline: 'current' } } });
+      assert.equal((await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true })).status, 'pending', `${dataSource.mode}: with a rule`);
+    }
   });
 
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {

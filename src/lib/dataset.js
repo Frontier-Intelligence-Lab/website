@@ -99,7 +99,44 @@ export function previewType(contentType = '') {
 }
 
 /**
- * Open questions to settle before review; `fix.page` names the screen that fixes one (data, import or annotate).
+ * Stored labels and file types that the current rules would refuse: rows written before a rule existed, or by
+ * anything that bypassed the API. New writes are checked in `checkAnnotation` and `checkKind`; this finds the old
+ * ones so they can be repaired in a draft and flagged in frozen history, never silently rewritten.
+ * Returns { annotations: [{ annotation, upload, reason }], kinds: [{ upload, reason }] }.
+ */
+export function findInvalid({ uploads, annotations, labelSet = [] }) {
+  const kinds = [];
+  for (const u of uploads) {
+    try { if (u.kind) checkKind(u, u.kind); } catch (err) { kinds.push({ upload: u, reason: err.message }); }
+  }
+  const bad = [];
+  for (const a of annotations) {
+    const upload = uploads.find((u) => u.id === a.uploadId);
+    if (!upload) continue;
+    const label = labelSet.find((l) => l.id === a.labelId);
+    try {
+      if (!label) throw invalid('Its label is no longer in the label set.');
+      // Compare against what a fresh write of this label would need; whole-file labels must carry no times or box.
+      const fit = checkAnnotation({ label, upload, startMs: a.startMs, endMs: a.endMs, box: a.box });
+      // Postgres returns jsonb keys in its own order, so compare the fields, not the serialised object.
+      const sameBox = (fit.box == null && a.box == null) || (fit.box != null && a.box != null && ['x', 'y', 'w', 'h'].every((k) => fit.box[k] === a.box[k]));
+      if (fit.startMs !== a.startMs || fit.endMs !== a.endMs || !sameBox) throw invalid('Its stored times or box are not in the supported form.');
+    } catch (err) {
+      bad.push({ annotation: a, upload, reason: err.message });
+    }
+  }
+  return { annotations: bad, kinds };
+}
+
+/** Labels and file types in a frozen snapshot or manifest that today's rules would refuse. */
+export const countInvalid = (frozen) => {
+  const found = findInvalid({ uploads: frozen.files ?? [], annotations: frozen.annotations ?? [], labelSet: frozen.labelSet ?? [] });
+  return { labels: found.annotations.length, kinds: found.kinds.length };
+};
+
+/**
+ * Open questions to settle before review; `fix.page` names the screen that fixes one (success, data, import or
+ * annotate) and `fix.action` an in-place repair (reset-kind, delete-annotation).
  * An issue goes away when it is fixed, or when someone records a note
  * against its key explaining why it stays. `blocking` issues cannot be noted away.
  */
@@ -107,7 +144,22 @@ export function computeIssues({ project, uploads, annotations, notes }) {
   const issues = [];
   const add = (issue) => issues.push({ ...issue, note: notes.find((n) => n.key === issue.key)?.note ?? null });
   const files = uploads.filter((u) => !u.duplicateOf);
-  const labelled = new Set(annotations.map((a) => a.uploadId));
+  const invalidFound = findInvalid({ uploads, annotations, labelSet: project.labelSet ?? [] });
+  const invalidIds = new Set(invalidFound.annotations.map((x) => x.annotation.id));
+  // A label that no longer fits its file does not count as labelling it.
+  const labelled = new Set(annotations.filter((a) => !invalidIds.has(a.id)).map((a) => a.uploadId));
+
+  // Review is against the bar set before training, so the bar has to exist first.
+  if (!project.success) {
+    add({ key: 'acceptance', group: 'rights', blocking: true, title: 'No acceptance rule yet', detail: 'Set how this work will be judged. Review locks the rule with the data, so it has to exist first.', fix: { label: 'Set the acceptance rule', page: 'success' } });
+  }
+  for (const { upload, reason } of invalidFound.kinds) {
+    add({ key: `kind:${upload.id}`, group: 'labels', blocking: true, uploadId: upload.id, title: `${upload.filename} is typed as Image`, detail: `${reason} Delete any box labels on it, then reset its data type.`, fix: { label: 'Reset the data type', action: 'reset-kind', uploadId: upload.id } });
+  }
+  for (const { annotation, upload, reason } of invalidFound.annotations) {
+    const name = (project.labelSet ?? []).find((l) => l.id === annotation.labelId)?.name ?? 'A removed label';
+    add({ key: `label:${annotation.id}`, group: 'labels', blocking: true, uploadId: upload.id, title: `“${name}” no longer fits ${upload.filename}`, detail: `${reason} Delete it, then label the file again if it needs one.`, fix: { label: 'Delete this label', action: 'delete-annotation', annotationId: annotation.id } });
+  }
 
   if (!project.dataSource) {
     add({ key: 'source', group: 'rights', blocking: true, title: 'Where did this data come from?', detail: 'Record its source and how it may be used. Staff read this record; Valcairn cannot verify it.', fix: { label: 'Record the source', page: 'data' } });

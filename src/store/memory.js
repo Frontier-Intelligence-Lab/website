@@ -324,7 +324,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       const project = projects.get(projectId);
       if (!project || project.workspaceId !== workspaceId) throw new StoreError('not_found');
       if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
-      if (requireResolved && project.dataSource?.mode === 'upload') {
+      if (requireResolved) {
         const where = (x) => x.projectId === projectId;
         const open = computeIssues({ project, uploads: uploads.filter(where), annotations: annotations.filter(where), notes: issueNotes.filter(where) }).filter((i) => i.open).length;
         if (open) throw Object.assign(new StoreError('issues_open'), { open });

@@ -324,6 +324,7 @@ withStore('account and dataset APIs complete a persisted review workflow', async
     const { workspace: ws } = await owner.call('POST', '/api/workspaces', { name: 'Integration Workspace' });
     const { project } = await owner.call('POST', `/api/workspaces/${ws.id}/projects`, { task: 'Classify sample documents', modalities: ['Documents'], startingPoint: 'own' });
     const base = `/api/workspaces/${ws.id}/projects/${project.id}`;
+    await owner.call('POST', base, { success: { measure: 'recall', target: '95%', baseline: 'current' } });
     await owner.call('POST', base, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'], personalData: 'no' } });
     const receipt = signToken(secret, { v: 1, kind: 'receipt', ws: ws.id, project: project.id, by: owner.id, objectKey: 'api-integration/sample', sha256: 'c'.repeat(64), sizeBytes: 12, contentType: 'text/plain', filename: 'sample.txt', exp: Math.floor(Date.now() / 1000) + 60 });
     const { upload } = await owner.call('POST', `${base}/uploads`, { receipt });
@@ -627,7 +628,7 @@ async function labelledProject(store) {
   const ws = await workspace(store, owner.id);
   const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Line 2', task: 'Spot jams', modalities: ['Video'], startingPoint: 'own' });
   const where = { workspaceId: ws.id, projectId: p.id };
-  await store.updateProject({ ...where, patch: { dataSource: { mode: 'upload', provenance: 'ours' } } });
+  await store.updateProject({ ...where, patch: { success: { measure: 'recall', target: '95%', baseline: 'current' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
   await store.setLabelSet({ ...where, labelSet: [{ id: 'l_jam', name: 'belt jam', scope: 'span', tone: 'green' }, { id: 'l_ok', name: 'ok', scope: 'file', tone: 'plain' }] });
   const video = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'v1', sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'video/mp4', filename: 'dock.mp4' });
   const label = await store.createAnnotation({ ...where, uploadId: video.id, labelId: 'l_jam', startMs: 0, endMs: 1000, createdBy: owner.id });
@@ -804,4 +805,55 @@ withStore('an upload metadata write waits for an in-flight freeze, then is refus
     freezer.release();
   }
   assert.equal((await pool.query('SELECT filename FROM uploads WHERE id = $1', [video.id])).rows[0].filename, 'dock.mp4');
+});
+
+withStore('labels stored before today\'s rules block review until repaired; approved history is only flagged', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Legacy', task: 'Spot tears', modalities: ['Images'], startingPoint: 'own' });
+  const where = { workspaceId: ws.id, projectId: p.id };
+  await store.updateProject({ ...where, patch: { success: { measure: 'recall' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
+  await store.setLabelSet({ ...where, labelSet: [{ id: 'box', name: 'tear', scope: 'box', tone: 'orange' }, { id: 'ok', name: 'ok', scope: 'file', tone: 'plain' }] });
+  const text = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'legacy-t', sha256: 'a'.repeat(64), sizeBytes: 5, contentType: 'text/plain', filename: 'notes.txt' });
+  const png = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'legacy-p', sha256: 'b'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'carton.png' });
+  // What the code before 261598d could write: text bytes typed as Image with a box, and a sub-minimum box from before 010.
+  await pool.query("UPDATE uploads SET kind = 'image' WHERE id = $1", [text.id]);
+  const onText = (await pool.query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by)
+    VALUES ($1, $2, $3, 'box', '{"x":0.1,"y":0.1,"w":0.2,"h":0.2}', $4) RETURNING id`, [ws.id, p.id, text.id, owner.id])).rows[0].id;
+  await pool.query('ALTER TABLE annotations DROP CONSTRAINT annotations_box_stored_form');
+  const tiny = (await pool.query(`INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by)
+    VALUES ($1, $2, $3, 'box', '{"x":0.1,"y":0.1,"w":0.0000001,"h":0.2}', $4) RETURNING id`, [ws.id, p.id, png.id, owner.id])).rows[0].id;
+  await pool.query(`ALTER TABLE annotations ADD CONSTRAINT annotations_box_stored_form CHECK (box IS NULL OR CASE WHEN jsonb_typeof(box) = 'object' AND box - 'x' - 'y' - 'w' - 'h' = '{}'::jsonb AND jsonb_typeof(box -> 'x') = 'number' AND jsonb_typeof(box -> 'y') = 'number' AND jsonb_typeof(box -> 'w') = 'number' AND jsonb_typeof(box -> 'h') = 'number' THEN (box ->> 'x')::numeric * 1000000 = trunc((box ->> 'x')::numeric * 1000000) AND (box ->> 'y')::numeric * 1000000 = trunc((box ->> 'y')::numeric * 1000000) AND (box ->> 'w')::numeric * 1000000 = trunc((box ->> 'w')::numeric * 1000000) AND (box ->> 'h')::numeric * 1000000 = trunc((box ->> 'h')::numeric * 1000000) AND (box ->> 'x')::numeric BETWEEN 0 AND 1 AND (box ->> 'y')::numeric BETWEEN 0 AND 1 AND (box ->> 'w')::numeric >= 0.001 AND (box ->> 'h')::numeric >= 0.001 AND (box ->> 'x')::numeric + (box ->> 'w')::numeric <= 1.000001 AND (box ->> 'y')::numeric + (box ->> 'h')::numeric <= 1.000001 ELSE false END) NOT VALID`);
+  await store.createAnnotation({ ...where, uploadId: png.id, labelId: 'ok', createdBy: owner.id });
+
+  await assert.rejects(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open >= 3);
+  // Repair inside the draft, through the normal store paths: drop the bad labels, then the hand-set type.
+  await assert.rejects(store.updateUpload({ ...where, uploadId: text.id, patch: { kind: null } }), { code: 'label_in_use' }, 'the box must go first');
+  await store.deleteAnnotation({ ...where, annotationId: onText });
+  await store.deleteAnnotation({ ...where, annotationId: tiny });
+  await store.updateUpload({ ...where, uploadId: text.id, patch: { kind: null } });
+  await store.createAnnotation({ ...where, uploadId: text.id, labelId: 'ok', createdBy: owner.id });
+  const review = await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true });
+  assert.equal(review.snapshot.annotations.length, 2);
+  assert.ok(review.snapshot.annotations.every((a) => a.box == null), 'only the repaired, valid labels were snapshotted');
+});
+
+withStore('migration 010: the database refuses boxes outside the stored form, for new and changed rows', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Boxes', task: 't', modalities: [], startingPoint: 'own' });
+  const png = await store.createUpload({ workspaceId: ws.id, projectId: p.id, uploadedBy: owner.id, objectKey: 'box-p', sha256: 'c'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'p.png' });
+  const insert = (box) => pool.query('INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by) VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING id', [ws.id, p.id, png.id, 'box', box, owner.id]);
+  for (const bad of ['{}', '{"x":0.1,"y":0.1,"w":0.2}', '{"y":0.1,"w":0.2,"h":0.2}', '{"x":0.1,"y":0.1,"w":0.0000001,"h":0.2}', '{"x":0.1,"y":0.1,"w":0.0009,"h":0.2}',
+    '{"x":"0.1","y":0.1,"w":0.2,"h":0.2}', '{"x":0.1,"y":0.1,"w":0.2,"h":0.2,"z":1}', '{"x":0.1234567,"y":0.1,"w":0.2,"h":0.2}', '{"x":0.9,"y":0,"w":0.2,"h":0.2}',
+    '{"x":-0.000001,"y":0,"w":0.2,"h":0.2}', '{"x":1,"y":0,"w":0.001,"h":0.5}', '[0.1,0.1,0.2,0.2]', '"box"']) {
+    await assert.rejects(insert(bad), (err) => err.code === '23514', bad);
+  }
+  for (const good of ['{"x":0,"y":0,"w":1,"h":1}', '{"x":0.1,"y":0.2,"w":0.001,"h":0.001}', '{"x":0.333334,"y":0,"w":0.666667,"h":1}', '{"x":0.999,"y":0,"w":0.001,"h":0.5}']) {
+    assert.equal((await insert(good)).rowCount, 1, good);
+  }
+  const { id } = (await insert('{"x":0.1,"y":0.1,"w":0.2,"h":0.2}')).rows[0];
+  await assert.rejects(pool.query(`UPDATE annotations SET box = '{"x":0.1,"y":0.1,"w":0,"h":0.2}' WHERE id = $1`, [id]), (err) => err.code === '23514', 'updates are checked too');
+  const constraint = (await pool.query("SELECT convalidated FROM pg_constraint WHERE conname = 'annotations_box_stored_form'")).rows[0];
+  assert.equal(constraint.convalidated, false, 'NOT VALID: existing rows were not rewritten or rejected at upgrade');
 });

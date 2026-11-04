@@ -35,6 +35,7 @@ async function setup() {
   const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
   const { project } = (await owner.post(`/api/workspaces/${ws.id}/projects`, { task: 'Spot belt jams on line 2.', modalities: ['Video', 'Audio'], startingPoint: 'own' })).json();
   const base = `/api/workspaces/${ws.id}/projects/${project.id}`;
+  await owner.post(base, { success: { measure: 'recall', target: '95%', baseline: 'current' } });
   await owner.post(base, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['training'], personalData: 'no' } });
   const add = async (fields) => (await owner.post(`${base}/uploads`, { receipt: receipt({ ws: ws.id, project: project.id, by: owner.id, ...fields }) })).json().upload;
   return { app, owner, ws, base, add };

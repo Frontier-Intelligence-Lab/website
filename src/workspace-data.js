@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { StoreError } from './store/index.js';
 import { signToken } from './lib/tokens.js';
-import { KINDS, SCOPES, TONES, computeIssues, detectKind, kindOf, previewType } from './lib/dataset.js';
+import { KINDS, SCOPES, TONES, computeIssues, countInvalid, detectKind, kindOf, previewType } from './lib/dataset.js';
 
 const PREVIEW_TTL_S = 30 * 60;
 const DOWNLOAD_TTL_S = 5 * 60;
@@ -75,6 +75,8 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
         labels: v.manifest.annotations?.length ?? 0,
         labelSet: v.manifest.labelSet ?? [],
         notes: v.manifest.issueNotes?.length ?? 0,
+        // Approved before a rule existed: shown honestly, never rewritten.
+        warnings: countInvalid(v.manifest),
       })),
       members: data.members.map((m) => ({ id: m.user.id, name: m.user.name, role: m.role })),
     };

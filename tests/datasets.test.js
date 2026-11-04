@@ -48,6 +48,7 @@ async function submit(c, base) {
 async function projectWithData(app, owner) {
   const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
   const { project } = (await owner.post(`/api/workspaces/${ws.id}/projects`, { task: 'Flag damaged boxes on line 2.', modalities: ['Images'], startingPoint: 'own' })).json();
+  await owner.post(`/api/workspaces/${ws.id}/projects/${project.id}`, { success: { measure: 'recall', target: '95%', baseline: 'current' } });
   await owner.post(`/api/workspaces/${ws.id}/projects/${project.id}`, { dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['training'], personalData: 'no' } });
   return { ws, project, base: `/api/workspaces/${ws.id}/projects/${project.id}` };
 }

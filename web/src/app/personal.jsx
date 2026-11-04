@@ -78,7 +78,7 @@ export function Personal() {
             <ul className="ob-list">
               <li><Tile icon="check" tone="green" size="sm" /><div><strong>Projects and testing</strong><span className="ob-muted">Same tools, private to you.</span></div></li>
               <li><Tile icon="study" tone="violet" size="sm" /><div><strong>Research-only datasets</strong><span className="ob-muted">After academic verification. Each license is labelled.</span></div></li>
-              <li><Tile icon="minus" tone="plain" size="sm" /><div><strong>Commercial licenses and financing</strong><span className="ob-muted">Need an organization. Create one when you start a company.</span></div></li>
+              <li><Tile icon="minus" tone="plain" size="sm" /><div><strong>Commercial licenses and financing (planned)</strong><span className="ob-muted">Not available yet. When they open they will need an organization.</span></div></li>
               <li><Tile icon="arrow" tone="blue" size="sm" /><div><strong>Move to an organization later</strong><span className="ob-muted">Projects and their rights records move with you.</span></div></li>
             </ul>
           </div>

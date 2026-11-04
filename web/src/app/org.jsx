@@ -50,7 +50,7 @@ export function Start() {
           <Link to="/setup/invited" className="ob-door">
             <span className="ob-door-head"><Tile icon="mail" tone="amber" size="lg" /></span>
             <span className="ob-door-title">I was invited</span>
-            <p>Join a team, or open a financing application a company shared with your firm.</p>
+            <p>Join a team that invited you. Reviewing financing applications a company shares with your firm is planned, not available yet.</p>
             <span className="ob-door-foot">You get exactly the access the person who invited you chose.</span>
           </Link>
         </div>
@@ -118,7 +118,7 @@ export function OrgCreate() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">Create your organization</h1>
-            <p className="ob-lede">One shared, private home for your company's projects, data, models and financing.</p>
+            <p className="ob-lede">One shared, private home for your company's projects and data. Models and financing are planned.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           <div className="ob-grid">
@@ -203,8 +203,8 @@ export function OrgCreate() {
               <ul className="ob-areas">
                 <li><Tile icon="grid" tone="orange" size="sm" />Projects</li>
                 <li><Tile icon="data" tone="teal" size="sm" />Data</li>
-                <li><Tile icon="layers" tone="blue" size="sm" />Models</li>
-                <li><Tile icon="bank" tone="amber" size="sm" />Financing</li>
+                <li><Tile icon="layers" tone="blue" size="sm" />Models (planned)</li>
+                <li><Tile icon="bank" tone="amber" size="sm" />Financing (planned)</li>
               </ul>
               <div className="ob-org-switch"><span className="avatar" style={{ width: 28, height: 28, fontSize: 11 }}>{initials(user.name)}</span><span>{user.name} · <strong>Owner</strong></span></div>
             </div>
@@ -393,7 +393,7 @@ function OrgTeamManage({ entry, detail }) {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">Who else should be here?</h1>
-            <p className="ob-lede">Invite the people you'll work with. Roles decide who can see data, approve spend and open financing.</p>
+            <p className="ob-lede">Invite the people you'll work with. Roles decide who can see and change data today; approving spend and financing are planned.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           {(detail.joinRequests.length > 0 || detail.workspace.joinByDomain) && <JoinRequests workspaceId={entry.id} requests={detail.joinRequests} />}
