@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import { StoreError } from './errors.js';
 import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
+import { boxNotStoredForm, frozenBoxViolations } from '../lib/box-sql.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
@@ -88,12 +89,15 @@ const annotationRow = (r) => ({
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, uploadId: r.upload_id, labelId: r.label_id,
   startMs: r.start_ms == null ? null : Number(r.start_ms), endMs: r.end_ms == null ? null : Number(r.end_ms),
   box: r.box ?? null, createdBy: r.created_by, createdAt: iso(r.created_at),
+  // Set only by reads that ask Postgres whether the raw box is in 010's stored form (ANNOTATIONS_CHECKED).
+  ...(r.box_not_stored_form ? { storedFormInvalid: true } : {}),
 });
 const noteRow = (r) => ({ key: r.issue_key, note: r.note, createdBy: r.created_by, createdAt: iso(r.created_at) });
 const reviewRow = (r) => r ? {
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, submittedBy: r.submitted_by,
   status: r.status, reviewerId: r.reviewer_id, notes: r.notes, checks: r.checks, snapshot: r.snapshot ?? null,
   decidedAt: iso(r.decided_at), createdAt: iso(r.created_at),
+  ...(r.raw_invalid_box_ids ? { rawInvalidBoxIds: r.raw_invalid_box_ids } : {}),
 } : null;
 const reviewerRow = (r) => r ? {
   username: r.username, name: r.name, role: r.role, enabled: r.enabled,
@@ -102,7 +106,12 @@ const reviewerRow = (r) => r ? {
 const versionRow = (r) => ({
   id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, number: r.number,
   createdBy: r.created_by, manifest: r.manifest, createdAt: iso(r.created_at),
+  ...(r.raw_invalid_box_ids ? { rawInvalidBoxIds: r.raw_invalid_box_ids } : {}),
 });
+
+// Reads that feed Resolve, the submit gate and history warnings ask Postgres for 010's verdict on the raw jsonb,
+// before node-postgres turns its numbers into JavaScript numbers and can hide digits a double cannot hold.
+const ANNOTATIONS_CHECKED = `SELECT *, ${boxNotStoredForm('box')} AS box_not_stored_form FROM annotations`;
 
 export function createPostgresStore(options) {
   const pool = createPostgresPool(options);
@@ -454,7 +463,7 @@ export function createPostgresStore(options) {
     },
     async listAnnotations({ workspaceId, projectId }) {
       if (!isId(workspaceId) || !isId(projectId)) return [];
-      return (await query('SELECT * FROM annotations WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId])).rows.map(annotationRow);
+      return (await query(`${ANNOTATIONS_CHECKED} WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id`, [workspaceId, projectId])).rows.map(annotationRow);
     },
     async createAnnotation({ workspaceId, projectId, uploadId, labelId, startMs = null, endMs = null, box = null, createdBy }) {
       if (!isId(uploadId)) throw new StoreError('not_found');
@@ -527,7 +536,7 @@ export function createPostgresStore(options) {
           // The gate reads files, labels and notes under the lock every write to them takes, so nothing slips in after the check.
           // One transaction client runs one query at a time, so these are sequential awaits.
           const uploads = await query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId], client);
-          const annotations = await query('SELECT * FROM annotations WHERE project_id = $1', [projectId], client);
+          const annotations = await query(`${ANNOTATIONS_CHECKED} WHERE project_id = $1`, [projectId], client);
           const notes = await query('SELECT * FROM issue_notes WHERE project_id = $1', [projectId], client);
           const open = computeIssues({ project: projectRow(project), uploads: uploads.rows.map(uploadRow), annotations: annotations.rows.map(annotationRow), notes: notes.rows.map(noteRow) }).filter(i => i.open).length;
           if (open) throw Object.assign(new StoreError('issues_open'), { open });
@@ -568,7 +577,7 @@ export function createPostgresStore(options) {
     },
     async getReview(reviewId) {
       if (!isId(reviewId)) return null;
-      return reviewRow((await query('SELECT * FROM reviews WHERE id = $1', [reviewId])).rows[0]);
+      return reviewRow((await query(`SELECT *, ${frozenBoxViolations('snapshot')} AS raw_invalid_box_ids FROM reviews WHERE id = $1`, [reviewId])).rows[0]);
     },
     async listProjectReviews({ workspaceId, projectId }) {
       if (!isId(workspaceId) || !isId(projectId)) return [];
@@ -613,7 +622,7 @@ export function createPostgresStore(options) {
     },
     async listDatasetVersions({ workspaceId, projectId }) {
       if (!isId(workspaceId) || !isId(projectId)) return [];
-      return (await query('SELECT * FROM dataset_versions WHERE workspace_id = $1 AND project_id = $2 ORDER BY number', [workspaceId, projectId])).rows.map(versionRow);
+      return (await query(`SELECT *, ${frozenBoxViolations('manifest')} AS raw_invalid_box_ids FROM dataset_versions WHERE workspace_id = $1 AND project_id = $2 ORDER BY number`, [workspaceId, projectId])).rows.map(versionRow);
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {

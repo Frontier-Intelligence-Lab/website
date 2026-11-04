@@ -125,6 +125,8 @@ export function findInvalid({ uploads, annotations, labelSet = [] }) {
     try {
       if (!label) throw invalid('Its label is no longer in the label set.');
       // Compare against what a fresh write of this label would need; whole-file labels must carry no times or box.
+      // Postgres marks a box 010 would refuse before its numbers are read into JavaScript (see box-sql.js).
+      if (a.storedFormInvalid) throw invalid('Its stored box is not in the supported form.');
       const fit = checkAnnotation({ label, upload, startMs: a.startMs, endMs: a.endMs, box: a.box });
       const sameBox = (fit.box == null && a.box == null) || (fit.box != null && isStoredBox(a.box) && ['x', 'y', 'w', 'h'].every((k) => fit.box[k] === a.box[k]));
       if (fit.startMs !== a.startMs || fit.endMs !== a.endMs || !sameBox) throw invalid('Its stored times or box are not in the supported form.');
@@ -135,9 +137,14 @@ export function findInvalid({ uploads, annotations, labelSet = [] }) {
   return { annotations: bad, kinds };
 }
 
-/** Labels and file types in a frozen snapshot or manifest that today's rules would refuse. */
-export const countInvalid = (frozen) => {
-  const found = findInvalid({ uploads: frozen.files ?? [], annotations: frozen.annotations ?? [], labelSet: frozen.labelSet ?? [] });
+/**
+ * Labels and file types in a frozen snapshot or manifest that today's rules would refuse. `storedFormInvalid` lists
+ * label ids whose raw box the database found outside the stored form (rawInvalidBoxIds on a Postgres review or version).
+ */
+export const countInvalid = (frozen, storedFormInvalid = []) => {
+  const raw = new Set(storedFormInvalid);
+  const annotations = (frozen.annotations ?? []).map((a) => (raw.has(a?.id) ? { ...a, storedFormInvalid: true } : a));
+  const found = findInvalid({ uploads: frozen.files ?? [], annotations, labelSet: frozen.labelSet ?? [] });
   return { labels: found.annotations.length, kinds: found.kinds.length };
 };
 

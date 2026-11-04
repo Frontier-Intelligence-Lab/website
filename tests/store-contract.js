@@ -400,6 +400,36 @@ export function runStoreContract(test, makeStore, label) {
     }
   });
 
+  withStore('a stored rule that bypassed the API blocks review in every data mode until it is complete', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    // The store saves what it is given; only the API normalizes. These are rules an older or direct write could leave.
+    const legacy = [
+      { measure: 'recall', target: '   ' }, { measure: 'data_quality', criteria: ' \n ' }, { measure: 'data_quality', criteria: { empty: true } },
+      { measure: 'precision', target: [] }, { measure: 'unknown', target: '95%' }, { measure: 'rubric', criteria: 'x'.repeat(1001) },
+    ];
+    const modes = [{ mode: 'upload', provenance: 'ours' }, { mode: 'license', query: 'retail shelf images' }, { mode: 'commission', brief: 'Collect shelf photos' }];
+    for (const dataSource of modes) {
+      const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: dataSource.mode, task: 'Spot tears', modalities: ['Images'], startingPoint: dataSource.mode === 'upload' ? 'own' : 'need' });
+      const where = { workspaceId: ws.id, projectId: p.id };
+      await store.updateProject({ ...where, patch: { dataSource } });
+      if (dataSource.mode === 'upload') {
+        await store.setLabelSet({ ...where, labelSet: [{ id: 'ok', name: 'ok', scope: 'file', tone: 'plain' }] });
+        const file = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: `${p.id}-f`, sha256: 'b'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'a.png' });
+        await store.createAnnotation({ ...where, uploadId: file.id, labelId: 'ok', createdBy: owner.id });
+      }
+      for (const success of legacy) {
+        await store.updateProject({ ...where, patch: { success } });
+        await assert.rejects(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open === 1, `${dataSource.mode}: ${JSON.stringify(success).slice(0, 60)}`);
+        const stored = await store.getProject(where);
+        assert.equal(stored.status, 'draft');
+        assert.deepEqual(stored.success, success, 'the gate reads the rule; it does not rewrite it');
+      }
+      await store.updateProject({ ...where, patch: { success: { measure: 'data_quality', target: null, criteria: 'Every image has a box for each tear' } } });
+      assert.equal((await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true })).status, 'pending', `${dataSource.mode}: once complete`);
+    }
+  });
+
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {
     await store.upsertReviewer({ username: 'YCInsider', name: 'YC reviewer', role: 'viewer', passwordHash: 'scrypt$a' });
     await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'admin', passwordHash: 'scrypt$b' });

@@ -4,6 +4,7 @@ import { api, uploadFile } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural, roleName } from './shell.jsx';
 import { nextStepKind } from './lifecycle.js';
+import { ruleProblem } from '../../../src/lib/onboarding.js';
 
 const STEPS = ['Goal', "How you'll judge it", 'Data'];
 const MODALITIES = ['Text', 'Documents', 'Images', 'Video', 'Audio', 'Sensor or time series', 'Robot trajectories'];
@@ -532,7 +533,7 @@ function AcademicCard({ entry, profile, onDone }) {
   const [devCode, setDevCode] = useState(null);
   const [error, setError] = useState(null);
   if (profile.academicVerifiedAt) {
-    return <section className="ob-card"><h2>Academic email verified</h2><p className="ob-muted">{profile.academicEmail}. Research-only datasets are available to you.</p></section>;
+    return <section className="ob-card"><h2>Academic email verified</h2><p className="ob-muted">{profile.academicEmail}. Your academic status is recorded. Access to datasets licensed only for non-commercial research is planned, not available yet.</p></section>;
   }
   async function send(event) {
     event.preventDefault();
@@ -628,7 +629,9 @@ export function ProjectHome() {
   const [pending, setPending] = useState(false);
   const [confirmReopen, setConfirmReopen] = useState(false);
 
-  const taskDone = Boolean(project.success);
+  // Complete, not merely present: the same check Resolve and the submit gate apply to the stored rule.
+  const ruleGap = ruleProblem(project.success);
+  const taskDone = !ruleGap;
   const dataDone = Boolean(modelPath ? project.model : project.dataSource);
   const s = project.status;
   const editable = ['draft', 'changes_requested'].includes(s);
@@ -676,7 +679,8 @@ export function ProjectHome() {
 
   // Lifecycle first (see lifecycle.js): frozen projects always keep their reopen, withdraw and version actions.
   const kind = nextStepKind({ status: s, startingPoint: project.startingPoint, role, hasSuccess: taskDone, hasData: dataDone });
-  const noRule = !taskDone && !unsure && <p className="ob-alert">This project has no acceptance rule. {s === 'in_review' ? 'Withdraw it from review to set one.' : manager ? 'Reopen it to set one before the next review.' : 'An owner or admin can reopen it to set one.'}</p>;
+  const fixRule = project.success ? 'complete it' : 'set one';
+  const noRule = !taskDone && !unsure && <p className="ob-alert">{project.success ? 'This project’s acceptance rule is incomplete.' : 'This project has no acceptance rule.'} {s === 'in_review' ? `Withdraw it from review to ${fixRule}.` : manager ? `Reopen it to ${fixRule} before the next review.` : `An owner or admin can reopen it to ${fixRule}.`}</p>;
   const needsFiles = mode === 'upload' && uploads.length === 0;
   const steps_ = {
     'book-call': {
@@ -689,7 +693,9 @@ export function ProjectHome() {
       </>,
     },
     'wait-call': { title: 'Waiting for a scoping call', body: 'Someone on the team is arranging a call with Valcairn.' },
-    'set-rule': { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` },
+    'set-rule': project.success
+      ? { title: 'Finish your acceptance rule', body: `${ruleGap} Review needs a complete rule.`, to: `${base}/success` }
+      : { title: 'Set your acceptance rule', body: 'Decide what good enough means before any training.', to: `${base}/success` },
     'describe-model': { title: 'Describe your model and tests', body: 'Where the model is, its license and the examples to test it on.', to: `${base}/model` },
     'record-data': { title: 'Record your data and its rights', body: 'Where it came from and how it may be used.', to: `${base}/data` },
     submit: {

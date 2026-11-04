@@ -51,14 +51,22 @@ export function validateProjectStart(raw) {
 export const METRIC_MEASURES = ['recall', 'precision', 'accuracy', 'success_rate'];
 export const WRITTEN_MEASURES = ['rubric', 'data_quality'];
 
+// Longest target and criteria a rule may hold. New input is trimmed and cut to these (validateSuccess); a stored
+// rule longer than this did not come through the API and is incomplete until it is saved again.
+const TARGET_MAX = 40;
+const CRITERIA_MAX = 1000;
+const filled = (value, max) => typeof value === 'string' && value.trim() !== '' && value.length <= max;
+
 /**
- * Whether an acceptance rule says what "good enough" means: a target for a metric, or written criteria for a
- * rubric or a data-quality bar. Review requires one (see computeIssues), and saving checks the same thing.
+ * Whether an acceptance rule says what "good enough" means: a known measure with a target for a metric, or written
+ * criteria for a rubric or a data-quality bar, each nonblank text within its limit. Saving, Resolve and the submit
+ * gate all use this, so a stored rule that bypassed the API is held to the same bar. It only reads the rule.
  */
 export function ruleProblem(success) {
-  if (!success || typeof success !== 'object') return 'Set how this work will be judged.';
-  if (WRITTEN_MEASURES.includes(success.measure)) return success.criteria ? null : 'Write the criteria reviewers will judge against.';
-  return success.target ? null : 'Say what score is good enough, for example 95%.';
+  if (!success || typeof success !== 'object' || Array.isArray(success)) return 'Set how this work will be judged.';
+  if (WRITTEN_MEASURES.includes(success.measure)) return filled(success.criteria, CRITERIA_MAX) ? null : 'Write the criteria reviewers will judge against.';
+  if (!METRIC_MEASURES.includes(success.measure)) return 'Choose how this work will be judged.';
+  return filled(success.target, TARGET_MAX) ? null : 'Say what score is good enough, for example 95%.';
 }
 
 function validateSuccess(raw) {
@@ -67,8 +75,8 @@ function validateSuccess(raw) {
   const written = WRITTEN_MEASURES.includes(measure);
   return {
     measure,
-    target: written ? null : text(s.target, 40) || null,
-    criteria: written ? text(s.criteria, 1000) || null : null,
+    target: written ? null : text(s.target, TARGET_MAX) || null,
+    criteria: written ? text(s.criteria, CRITERIA_MAX) || null : null,
     baseline: oneOf(s.baseline, ['current', 'off_the_shelf', 'none']) ?? 'none',
     runsOn: oneOf(s.runsOn, ['cloud', 'servers', 'device', 'later']) ?? 'later',
     device: text(s.device, 120) || null,

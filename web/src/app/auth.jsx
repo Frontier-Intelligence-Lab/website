@@ -10,7 +10,7 @@ function emailHint(email) {
   const domain = email.split('@')[1]?.toLowerCase() ?? '';
   if (!domain.includes('.')) return { tone: 'plain', text: 'Use a work email to find your team faster.' };
   if (PERSONAL.includes(domain)) return { tone: 'violet', text: 'Personal email. Fine for a personal workspace, and you can still create an organization.' };
-  if (/\.(edu|ac\.[a-z]{2})$/.test(domain)) return { tone: 'violet', text: 'Academic email. You can verify it later for research-only datasets.' };
+  if (/\.(edu|ac\.[a-z]{2})$/.test(domain)) return { tone: 'violet', text: 'Academic email. You can verify it later to record your academic status; research-only datasets are planned.' };
   return { tone: 'blue', text: `Work email. After you confirm it, we check whether ${domain} already has an organization here.` };
 }
 

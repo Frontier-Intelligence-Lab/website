@@ -76,7 +76,7 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
         labelSet: v.manifest.labelSet ?? [],
         notes: v.manifest.issueNotes?.length ?? 0,
         // Approved before a rule existed: shown honestly, never rewritten.
-        warnings: countInvalid(v.manifest),
+        warnings: countInvalid(v.manifest, v.rawInvalidBoxIds),
       })),
       members: data.members.map((m) => ({ id: m.user.id, name: m.user.name, role: m.role })),
     };

@@ -64,7 +64,7 @@ test('a stored box must be exactly { x, y, w, h }: extra or missing keys are inv
 
 test('an acceptance rule needs a target for a metric, or written criteria for a rubric or a data-quality bar', () => {
   assert.match(ruleProblem(null), /how this work will be judged/);
-  assert.match(ruleProblem({}), /score is good enough/);
+  assert.match(ruleProblem({}), /Choose how this work will be judged/, 'a stored rule with no known measure is incomplete');
   assert.match(ruleProblem({ measure: 'recall', target: null }), /score is good enough/);
   assert.equal(ruleProblem({ measure: 'recall', target: '95%' }), null);
   assert.match(ruleProblem({ measure: 'rubric', target: '95%' }), /criteria/);
@@ -73,4 +73,47 @@ test('an acceptance rule needs a target for a metric, or written criteria for a 
   const incomplete = computeIssues({ project: { ...project, success: { measure: 'recall', target: null } }, uploads: [png], annotations: [], notes: [] }).find((i) => i.key === 'acceptance');
   assert.equal(incomplete.blocking, true);
   assert.match(incomplete.title, /incomplete/);
+});
+
+// Stored rules that never came through validateSuccess: the shared check holds them to the same bar, read only.
+const LEGACY_RULES = [
+  ['blank target', { measure: 'recall', target: '   ' }],
+  ['blank criteria', { measure: 'data_quality', criteria: ' \n ' }],
+  ['criteria as an object', { measure: 'data_quality', criteria: { empty: true } }],
+  ['target as an array', { measure: 'precision', target: [] }],
+  ['target as a number', { measure: 'accuracy', target: 95 }],
+  ['unknown measure', { measure: 'unknown', target: '95%' }],
+  ['missing measure', { target: '95%' }],
+  ['criteria on a metric', { measure: 'recall', criteria: 'looks right' }],
+  ['target on a written measure', { measure: 'rubric', target: '95%' }],
+  ['overlong criteria', { measure: 'rubric', criteria: 'x'.repeat(1001) }],
+  ['overlong target', { measure: 'recall', target: '9'.repeat(41) }],
+  ['rule as an array', []],
+];
+
+test('a stored acceptance rule is checked for measure, field type, nonblank text and length', () => {
+  for (const [name, rule] of LEGACY_RULES) {
+    const before = JSON.stringify(rule);
+    assert.ok(ruleProblem(rule), name);
+    assert.equal(JSON.stringify(rule), before, `${name}: only read, never normalized`);
+    const issue = computeIssues({ project: { ...project, success: rule }, uploads: [png], annotations: [], notes: [] }).find((i) => i.key === 'acceptance');
+    assert.equal(issue?.blocking, true, `${name}: blocks review`);
+  }
+  // The limits are the API's own: the longest text the API saves is complete, and padding is not blankness.
+  assert.equal(ruleProblem({ measure: 'rubric', criteria: 'x'.repeat(1000) }), null);
+  assert.equal(ruleProblem({ measure: 'recall', target: '9'.repeat(40) }), null);
+  assert.equal(ruleProblem({ measure: 'recall', target: ' 95% ' }), null);
+});
+
+test('a box the database marks outside the stored form is invalid, in drafts and in frozen history', () => {
+  const labelSet = [{ id: 'b', name: 'tear', scope: 'box', tone: 'plain' }];
+  // What node-postgres returns for a raw 0.100000000000000001: a JavaScript 0.1 that looks canonical.
+  const box = { id: 'a1', uploadId: png.id, labelId: 'b', startMs: null, endMs: null, box: { x: 0.1, y: 0, w: 0.5, h: 0.5 } };
+  assert.equal(findInvalid({ uploads: [png], annotations: [box], labelSet }).annotations.length, 0);
+  assert.equal(findInvalid({ uploads: [png], annotations: [{ ...box, storedFormInvalid: true }], labelSet }).annotations.length, 1);
+  const frozen = { files: [png], annotations: [box], labelSet };
+  const before = JSON.stringify(frozen);
+  assert.deepEqual(countInvalid(frozen), { labels: 0, kinds: 0 });
+  assert.deepEqual(countInvalid(frozen, ['a1']), { labels: 1, kinds: 0 });
+  assert.equal(JSON.stringify(frozen), before, 'the frozen record is not rewritten');
 });

@@ -927,3 +927,69 @@ withStore('the operator query lists exactly the rows that make VALIDATE CONSTRAI
   await pool.query('ALTER TABLE annotations DROP CONSTRAINT annotations_box_stored_form');
   await pool.query(`ALTER TABLE annotations ADD CONSTRAINT annotations_box_stored_form ${BOX_010}`);
 });
+
+test('the stored-form check the app runs in Postgres is migration 010 word for word', async () => {
+  const { boxStoredForm } = await import('../src/lib/box-sql.js');
+  const squash = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const fromMigration = BOX_010.match(/box IS NULL OR (CASE[\s\S]*END)\s*\)\s*NOT VALID/)[1];
+  assert.equal(squash(boxStoredForm('box')), squash(fromMigration));
+});
+
+withStore('a raw box with digits a double cannot hold is caught before JavaScript rounds it, and frozen history is flagged', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Precision', task: 'Spot tears', modalities: ['Images'], startingPoint: 'own' });
+  const where = { workspaceId: ws.id, projectId: p.id };
+  await store.updateProject({ ...where, patch: { success: { measure: 'recall', target: '95%' }, dataSource: { mode: 'upload', provenance: 'ours' } } });
+  await store.setLabelSet({ ...where, labelSet: [{ id: 'box', name: 'tear', scope: 'box', tone: 'orange' }] });
+  const png = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'hp-p', sha256: 'f'.repeat(64), sizeBytes: 5, contentType: 'image/png', filename: 'p.png' });
+  const RAW = '{"x":0.100000000000000001,"y":0,"w":0.5,"h":0.5}';
+  // 010 refuses this today, so it can only be a row stored before the upgrade.
+  await assert.rejects(pool.query('INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by) VALUES ($1, $2, $3, $4, $5::jsonb, $6)', [ws.id, p.id, png.id, 'box', RAW, owner.id]), (err) => err.code === '23514');
+  const legacy = await withoutBoxConstraint(pool, async () => (await pool.query('INSERT INTO annotations (workspace_id, project_id, upload_id, label_id, box, created_by) VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING id', [ws.id, p.id, png.id, 'box', RAW, owner.id])).rows[0].id);
+  assert.equal((await pool.query(VIOLATIONS_SQL)).rows.map((r) => r.id).includes(legacy), true, 'the operator query lists it');
+
+  const listed = (await store.listAnnotations(where)).find((a) => a.id === legacy);
+  assert.equal(listed.box.x, 0.1, 'node-postgres reads it as 0.1, which looks canonical');
+  assert.equal(listed.storedFormInvalid, true, 'Postgres says what 010 says about the raw value');
+  // Two issues: the box, and the PNG, which an invalid box does not count as labelling.
+  await assert.rejects(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }), (err) => err.code === 'issues_open' && err.open === 2);
+  assert.equal((await pool.query('SELECT box::text FROM annotations WHERE id = $1', [legacy])).rows[0].box, '{"h": 0.5, "w": 0.5, "x": 0.100000000000000001, "y": 0}', 'the raw row is untouched');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM reviews WHERE project_id = $1', [p.id])).rows[0].n, 0, 'no snapshot was taken');
+
+  // Repaired through the normal path, review goes through; then history made before this check carries the raw value.
+  await store.deleteAnnotation({ ...where, annotationId: legacy });
+  const fresh = await store.createAnnotation({ ...where, uploadId: png.id, labelId: 'box', box: { x: 0.1, y: 0, w: 0.5, h: 0.5 }, createdBy: owner.id });
+  const review = await store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true });
+  assert.deepEqual((await store.getReview(review.id)).rawInvalidBoxIds, []);
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+  const version = await store.createDatasetVersion({ ...where, createdBy: owner.id });
+  assert.deepEqual((await store.listDatasetVersions(where))[0].rawInvalidBoxIds, []);
+  await pool.query(`UPDATE reviews SET snapshot = jsonb_set(snapshot, '{annotations,0,box}', $2::jsonb) WHERE id = $1`, [review.id, RAW]);
+  await pool.query(`UPDATE dataset_versions SET manifest = jsonb_set(manifest, '{annotations,0,box}', $2::jsonb) WHERE id = $1`, [version.id, RAW]);
+  const text = async () => (await pool.query('SELECT r.snapshot::text AS s, v.manifest::text AS m FROM reviews r, dataset_versions v WHERE r.id = $1 AND v.id = $2', [review.id, version.id])).rows[0];
+  const before = await text();
+  const { countInvalid } = await import('../src/lib/dataset.js');
+  const [stored] = await store.listDatasetVersions(where);
+  assert.deepEqual(stored.rawInvalidBoxIds, [fresh.id]);
+  assert.deepEqual(countInvalid(stored.manifest, stored.rawInvalidBoxIds), { labels: 1, kinds: 0 });
+  assert.deepEqual(countInvalid(stored.manifest), { labels: 0, kinds: 0 }, 'without the database verdict the rounded value looks fine');
+  const reread = await store.getReview(review.id);
+  assert.deepEqual(countInvalid(reread.snapshot, reread.rawInvalidBoxIds), { labels: 1, kinds: 0 });
+  assert.deepEqual(await text(), before, 'warnings never rewrite the snapshot or manifest');
+});
+
+withStore('an invalid rule written while submit waits on the lock is seen by the gate', async (store, pool) => {
+  const { owner, p, where } = await labelledProject(store);
+  let submit;
+  await holdingProject(pool, p.id, async (client) => {
+    await client.query(`UPDATE projects SET success = '{"measure":"recall","target":"   "}' WHERE id = $1`, [p.id]);
+    submit = watch(store.submitForReview({ ...where, submittedBy: owner.id, requireResolved: true }));
+    await pause(150);
+    assert.equal(submit.done, false, 'submit waits for the rule write');
+  });
+  const result = await submit.result;
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'issues_open');
+  assert.equal((await store.getProject(where)).status, 'draft');
+});

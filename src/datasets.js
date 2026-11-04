@@ -150,7 +150,7 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
     // Staff decide on the snapshot taken at submission; that is also what a dataset version will contain.
     const reviewed = review.snapshot ?? { task: project.task, success: project.success, dataSource: project.dataSource, files: [] };
     const duplicates = uploads.filter((u) => u.duplicateOf).length;
-    const { snapshot, ...rest } = review;
+    const { snapshot, rawInvalidBoxIds, ...rest } = review;
     return {
       review: rest,
       workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
@@ -160,7 +160,7 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
       labelSet: reviewed.labelSet ?? [],
       annotations: reviewed.annotations ?? [],
       issueNotes: reviewed.issueNotes ?? [],
-      warnings: countInvalid(reviewed),
+      warnings: countInvalid(reviewed, rawInvalidBoxIds),
       uploads: reviewed.files.map(({ objectKey, ...u }) => {
         const type = previewType(u.contentType);
         return {
