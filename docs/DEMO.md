@@ -1,6 +1,6 @@
 # YC / Speedrun demo runbook
 
-A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace. Everything shown in part one executes. Part two trains, evaluates and exports a model on a GPU machine and needs the runner and its handlers (PRs 14 and 16); cloud deployment and financing are labelled as planned.
+A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace. Everything shown executes, except training, deployment and financing, which the app labels as planned.
 
 ## Before the demo (once)
 
@@ -26,39 +26,6 @@ A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace.
 | 8 | "The customer fixes it; nothing changes silently." | Profile A sees the reviewer notes. Set personal data to **No**, resend from **Resolve**. Profile B ticks all five checks → **Approve**. |
 | 9 | "Version 1 is the exact reviewed files, labels and rights." | Profile A → **Approve version 1**. **Versions** shows v1, its manifest and per-file downloads that keep working after **Reopen**, which voids approval for future versions. |
 | 10 | "Training, evaluation and deployment are next." | Point at the **Planned** labels. Nothing runs yet; say so. |
-
-## Part two: train on your own machine, evaluate and run it locally (about 5 minutes)
-
-This part needs a machine with an NVIDIA GPU, Docker with GPU support, Ollama and Python 3.11, and the Valcairn Runner and its training and export handlers (`services/runner`, PRs 14 and 16). Until those are merged this branch only queues and records jobs. Training a small model on the 252 synthetic conversations takes about a minute on one recent GPU.
-
-### Before the demo (once)
-
-1. Start web with `MODEL_CATALOG_FILE=docs/model-catalog.demo.json` (one small Apache-2.0 model). Start ingest with file storage, for example `INGEST_STORAGE=file:///…/.local/objects`.
-2. Seed a training-ready synthetic workspace, using the same storage directory:
-   ```bash
-   DATABASE_URL=postgresql://<user>@127.0.0.1:5432/valcairn_demo node scripts/seed-train-demo.js --model qwen3-0.6b --objects .local/objects --disposable-db
-   ```
-   It writes only to a disposable local database: `DATABASE_URL` must be set (it never falls back to the in-memory store), point at this machine and name a database containing `demo`, `test` or `qa`, and `--disposable-db` confirms it. It refuses before writing anything otherwise. Its dataset review is a synthetic fixture, recorded as approved by the seed script and not by a person. It prints the workspace path and the demo owner's password once. It writes `acme-support.synthetic.jsonl`: 252 support conversations for three fictional robots, approved as dataset version 1 with a rights record that allows training. It also creates an enhance plan approved for **Your Valcairn Runner**.
-3. On the GPU machine, in `services/runner`: `docker build -t valcairn-train:0.1 images/train` and `docker pull ghcr.io/ggml-org/llama.cpp@sha256:e414b8b4a5b8618b13292095cde7bd6520b01124c6d1c3b800c4b0382a2851cb`.
-4. Rehearse once. The first training run fetches the base weights (about 1.5 GB), and the first export converts the base model. Both are cached for the live run.
-
-### The walkthrough
-
-| # | Say | Do |
-| --- | --- | --- |
-| 1 | "Their machine, their GPU. We never connect to it; it calls us." | `/w/<slug>/compute` → **Link a machine**, name it, **Link and show key**. Save the key to a file and start the runner with the command shown. The runner turns **Online** and lists the GPU, Docker with GPU support and the local Ollama models. |
-| 2 | "Every job runs in a sandbox with no network." | **Run sandbox check**. Open **Details**: it ran with network `none` and read the GPU from inside the container. |
-| 3 | "This plan was approved, with its data rights, before anything ran." | **Approved plans for your runner** → **Start training on …**. The timeline shows the dataset downloaded and checked against its version hash, then training, with the loss curve filling in. |
-| 4 | "We hold out examples it never sees, and compare with the unchanged base model." | When it finishes, point at **Held-out loss** and **Held-out answers** for base against tuned, then at the two held-out examples. In our rehearsal: loss 4.47 → 0.08 and token F1 21.7% → 99.1% on 24 held-out examples; the base model invented a 12-month warranty where the true answer is 36 months. Read out your own run's numbers, not these. They show adaptation to this narrow synthetic task (252 closely related conversations, 24 withheld), not general model quality. |
-| 5 | "It ships as a file they own, running locally." | **Export to Ollama on this runner**. When it finishes: the Ollama model name, the GGUF hash and size, and the speed of tuned against base. On the runner machine, `ollama run valcairn-<id>` answers in the support team's format. |
-
-Say plainly what is not shown: multi-GPU training runs through `accelerate` but was only exercised on one GPU; preference tuning and reinforcement learning steps are skipped; re-evaluating a finished run later is planned.
-
-### If something fails live
-
-- **The runner stays Waiting:** the key file or `VALCAIRN_URL` is wrong. The runner logs `Valcairn refused this runner` for a bad or revoked key.
-- **Training fails with `sandbox_unavailable`:** Docker is not running, or GPU support in Docker is off (`docker run --rm --gpus all ubuntu:24.04 nvidia-smi` should list the GPU).
-- **`dataset_error`:** the seeded file is not in the ingest storage directory. Seed again with the same `--objects` path that ingest uses.
 
 ## Reset between runs
 
