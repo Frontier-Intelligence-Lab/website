@@ -777,3 +777,98 @@ test('validateCall decides from the run’s own state and newRun refuses an empt
   assert.match(run.policy.policyHash, /^[0-9a-f]{64}$/);
   assert.deepEqual(newGrant(run).scope, SCOPE);
 });
+
+test('Approve and Decline act on the exact draft revision a screen showed, in one transaction: a stale draft screen cannot rewind a completed, kept, stopped, interrupted, failed, approved or running run, replace its grant, or write anything', async (t) => {
+  const gw = await fakeGateway(t, [note('n1')]);
+  const ollama = await fakeOllama(t, [turn(call('search_notes', { query: 'deploy step' })), turn(call('read_note', { id: 'n1' })), turn(call('finish_draft', { answer: 'Checklist from n1.', citations: ['n1'] }))]);
+  const backend = memoryBackend();
+  const ledger = openLedger({ scopeKey: scopeKeyOf('ws-1', 'user-1'), backend });
+  const draft = await ledger.createRun(await newRun({ scope: SCOPE, scopeKey: ledger.scopeKey, model: MODEL, question: 'q', gateway: gw.origin, runtime: ollama.origin }));
+  const staleScreen = { ...draft }; // tab B rendered the draft at revision 0 and keeps showing that view
+  // Tab A approves through the page's entry point, runs the task to completion and keeps the draft.
+  const { run: approved, grant } = await ledger.approveDraft(draft.id, draft.revision, newGrant);
+  assert.deepEqual([approved.status, approved.revision, grant.runId, grant.revokedAt, grant.policyHash], ['approved', 1, draft.id, null, draft.policy.policyHash]);
+  assert.deepEqual([await ledger.run(draft.id), await ledger.grant(draft.id)], [approved, grant], 'both records landed together');
+  const memory = createMemoryClient({ origin: gw.origin, key: KEY, scope: SCOPE });
+  assert.equal((await runAgent({ run: approved, ledger, runtime: createRuntime(ollama.origin), memory })).status, 'completed');
+  assert.equal((await keepLocalDraft({ ledger, proposal: await ledger.proposal(draft.id), snapshots: await ledger.snapshots(draft.id), memory, scope: SCOPE })).kept, true);
+  memory.close();
+  const records = async () => JSON.stringify([await ledger.run(draft.id), await ledger.grant(draft.id), await ledger.steps(draft.id), await ledger.snapshots(draft.id), await ledger.proposal(draft.id)]);
+  const traffic = () => [ollama.requests.length, gw.seen.length];
+  // Tab B's Approve and Decline on its stale screen: refused before any write; nothing ran; every byte is as it was;
+  // and the screen, reloaded from the stored record, no longer offers Approve.
+  const refusedStale = async (why) => {
+    const before = await records(); const quiet = traffic();
+    await assert.rejects(ledger.approveDraft(staleScreen.id, staleScreen.revision, newGrant), (e) => e instanceof LedgerError && e.kind === 'not_draft', `${why}: approve`);
+    await assert.rejects(ledger.declineDraft(staleScreen.id, staleScreen.revision), (e) => e instanceof LedgerError && e.kind === 'not_draft', `${why}: decline`);
+    assert.equal(await records(), before, `${why}: run, grant, steps, snapshots and proposal are byte-identical`);
+    assert.deepEqual(traffic(), quiet, `${why}: no model or gateway call`);
+    assert.notEqual(recoveryAction(await ledger.run(draft.id)).action, 'approve', `${why}: the refreshed screen offers no Approve`);
+  };
+  await refusedStale('completed and kept');
+  await assert.rejects(ledger.approveDraft(staleScreen.id, staleScreen.revision, newGrant), /now completed/, 'the refusal names the current state');
+  assert.deepEqual([(await ledger.run(draft.id)).executions, (await ledger.steps(draft.id)).at(-1).attempt, (await ledger.proposal(draft.id)).state], [1, 1, 'accepted'], 'one execution, first attempts, still kept');
+  // Every other stored state a stale screen can meet, set as fixtures (the page never writes these directly).
+  for (const [patch, why] of [
+    [{ status: 'stopped', finishedAt: '2026-11-04T12:00:00Z' }, 'stopped'],
+    [{ status: 'interrupted' }, 'interrupted'],
+    [{ status: 'failed', failure: { kind: 'unreachable', source: 'runtime', message: 'dropped', retryable: true } }, 'failed, retryable'],
+    [{ status: 'approved' }, 'approved but not started'],
+  ]) { await ledger.updateRun(draft.id, patch); await refusedStale(why); }
+  // A revoked grant stays revoked: the stale Approve does not replace it with a fresh one.
+  await ledger.putGrant({ ...grant, revokedAt: '2026-11-04T13:00:00Z' });
+  await refusedStale('approved with a revoked grant');
+  assert.equal((await ledger.grant(draft.id)).revokedAt, '2026-11-04T13:00:00Z');
+  // Running under another tab's execution: refused, and that execution's own guarded writes still land afterwards.
+  await ledger.updateRun(draft.id, { status: 'running', executionId: 'tab-a' });
+  await refusedStale('running elsewhere');
+  const step = { runId: draft.id, stepIndex: 99, kind: 'tool', name: 'probe', state: 'done', attempt: 1 };
+  assert.deepEqual(await ledger.execution(draft.id, 'tab-a').putStep(step), step, 'the owning execution was not disturbed');
+  assert.deepEqual([(await ledger.run(draft.id)).status, (await ledger.run(draft.id)).executionId], ['running', 'tab-a']);
+  // Deleted meanwhile: refused as gone, and nothing is recreated.
+  await ledger.clear();
+  await assert.rejects(ledger.approveDraft(staleScreen.id, staleScreen.revision, newGrant), (e) => e.kind === 'not_found');
+  await assert.rejects(ledger.declineDraft(staleScreen.id, staleScreen.revision), (e) => e.kind === 'not_found');
+  assert.deepEqual([await ledger.runs(), await ledger.grant(draft.id)], [[], null]);
+  assert.match(explainAgent({ kind: 'not_draft' }), /no longer a draft/);
+  assert.match(explainAgent({ kind: 'stale' }), /review it again/);
+});
+
+test('a current draft approves once, with its grant in the same transaction; Decline bumps the revision so a stale Approve is refused while the newly rendered draft can be approved; another ledger cannot reach it; a failed second write leaves no grant', async (t) => {
+  const gw = await fakeGateway(t, []);
+  const ollama = await fakeOllama(t, []);
+  const backend = memoryBackend();
+  const ledger = openLedger({ scopeKey: scopeKeyOf('ws-1', 'user-1'), backend });
+  const theirs = openLedger({ scopeKey: scopeKeyOf('ws-2', 'user-1'), backend });
+  const fresh = async () => ledger.createRun(await newRun({ scope: SCOPE, scopeKey: ledger.scopeKey, model: MODEL, question: 'q', gateway: gw.origin, runtime: ollama.origin }));
+  // Decline, then approve: tab A declines the draft it sees (revision 0 → 1); tab B's screen still shows revision 0.
+  const d1 = await fresh();
+  const declined = await ledger.declineDraft(d1.id, d1.revision);
+  assert.deepEqual([declined.status, declined.revision, typeof declined.declinedAt], ['draft', 1, 'string']);
+  assert.equal(await ledger.grant(d1.id), null, 'Decline never touches grants');
+  await assert.rejects(ledger.approveDraft(d1.id, d1.revision, newGrant), (e) => e instanceof LedgerError && e.kind === 'stale', 'the stale screen cannot approve');
+  await assert.rejects(ledger.declineDraft(d1.id, d1.revision), (e) => e.kind === 'stale');
+  assert.deepEqual([await ledger.run(d1.id), await ledger.grant(d1.id)], [declined, null], 'nothing changed');
+  const { run: later, grant } = await ledger.approveDraft(d1.id, declined.revision, newGrant);
+  assert.deepEqual([later.status, later.revision, later.declinedAt, grant.runId], ['approved', 2, declined.declinedAt, d1.id], 'the newly rendered revision is approvable; the earlier decline stays on record');
+  // Repeated clicks on one screen: the first lands, the second finds no draft and writes nothing. (IndexedDB runs
+  // overlapping read-write transactions one after another, so the second click always sees the first's result.)
+  const d2 = await fresh();
+  const first = await ledger.approveDraft(d2.id, d2.revision, newGrant);
+  await assert.rejects(ledger.approveDraft(d2.id, d2.revision, newGrant), (e) => e.kind === 'not_draft');
+  await assert.rejects(ledger.declineDraft(d2.id, d2.revision), (e) => e.kind === 'not_draft');
+  assert.deepEqual([await ledger.run(d2.id), await ledger.grant(d2.id)], [first.run, first.grant], 'one approval, one grant, the same approvedAt');
+  assert.equal(first.run.executions ?? 0, 0, 'approval alone starts nothing');
+  // Another workspace's ledger over the same database cannot approve or decline it.
+  const d3 = await fresh();
+  await assert.rejects(theirs.approveDraft(d3.id, d3.revision, newGrant), (e) => e.kind === 'not_found');
+  await assert.rejects(theirs.declineDraft(d3.id, d3.revision), (e) => e.kind === 'not_found');
+  assert.deepEqual([await ledger.run(d3.id), await ledger.grant(d3.id)], [d3, null]);
+  // All or nothing: if the run write fails after the grant write, the transaction leaves no grant behind.
+  const brokenRuns = { transact: (names, mode, fn) => backend.transact(names, mode, (stores) => fn(mode === 'readwrite' && stores.grants ? { ...stores, runs: { ...stores.runs, put: async () => { throw new LedgerError('storage_failed', 'quota'); } } } : stores)) };
+  const broken = openLedger({ scopeKey: ledger.scopeKey, backend: brokenRuns });
+  await assert.rejects(broken.approveDraft(d3.id, d3.revision, newGrant), (e) => e.kind === 'storage_failed');
+  assert.deepEqual([await ledger.run(d3.id), await ledger.grant(d3.id)], [d3, null], 'no grant-only write');
+  assert.equal((await ledger.approveDraft(d3.id, d3.revision, newGrant)).run.status, 'approved', 'the draft is still approvable afterwards');
+  assert.deepEqual([ollama.requests.length, gw.seen.length], [0, 0], 'approval and decline never call the model or the gateway');
+});
