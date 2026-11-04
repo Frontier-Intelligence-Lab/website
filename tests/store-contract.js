@@ -434,13 +434,14 @@ export function runStoreContract(test, makeStore, label) {
     const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
     const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
     const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'other', ownerId: owner.id });
-    const first = await store.requestModelPull({ workspaceId: ws.id, modelId: 'qwen3-8b', requestedBy: owner.id });
+    // The store records any well-formed model id; whether it is in the catalog is the route's concern.
+    const first = await store.requestModelPull({ workspaceId: ws.id, modelId: 'example-base', requestedBy: owner.id });
     assert.equal(first.status, 'requested');
-    assert.equal((await store.requestModelPull({ workspaceId: ws.id, modelId: 'qwen3-8b', requestedBy: owner.id })).id, first.id);
+    assert.equal((await store.requestModelPull({ workspaceId: ws.id, modelId: 'example-base', requestedBy: owner.id })).id, first.id);
     assert.equal((await store.listModelPulls(ws.id)).length, 1);
     assert.equal((await store.listModelPulls(other.id)).length, 0);
 
-    const plan = { name: 'returns-assistant', baseModelId: 'qwen3-8b', datasets: [], steps: ['sft'], compute: null, spendCapUsd: null };
+    const plan = { name: 'returns-assistant', baseModelId: 'example-base', datasets: [], steps: ['sft'], compute: null, spendCapUsd: null };
     const run = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: plan });
     assert.equal(run.status, 'draft');
     assert.equal(await store.getEnhanceRun({ workspaceId: other.id, runId: run.id }), null, 'scoped to its workspace');

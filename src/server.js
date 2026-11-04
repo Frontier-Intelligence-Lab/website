@@ -7,6 +7,7 @@ const app = await buildApp({ config, logger: { level: config.logLevel } });
 app.log.info({
   contactDelivery: config.contactDelivery,
   reviewersConfigured: config.reviewers.length,
+  modelCatalog: config.modelCatalog.length,
   cookieSecure: config.cookieSecure,
   trustProxy: config.trustProxy,
 }, 'valcairn site starting');
