@@ -298,6 +298,15 @@ test('export and evaluation name one finished training run of the same plan on t
   const res = await queue(runner.id, { kind: 'export', enhanceRunId: plan.id, trainJobId: train.id });
   assert.equal(res.statusCode, 200, res.body);
   assert.deepEqual(res.json().job.spec.source, { trainJobId: train.id, adapterSha256: sha, adapterLocation: 'jobs/x/out/adapter' });
+  // A training run that reported its manifest has it frozen into the export as well.
+  const train2 = (await queue(runner.id, { kind: 'train', enhanceRunId: plan.id })).json().job;
+  const leased2 = (await runnerApi.post('/api/runner/lease')).json().job;
+  assert.equal(leased2.id, res.json().job.id, 'the export queued first is leased first');
+  await runnerApi.post(`/api/runner/jobs/${leased2.id}/finish`, { leaseToken: leased2.leaseToken, outcome: 'failed', failure: 'runtime_error' });
+  const leased3 = (await runnerApi.post('/api/runner/lease')).json().job;
+  await runnerApi.post(`/api/runner/jobs/${train2.id}/finish`, { leaseToken: leased3.leaseToken, outcome: 'succeeded', result: { adapter: { sha256: sha, location: 'jobs/y/out/adapter' }, trainingManifestSha256: 'd'.repeat(64) } });
+  const withManifest = await queue(runner.id, { kind: 'export', enhanceRunId: plan.id, trainJobId: train2.id });
+  assert.equal(withManifest.json().job.spec.source.trainingManifestSha256, 'd'.repeat(64));
   assert.equal((await owner.get(`${base}/jobs/${res.json().job.id}`)).json().job.kind, 'export');
 });
 

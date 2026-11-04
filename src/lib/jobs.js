@@ -131,7 +131,9 @@ export function buildJobSpec({ kind, run, catalog, trainJob = null }) {
   if (kind !== 'train') {
     const adapter = trainJob?.result?.adapter;
     if (!trainJob || trainJob.status !== 'succeeded' || !/^[0-9a-f]{64}$/.test(adapter?.sha256 ?? '')) return { errors: { trainJobId: 'Choose a finished training run of this plan.' } };
-    source = { trainJobId: trainJob.id, adapterSha256: adapter.sha256, adapterLocation: adapter.location ?? null };
+    const manifest = trainJob.result.trainingManifestSha256;
+    // The training manifest binds the adapter to its base model, data, split and settings; the runner checks it on export.
+    source = { trainJobId: trainJob.id, adapterSha256: adapter.sha256, adapterLocation: adapter.location ?? null, ...(/^[0-9a-f]{64}$/.test(manifest ?? '') && { trainingManifestSha256: manifest }) };
   }
   return {
     values: {
