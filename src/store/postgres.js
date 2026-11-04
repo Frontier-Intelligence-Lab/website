@@ -240,17 +240,20 @@ export function createPostgresStore(options) {
     LEFT JOIN LATERAL (SELECT * FROM device_reports WHERE device_id = d.id ORDER BY created_at DESC, id DESC LIMIT 1) r ON true`;
   // A lease that ran out without word from the runner: retried while attempts remain, honoured if cancel was asked.
   // The CASEs read the row's values from before this UPDATE.
-  const expireLeases = async (scope, values, client = pool) => {
+  const LEASE_SCOPES = { id: 'id', workspace: 'workspace_id', runner: 'runner_id' };
+  const expireLeases = async (scope, value, client = pool) => {
+    const column = LEASE_SCOPES[scope];
+    if (!column) throw new Error('Unknown lease scope');
     await query(`UPDATE jobs SET
         status = CASE WHEN status = 'cancel_requested' THEN 'cancelled' WHEN attempt < max_attempts THEN 'queued' ELSE 'failed' END,
         failure = CASE WHEN status <> 'cancel_requested' AND attempt >= max_attempts THEN 'lease_expired' ELSE failure END,
         finished_at = CASE WHEN status = 'cancel_requested' OR attempt >= max_attempts THEN clock_timestamp() END,
         lease_hash = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
-      WHERE status IN ('leased', 'running', 'cancel_requested') AND lease_expires_at <= clock_timestamp() AND ${scope}`, values, client);
+      WHERE status IN ('leased', 'running', 'cancel_requested') AND lease_expires_at <= clock_timestamp() AND ${column} = $1`, [value], client);
   };
   const lockHeldJob = async (client, { runnerId, jobId, leaseHash }) => {
     if (!isId(runnerId) || !isId(jobId)) throw new StoreError('not_found');
-    await expireLeases('id = $1', [jobId], client);
+    await expireLeases('id', jobId, client);
     const j = (await query('SELECT * FROM jobs WHERE id = $1 AND runner_id = $2 FOR UPDATE', [jobId, runnerId], client)).rows[0];
     if (!j) throw new StoreError('not_found');
     if (!HELD.includes(j.status) || j.lease_hash !== leaseHash) throw new StoreError('lease_lost');
@@ -951,12 +954,12 @@ export function createPostgresStore(options) {
     },
     async listJobs({ workspaceId, limit = 50 }) {
       if (!isId(workspaceId)) return [];
-      await expireLeases('workspace_id = $1', [workspaceId]);
+      await expireLeases('workspace', workspaceId);
       return (await query('SELECT * FROM jobs WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2', [workspaceId, limit])).rows.map(jobRow);
     },
     async getJob({ workspaceId, jobId }) {
       if (!isId(workspaceId) || !isId(jobId)) return null;
-      await expireLeases('id = $1', [jobId]);
+      await expireLeases('id', jobId);
       const r = (await query('SELECT * FROM jobs WHERE id = $1 AND workspace_id = $2', [jobId, workspaceId])).rows[0];
       return r ? jobRow(r) : null;
     },
@@ -968,7 +971,7 @@ export function createPostgresStore(options) {
     async cancelJob({ workspaceId, jobId, actorId }) {
       if (![workspaceId, jobId, actorId].every(isId)) throw new StoreError('not_found');
       return transaction(async (client) => {
-        await expireLeases('id = $1', [jobId], client);
+        await expireLeases('id', jobId, client);
         const j = (await query('SELECT * FROM jobs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [jobId, workspaceId], client)).rows[0];
         if (!j) throw new StoreError('not_found');
         if (FINISHED.includes(j.status)) throw new StoreError('invalid_state');
@@ -988,7 +991,7 @@ export function createPostgresStore(options) {
       return transaction(async (client) => {
         const runner = (await query("SELECT id FROM runners WHERE id = $1 AND status = 'active' FOR UPDATE", [runnerId], client)).rows[0];
         if (!runner) throw new StoreError('invalid_state');
-        await expireLeases('runner_id = $1', [runnerId], client);
+        await expireLeases('runner', runnerId, client);
         const held = (await query(`SELECT 1 FROM jobs WHERE runner_id = $1 AND status IN ('leased', 'running', 'cancel_requested')`, [runnerId], client)).rows[0];
         if (held) return null;
         const next = (await query("SELECT id FROM jobs WHERE runner_id = $1 AND status = 'queued' ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED", [runnerId], client)).rows[0];
@@ -1001,7 +1004,7 @@ export function createPostgresStore(options) {
     },
     async getRunnerJob({ runnerId, jobId }) {
       if (!isId(runnerId) || !isId(jobId)) return null;
-      await expireLeases('id = $1', [jobId]);
+      await expireLeases('id', jobId);
       const r = (await query('SELECT * FROM jobs WHERE id = $1 AND runner_id = $2', [jobId, runnerId])).rows[0];
       return r ? jobRow(r) : null;
     },

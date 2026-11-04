@@ -239,6 +239,38 @@ test('revoking a runner cancels its waiting jobs and fails the one it holds; wor
   assert.equal((await rival.post(`/api/workspaces/${rws.id}/jobs`, { kind: 'probe', runnerId: runner.id, idempotencyKey: 'cross-tenant-1' })).statusCode, 400, 'another workspace’s runner does not exist here');
 });
 
+test('a runner gets a training job’s frozen dataset files only while it holds the job, and only if training is allowed', async () => {
+  const store = createMemoryStore();
+  const app = await makeApp({ store, env: { MODEL_CATALOG_FILE: FIXTURE_CATALOG, INGEST_PUBLIC_URL: 'http://127.0.0.1:4100', INGEST_SHARED_SECRET: 's'.repeat(40) } });
+  const owner = await person(app, 'o@acme-robotics.com');
+  const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
+  const base = `/api/workspaces/${ws.id}`;
+  const { runner, key } = (await owner.post(`${base}/runners`, { label: 'Box' })).json();
+  const api = runnerClient(app, key);
+  const projectId = '00000000-0000-4000-8000-0000000000aa';
+  const manifest = (allowedUses) => ({ dataSource: { mode: 'upload', allowedUses }, files: [{ id: 'f1', filename: 'chats.jsonl', sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'application/json', objectKey: `ws/${ws.id}/f1` }] });
+  let current = manifest(['training']);
+  store.listDatasetVersions = async ({ workspaceId, projectId: p }) => (workspaceId === ws.id && p === projectId ? [{ number: 1, manifest: current }] : []);
+  const draft = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId, version: 1 }], steps: ['sft'], compute: 'runner', spendCapUsd: 0 } });
+  const plan = await store.requestEnhanceRun({ workspaceId: ws.id, runId: draft.id, requestedBy: owner.id, expectedUpdatedAt: draft.updatedAt });
+  const job = (await owner.post(`${base}/jobs`, { kind: 'train', runnerId: runner.id, enhanceRunId: plan.id, idempotencyKey: 'train-key-001' })).json().job;
+
+  assert.equal((await api.post(`/api/runner/jobs/${job.id}/inputs`, { leaseToken: 'x'.repeat(32) })).json().code, 'lease_lost', 'not before it holds the job');
+  const leased = (await api.post('/api/runner/lease')).json().job;
+  const res = await api.post(`/api/runner/jobs/${job.id}/inputs`, { leaseToken: leased.leaseToken });
+  assert.equal(res.statusCode, 200, res.body);
+  const body = res.json();
+  assert.equal(body.baseModel.id, 'fixture-dense-8b');
+  assert.equal(body.datasets[0].files[0].sha256, 'a'.repeat(64));
+  assert.match(body.datasets[0].files[0].url, /^http:\/\/127\.0\.0\.1:4100\/v1\/objects\?token=/);
+  assert.ok(!JSON.stringify(body).includes('objectKey'), 'storage keys stay on the server');
+
+  current = manifest(['evaluation']);
+  assert.equal((await api.post(`/api/runner/jobs/${job.id}/inputs`, { leaseToken: leased.leaseToken })).json().code, 'dataset_unavailable');
+  const actions = (await store.listAudit(ws.id)).map((a) => a.action);
+  assert.ok(actions.includes('job.inputs_released'));
+});
+
 test('runner input validation', () => {
   assert.equal(bearerKey('Bearer vrk_' + 'a'.repeat(43)), 'vrk_' + 'a'.repeat(43));
   for (const bad of [undefined, '', 'vrk_x', 'Basic abc', `Bearer vrk_${'a'.repeat(42)}`, `bearer vrk_${'a'.repeat(43)}`]) assert.equal(bearerKey(bad), null);

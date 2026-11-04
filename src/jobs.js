@@ -1,4 +1,6 @@
 import { StoreError } from './store/index.js';
+import { allowsTraining } from './lib/models.js';
+import { signToken } from './lib/tokens.js';
 import { LEASE_MS, bearerKey, buildJobSpec, hashSecret, keyPrefix, newLeaseToken, newRunnerKey, validateCapabilities, validateEvents, validateFinish, validateRunnerLabel } from './lib/jobs.js';
 
 /**
@@ -6,6 +8,8 @@ import { LEASE_MS, bearerKey, buildJobSpec, hashSecret, keyPrefix, newLeaseToken
  * it; the runner authenticates with that key only, leases one job at a time and reports progress. The web server
  * never connects to a runner: the runner always calls in, so it can sit behind NAT on a laptop.
  */
+const INPUT_TTL_S = 15 * 60;
+
 export function registerJobRoutes(app, { config, store, helpers, guards }) {
   const { problem, privateHeaders } = helpers;
   const { signedIn, member, post, get, fail } = guards;
@@ -90,7 +94,7 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
     request.runner = runner;
   };
   const runnerRoute = { preHandler: runnerAuth, config: { rateLimit: { max: 600, timeWindow: '1 minute' } } };
-  const lease = (body) => (typeof body?.leaseToken === 'string' && body.leaseToken.length <= 100 ? hashSecret(body.leaseToken) : null);
+  const lease = (body) => (typeof body?.leaseToken === 'string' && /^[A-Za-z0-9_-]{32}$/.test(body.leaseToken) ? hashSecret(body.leaseToken) : null);
   const forRunner = (job) => ({ id: job.id, kind: job.kind, status: job.status, attempt: job.attempt, leaseExpiresAt: job.leaseExpiresAt, cancelRequested: job.status === 'cancel_requested' });
 
   app.post('/api/runner/heartbeat', runnerRoute, async (request, reply) => {
@@ -127,6 +131,30 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
       const { added, job } = await store.appendJobEvents({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body), events: result.values });
       return { added, job: forRunner(job) };
     } catch (err) { return jobFail(reply, err); }
+  });
+
+  // The frozen inputs of a plan-based job, only for the runner that holds it: the dataset versions named in the
+  // job's spec, resolved through each version's manifest, with short-lived signed download links.
+  app.post('/api/runner/jobs/:jobId/inputs', runnerRoute, async (request, reply) => {
+    let job;
+    try { job = await store.touchJob({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body) }); }
+    catch (err) { return jobFail(reply, err); }
+    if (job.kind === 'probe') return problem(reply, 400, 'A sandbox check has no inputs.');
+    const ingest = config.ingest;
+    if (!ingest) return problem(reply, 503, 'File storage is not configured on this server.', { code: 'storage_unavailable' });
+    const datasets = [];
+    for (const { projectId, version } of job.spec.plan.datasets) {
+      const v = (await store.listDatasetVersions({ workspaceId: job.workspaceId, projectId })).find((x) => x.number === version);
+      if (!v || !allowsTraining(v.manifest)) return problem(reply, 409, 'A dataset version in this plan is missing or no longer allows training.', { code: 'dataset_unavailable' });
+      const exp = Math.floor(Date.now() / 1000) + INPUT_TTL_S;
+      datasets.push({
+        projectId, version,
+        files: v.manifest.files.map((f) => ({ id: f.id, filename: f.filename, sha256: f.sha256, sizeBytes: f.sizeBytes, contentType: f.contentType,
+          url: `${ingest.publicUrl}/v1/objects?token=${encodeURIComponent(signToken(ingest.secret, { v: 1, kind: 'download', key: f.objectKey, filename: f.filename, exp }))}` })),
+      });
+    }
+    await store.recordAudit({ workspaceId: job.workspaceId, actorId: request.runner.createdBy, action: 'job.inputs_released', targetType: 'job', targetId: job.id, metadata: { runnerId: request.runner.id, versions: datasets.length } });
+    return { baseModel: { id: job.spec.baseModel.id, source: job.spec.baseModel.source, license: job.spec.baseModel.license }, datasets, expiresInSeconds: INPUT_TTL_S };
   });
 
   app.post('/api/runner/jobs/:jobId/finish', runnerRoute, async (request, reply) => {

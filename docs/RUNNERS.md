@@ -18,6 +18,10 @@ Person (browser, session cookie)                  Runner (its machine, bearer ke
 
 Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `cancelled`. While a runner holds a job it can also be `cancel_requested`.
 
+## In the app
+
+**Compute** (`/w/:slug/compute`) lists the workspace's runners with what each one reports: GPUs, sandbox, Ollama models and platform, and whether it is online (reported within the last 90 seconds). Owners and admins link a machine there, which shows the key once with the commands to start the runner. They can also run a sandbox check or disconnect a runner. Each job shows its status, its attempt and a live event timeline. A job that has not finished can be cancelled.
+
 ## Rules
 
 - **Who.** Any member can see the workspace's runners and jobs. Only owners and admins link or revoke runners and queue or cancel jobs, because a job runs code on a machine against the workspace's data.
@@ -53,6 +57,7 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 | `GET /api/runner/jobs/:jobId` | none | `{ job }`: status only, for recovery after a dropped response. |
 | `POST /api/runner/jobs/:jobId/heartbeat` | `{ leaseToken }` | `{ job }`; extends the lease. |
 | `POST /api/runner/jobs/:jobId/events` | `{ leaseToken, events: [{ seq, kind, data }] }` (1 to 50) | `{ added, job }`. |
+| `POST /api/runner/jobs/:jobId/inputs` | `{ leaseToken }` | Training, evaluation and export only: `{ baseModel: { id, source, license }, datasets: [{ projectId, version, files: [{ id, filename, sha256, sizeBytes, contentType, url }] }], expiresInSeconds }`. Files come from each frozen version's manifest, with signed download links valid for 15 minutes. Refused with `409 dataset_unavailable` if a version is gone or its rights record no longer allows training, and `503 storage_unavailable` without file storage. Recorded as `job.inputs_released`. |
 | `POST /api/runner/jobs/:jobId/finish` | `{ leaseToken, outcome: 'succeeded', result }` or `{ leaseToken, outcome: 'failed', failure, retryable? }` | `{ job }`. |
 
 Errors: `401 runner_key_invalid`, `401 runner_owner_inactive`, `404` (another runner's job), `409 lease_lost`, `400 { errors }` for invalid input. The runner API allows 600 requests per minute per address.
