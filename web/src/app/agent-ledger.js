@@ -79,7 +79,16 @@ export async function indexedDbBackend(name, idb = globalThis.indexedDB) {
       const tx = db.transaction(names, mode);
       const done = new Promise((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onabort = () => reject(tx.error ?? new LedgerError('storage_failed', 'The local database aborted the write.')); tx.onerror = () => reject(tx.error); });
       let result;
-      try { result = await fn(Object.fromEntries(names.map((n) => [n, wrap(tx.objectStore(n))]))); } catch (err) { try { tx.abort(); } catch { /* already finished */ } throw err; }
+      try {
+        result = await fn(Object.fromEntries(names.map((n) => [n, wrap(tx.objectStore(n))])));
+      } catch (err) {
+        // A refusal or a failed request: abort, then wait for the transaction's own settlement (its error or abort
+        // event rejects `done`; consumed here so it never surfaces as a second, unhandled error) and report the
+        // callback's own error.
+        try { tx.abort(); } catch { /* already aborting or finished */ }
+        await done.catch(() => {});
+        throw err;
+      }
       await done;
       return result;
     },
