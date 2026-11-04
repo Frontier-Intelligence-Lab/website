@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { plural } from './shell.jsx';
-import { LIMITS, clip, createMemoryClient, explain, newest, readConnection, toPassage } from './memory.js';
+import { LIMITS, clip, explain, newest, readConnection, toPassage } from './memory.js';
+import { useMemoryClient } from './use-memory-client.js';
 
 /**
  * Opt-in reference material for a chat on this device: passages from the person's own saved notes, fetched from the
@@ -11,7 +12,7 @@ import { LIMITS, clip, createMemoryClient, explain, newest, readConnection, toPa
  */
 export function ReferencePicker({ entry, account, draft, disabled, onChange }) {
   const [connection] = useState(() => readConnection(entry.id, account.user.id));
-  const client = useMemo(() => (connection ? createMemoryClient(connection) : null), [connection]);
+  const client = useMemoryClient(connection); // owned by this picker's effect lifecycle; closed when it leaves
   const [enabled, setEnabled] = useState(false);
   const [state, setState] = useState({ status: 'idle', results: [] }); // idle | searching | found | none | error
   const [unticked, setUnticked] = useState(() => new Set());
@@ -22,8 +23,8 @@ export function ReferencePicker({ entry, account, draft, disabled, onChange }) {
   useEffect(() => { onChange(enabled ? chosen : []); }, [enabled, state.results, unticked]); // eslint-disable-line react-hooks/exhaustive-deps
   // Sending clears the draft; references were for that message only, so they go with it. Turning the option off drops them too.
   useEffect(() => { if (!draft || !enabled) reset(); }, [draft, enabled]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Leaving the page stops any lookup and closes the client, so nothing late can arrive anywhere.
-  useEffect(() => () => { ops.current.stop(); client?.close(); }, [client]);
+  // Leaving the page stops any lookup (the client is closed by its own hook), so nothing late can arrive anywhere.
+  useEffect(() => () => ops.current.stop(), []);
 
   async function find() {
     const run = ops.current.start();
@@ -47,7 +48,7 @@ export function ReferencePicker({ entry, account, draft, disabled, onChange }) {
         <input type="checkbox" checked={enabled} disabled={disabled} onChange={(e) => setEnabled(e.target.checked)} />
         Use my saved notes as reference for this message (off unless you turn it on)
       </label>
-      {enabled && !client && <p className="ob-muted" style={{ fontSize: 13 }}>No memory is connected in this tab. Connect it on the <Link to={`/w/${entry.slug}/memory`}>Memory page</Link>, then come back here.</p>}
+      {enabled && !connection && <p className="ob-muted" style={{ fontSize: 13 }}>No memory is connected in this tab. Connect it on the <Link to={`/w/${entry.slug}/memory`}>Memory page</Link>, then come back here.</p>}
       {enabled && client && (
         <>
           <div className="row-wrap gap-10">

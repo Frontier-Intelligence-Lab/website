@@ -1,9 +1,10 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { useLoaderData } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
-import { LIMITS, clip, connectMemory, createMemoryClient, derivedSources, explain, fileImport, newest, noteSource, primarySource, readConnection, sourcesForSave, writeConnection } from './memory.js';
+import { LIMITS, clip, connectMemory, derivedSources, explain, fileImport, newest, noteSource, primarySource, readConnection, sourcesForSave, writeConnection } from './memory.js';
+import { useMemoryClient } from './use-memory-client.js';
 
 const when = (iso) => (iso ? new Date(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—');
 const STATUS = { active: ['Active', 'tile--green'], superseded: ['Superseded', 'tile--amber'], deleted: ['Deleted', 'tile--orange'], held: ['Held', 'tile--violet'], retracted: ['Retracted', 'tile--orange'] };
@@ -29,9 +30,9 @@ export function MemoryPage() {
   const [notice, setNotice] = useState(null);
   const [inspecting, setInspecting] = useState(null);
   const [version, setVersion] = useState(0); // bumps after every write so the lists reload
-  const client = useMemo(() => (connection ? createMemoryClient(connection) : null), [connection]);
-  // Disconnecting, or leaving the page, aborts everything in flight through this client.
-  useEffect(() => () => client?.close(), [client]);
+  // Owned by this page's effect lifecycle: a fresh client per setup, closed by its own cleanup when the connection
+  // changes or the page is left. Disconnect below closes it at once as well, before the state settles.
+  const client = useMemoryClient(connection);
   const changed = () => setVersion((v) => v + 1);
 
   function connected(conn) { writeConnection(...ids, conn); setConnection(conn); setNotice(null); }
@@ -56,7 +57,7 @@ export function MemoryPage() {
       {notice && <p className={`ob-alert${notice.tone === 'ok' ? ' ob-alert--ok' : ''}`} role="status">{notice.text}</p>}
       {origins.length === 0 ? (
         <section className="ob-card"><h2>Memory is off on this server</h2><p className="ob-muted">No memory gateway origin is configured (LOCAL_MEMORY_ORIGINS is empty), so this page cannot connect to anything.</p></section>
-      ) : !connection ? <ConnectCard origin={origins[0]} workspaceId={entry.id} userId={account.user.id} onConnected={connected} /> : (
+      ) : !connection ? <ConnectCard origin={origins[0]} workspaceId={entry.id} userId={account.user.id} onConnected={connected} /> : !client ? <p className="ob-muted" role="status">Opening the connection…</p> : (
         <>
           <ConnectionCard connection={connection} client={client} onDisconnect={disconnect} />
           {inspecting && <InspectCard key={inspecting} client={client} id={inspecting} onClose={() => setInspecting(null)} onChanged={changed} onOpen={setInspecting} />}
