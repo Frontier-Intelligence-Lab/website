@@ -40,11 +40,11 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def download(url: str, dest: Path, expected_sha: str, opener=urllib.request.urlopen) -> None:
+def download(url: str, dest: Path, expected_sha: str, opener=None) -> None:
     """Fetch one dataset file through its signed link and refuse it unless its SHA-256 matches the manifest."""
     tmp = dest.with_suffix(dest.suffix + ".part")
     h, size = hashlib.sha256(), 0
-    with opener(url, timeout=120) as res, tmp.open("wb") as out:
+    with (opener or urllib.request.urlopen)(url, timeout=120) as res, tmp.open("wb") as out:
         for chunk in iter(lambda: res.read(1024 * 1024), b""):
             size += len(chunk)
             if size > MAX_FILE_BYTES:
@@ -59,10 +59,12 @@ def download(url: str, dest: Path, expected_sha: str, opener=urllib.request.urlo
 
 def forward(ctx, line: str) -> None:
     """Turn a progress line from the image into a Valcairn event; other output is not sent."""
-    if not line.startswith(PREFIX):
+    # Progress bars redraw with carriage returns, so a progress line can arrive glued to other output.
+    at = line.rfind(PREFIX)
+    if at < 0:
         return
     try:
-        event = json.loads(line[len(PREFIX):])
+        event = json.loads(line[at + len(PREFIX):])
     except ValueError:
         return
     kind = event.pop("kind", None)

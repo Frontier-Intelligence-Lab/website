@@ -106,7 +106,7 @@ def main() -> int:
         output_dir="/tmp/run", num_train_epochs=float(settings.get("epochs", 2)), per_device_train_batch_size=int(settings.get("batchSize", 4)),
         gradient_accumulation_steps=int(settings.get("gradAccum", 2)), learning_rate=float(settings.get("learningRate", 2e-4)),
         logging_steps=5, eval_strategy="no", save_strategy="no", report_to=[], bf16=True, max_length=int(settings.get("maxLength", 1024)),
-        seed=int(settings.get("seed", 7)), gradient_checkpointing=True,
+        seed=int(settings.get("seed", 7)), gradient_checkpointing=True, disable_tqdm=True,
     )
     lora = LoraConfig(r=int(settings.get("rank", 32)), lora_alpha=int(settings.get("alpha", 64)), lora_dropout=0.05, target_modules="all-linear", task_type="CAUSAL_LM")
     trainer = SFTTrainer(model=model, args=config, train_dataset=Dataset.from_list(train_rows), eval_dataset=Dataset.from_list(held_rows),

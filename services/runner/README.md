@@ -5,13 +5,22 @@ The Valcairn Runner runs Valcairn jobs on your own machine: a workstation, a GPU
 | Job | Status |
 | --- | --- |
 | `probe`: start a sandbox with no network, read the GPUs from inside it, check Ollama | Implemented and run against a real RTX 5090 with Docker Desktop and Ollama 0.40.13. |
-| `train`, `evaluate`, `export` | **Planned**, as separate increments. A job of these kinds ends as `unsupported` until its handler lands. |
+| `train`: LoRA fine-tuning of an approved plan's base model on its frozen dataset versions, with held-out loss of the base and the tuned model | Implemented (runner 0.2). Run against a real RTX 5090: on a synthetic 252-example support set with Qwen3-0.6B, held-out loss fell from 4.4707 on the base model to 0.0785 after 58 steps (38 s), with the same adapter hash on a second run. |
+| `evaluate`, `export` | **Planned**, as separate increments. A job of these kinds ends as `unsupported` until its handler lands. |
 
 ## Requirements
 
 - Python 3.11 or later. The Runner uses only the standard library.
 - Docker (Docker Desktop on Windows and macOS). For GPU jobs, add the NVIDIA driver and GPU support in Docker: Docker Desktop on WSL 2, or the NVIDIA Container Toolkit on Linux.
 - Optional: Ollama on this machine (`http://127.0.0.1:11434` by default).
+
+## Build the training image (once, for `train`)
+
+```bash
+docker build -t valcairn-train:0.1 images/train
+```
+
+The image pins PyTorch 2.15 (CUDA 13.4), transformers 5.22.1, peft 0.21.2, trl 1.17.1, accelerate 1.15.0, datasets 5.1.0 and huggingface_hub 2.4.0. It needs an NVIDIA driver that supports CUDA 13.4.
 
 ## Link and run
 
@@ -45,6 +54,22 @@ VALCAIRN_URL=https://your-valcairn-site VALCAIRN_RUNNER_KEY_FILE=~/.valcairn-run
 | `VALCAIRN_RUNNER_KEY` | none | The key itself, if no file is set. |
 | `OLLAMA_HOST_URL` | `http://127.0.0.1:11434` | The Ollama on this machine. Cloud models (those with a remote host) are never reported as local. |
 | `VALCAIRN_PROBE_IMAGE` | `ubuntu:24.04` | The image the sandbox check starts. |
+| `VALCAIRN_TRAIN_IMAGE` | `valcairn-train:0.1` | The training image built above. |
+| `VALCAIRN_RUNNER_HOME` | `~/.valcairn-runner` | Where job inputs, model caches (`models/`) and outputs (`jobs/<id>/attempt-<n>/out`) are kept. |
+| `VALCAIRN_TRAIN_MEMORY` | `32g` | Memory limit of the training container. |
+| `HF_TOKEN` | none | Not read by the runner today; gated models are not fetched. |
+
+## How a training job runs
+
+1. **Inputs.** The runner asks Valcairn for the job's inputs: the base model's source and short-lived signed links to the frozen files of each dataset version. It downloads the `.jsonl` files, checks each file's SHA-256 against the version's manifest, and refuses any file that does not match.
+2. **Weights.** If the base model is not cached, a **fetch** step downloads it into `models/`. This is the only step with network access. It downloads only safetensors weights and plain config and tokenizer files: no pickled weights and no custom code (`trust_remote_code` is off).
+3. **Training** runs with `--network none`, with the weights and data mounted read-only. It uses LoRA (rank 32, alpha 64, all linear layers, 2 epochs, bf16). With more than one GPU it runs through `accelerate launch --multi_gpu`.
+4. **Held-out comparison.** About 10% of the examples, chosen by a hash of each example's content so the split is reproducible, are never trained on. Their loss is measured on the unchanged base model first, then on the tuned model. The split's hashes are saved as `split.json`.
+5. **Result.** The adapter stays on this machine in safetensors. Valcairn receives its SHA-256, size and location, the report (example counts, steps, time, GPUs, peak GPU memory, both held-out losses) and the live loss curve.
+
+Examples are JSON lines: `{"messages": [{"role": "user", "content": "…"}, {"role": "assistant", "content": "…"}]}` or `{"prompt": "…", "completion": "…"}`. Other lines are counted as skipped. Only fine-tuning (`sft`) runs today; preference tuning and reinforcement learning steps in a plan are shown as skipped.
+
+Training steps also get a scratch `/cache` tmpfs where executables are allowed, because Triton compiles GPU kernels there and loads them. It is not persisted, and `/tmp` stays `noexec`.
 
 ## What the sandbox allows
 
