@@ -118,6 +118,25 @@ const runRow = (r) => r ? {
   requestedBy: r.requested_by, requestedAt: iso(r.requested_at), createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
 } : null;
 
+const reportRow = (r) => r ? {
+  id: r.id, deviceId: r.device_id, reachable: r.reachable, runtimeVersion: r.runtime_version, models: r.models, running: r.running,
+  browser: r.browser, provenance: r.provenance, createdAt: iso(r.created_at),
+} : null;
+const deviceRow = (r, report = null) => r ? {
+  id: r.id, workspaceId: r.workspace_id, ownerId: r.owner_id, label: r.label, runtime: r.runtime, status: r.status,
+  lastSeenAt: iso(r.last_seen_at), revokedAt: iso(r.revoked_at), createdAt: iso(r.created_at), latestReport: report,
+} : null;
+const installRow = (r) => ({
+  id: r.id, deviceId: r.device_id, runtimeRef: r.runtime_ref, catalogId: r.catalog_id, digest: r.digest,
+  sizeBytes: r.size_bytes == null ? null : Number(r.size_bytes), details: r.details, state: r.state, failure: r.failure,
+  verifiedAt: iso(r.verified_at), provenance: r.provenance, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
+});
+const execRow = (r) => ({
+  id: r.id, deviceId: r.device_id, installId: r.install_id, modelRef: r.model_ref, modelDigest: r.model_digest, location: r.location,
+  kind: r.kind, warm: r.warm, status: r.status, failure: r.failure, settings: r.settings, metrics: r.metrics, task: r.task,
+  promptSha256: r.prompt_sha256, provenance: r.provenance, createdAt: iso(r.created_at),
+});
+
 // Reads that feed Resolve, the submit gate and history warnings ask Postgres for 010's verdict on the raw jsonb,
 // before node-postgres turns its numbers into JavaScript numbers and can hide digits a double cannot hold.
 const ANNOTATIONS_CHECKED = `SELECT *, ${boxNotStoredForm('box')} AS box_not_stored_form FROM annotations`;
@@ -152,6 +171,14 @@ export function createPostgresStore(options) {
     if (!result.rowCount) throw new StoreError('not_found');
     return result.rows[0];
   };
+  // A device write needs the person's own, active device; the row lock orders it against revocation.
+  const lockActiveDevice = async (client, { workspaceId, ownerId, deviceId }) => {
+    const d = (await query('SELECT status FROM devices WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 FOR SHARE', [deviceId, workspaceId, ownerId], client)).rows[0];
+    if (!d) throw new StoreError('not_found');
+    if (d.status !== 'active') throw new StoreError('invalid_state');
+  };
+  const DEVICE_WITH_REPORT = `SELECT d.*, to_jsonb(r) AS report FROM devices d
+    LEFT JOIN LATERAL (SELECT * FROM device_reports WHERE device_id = d.id ORDER BY created_at DESC, id DESC LIMIT 1) r ON true`;
   const addAudit = async (client, { workspaceId = null, actorId = null, action, targetType = null, targetId = null, metadata = {} }) => {
     await query(`INSERT INTO audit_events (workspace_id, actor_id, action, target_type, target_id, metadata)
       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
@@ -686,6 +713,89 @@ export function createPostgresStore(options) {
         await addAudit(client, { workspaceId, actorId: requestedBy, action: 'enhance_run.requested', targetType: 'enhance_run', targetId: runId, metadata: { spendCapUsd: row.spend_cap_usd } });
         return runRow(row);
       });
+    },
+
+    // Devices belong to one person in one workspace; every statement filters on both.
+    async createDevice({ workspaceId, ownerId, label, runtime = 'ollama' }) {
+      if (!isId(workspaceId) || !isId(ownerId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const row = (await query('INSERT INTO devices (workspace_id, owner_id, label, runtime) VALUES ($1, $2, $3, $4) RETURNING *', [workspaceId, ownerId, label, runtime], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId: ownerId, action: 'device.registered', targetType: 'device', targetId: row.id, metadata: { runtime } });
+        return deviceRow(row);
+      });
+    },
+    async listDevices({ workspaceId, ownerId }) {
+      if (!isId(workspaceId) || !isId(ownerId)) return [];
+      const rows = (await query(`${DEVICE_WITH_REPORT} WHERE d.workspace_id = $1 AND d.owner_id = $2 ORDER BY d.created_at, d.id`, [workspaceId, ownerId])).rows;
+      return rows.map((r) => deviceRow(r, reportRow(r.report)));
+    },
+    async getDevice({ workspaceId, ownerId, deviceId }) {
+      if (![workspaceId, ownerId, deviceId].every(isId)) return null;
+      const r = (await query(`${DEVICE_WITH_REPORT} WHERE d.id = $1 AND d.workspace_id = $2 AND d.owner_id = $3`, [deviceId, workspaceId, ownerId])).rows[0];
+      return r ? deviceRow(r, reportRow(r.report)) : null;
+    },
+    async revokeDevice({ workspaceId, ownerId, deviceId }) {
+      if (![workspaceId, ownerId, deviceId].every(isId)) throw new StoreError('not_found');
+      await transaction(async (client) => {
+        const current = (await query('SELECT status FROM devices WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 FOR UPDATE', [deviceId, workspaceId, ownerId], client)).rows[0];
+        if (!current) throw new StoreError('not_found');
+        if (current.status !== 'active') throw new StoreError('invalid_state');
+        await query("UPDATE devices SET status = 'revoked', revoked_at = clock_timestamp() WHERE id = $1", [deviceId], client);
+        await addAudit(client, { workspaceId, actorId: ownerId, action: 'device.revoked', targetType: 'device', targetId: deviceId });
+      });
+      const r = (await query(`${DEVICE_WITH_REPORT} WHERE d.id = $1`, [deviceId])).rows[0];
+      return deviceRow(r, reportRow(r.report));
+    },
+    async recordDeviceReport({ workspaceId, ownerId, deviceId, report }) {
+      if (![workspaceId, ownerId, deviceId].every(isId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        await lockActiveDevice(client, { workspaceId, ownerId, deviceId });
+        const row = (await query(`INSERT INTO device_reports (device_id, workspace_id, owner_id, reachable, runtime_version, models, running, browser)
+          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb) RETURNING *`,
+        [deviceId, workspaceId, ownerId, report.reachable, report.runtimeVersion, JSON.stringify(report.models), JSON.stringify(report.running), JSON.stringify(report.browser)], client)).rows[0];
+        await query('UPDATE devices SET last_seen_at = $2 WHERE id = $1', [deviceId, row.created_at], client);
+        return reportRow(row);
+      });
+    },
+    async saveModelInstall({ workspaceId, ownerId, deviceId, install }) {
+      if (![workspaceId, ownerId, deviceId].every(isId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        await lockActiveDevice(client, { workspaceId, ownerId, deviceId });
+        const previous = (await query('SELECT state FROM model_installs WHERE device_id = $1 AND runtime_ref = $2 FOR UPDATE', [deviceId, install.runtimeRef], client)).rows[0];
+        // verified_at is kept while the same digest stays verified; a new digest or a lapse is a new verification.
+        const row = (await query(`INSERT INTO model_installs (device_id, workspace_id, owner_id, runtime_ref, catalog_id, digest, size_bytes, details, state, failure, verified_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::text, $10, CASE WHEN $9::text IN ('verified', 'ready') THEN clock_timestamp() END)
+          ON CONFLICT (device_id, runtime_ref) DO UPDATE SET catalog_id = EXCLUDED.catalog_id, digest = EXCLUDED.digest, size_bytes = EXCLUDED.size_bytes,
+            details = EXCLUDED.details, state = EXCLUDED.state, failure = EXCLUDED.failure, updated_at = clock_timestamp(),
+            verified_at = CASE WHEN EXCLUDED.state NOT IN ('verified', 'ready') THEN NULL
+              WHEN model_installs.verified_at IS NOT NULL AND model_installs.digest = EXCLUDED.digest THEN model_installs.verified_at
+              ELSE clock_timestamp() END
+          RETURNING *`,
+        [deviceId, workspaceId, ownerId, install.runtimeRef, install.catalogId, install.digest, install.sizeBytes, JSON.stringify(install.details), install.state, install.failure], client)).rows[0];
+        if (previous?.state !== row.state) await addAudit(client, { workspaceId, actorId: ownerId, action: `model_install.${row.state}`, targetType: 'model_install', targetId: row.id, metadata: { runtimeRef: row.runtime_ref, digest: row.digest } });
+        return installRow(row);
+      });
+    },
+    async listModelInstalls({ workspaceId, ownerId, deviceId }) {
+      if (![workspaceId, ownerId, deviceId].every(isId)) return [];
+      return (await query('SELECT * FROM model_installs WHERE device_id = $1 AND workspace_id = $2 AND owner_id = $3 ORDER BY runtime_ref', [deviceId, workspaceId, ownerId])).rows.map(installRow);
+    },
+    async recordExecutionRun({ workspaceId, ownerId, deviceId, run }) {
+      if (![workspaceId, ownerId, deviceId].every(isId) || (run.installId != null && !isId(run.installId))) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        await lockActiveDevice(client, { workspaceId, ownerId, deviceId });
+        if (run.installId && !(await query('SELECT 1 FROM model_installs WHERE id = $1 AND device_id = $2', [run.installId, deviceId], client)).rows[0]) throw new StoreError('not_found');
+        const row = (await query(`INSERT INTO execution_runs (device_id, workspace_id, owner_id, install_id, model_ref, model_digest, location, kind, warm, status, failure, settings, metrics, task, prompt_sha256)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15) RETURNING *`,
+        [deviceId, workspaceId, ownerId, run.installId, run.modelRef, run.modelDigest, run.location, run.kind, run.warm, run.status, run.failure,
+          JSON.stringify(run.settings), JSON.stringify(run.metrics), run.task == null ? null : JSON.stringify(run.task), run.promptSha256], client)).rows[0];
+        return execRow(row);
+      });
+    },
+    async listExecutionRuns({ workspaceId, ownerId, deviceId, limit = 50 }) {
+      if (![workspaceId, ownerId, deviceId].every(isId)) return [];
+      return (await query(`SELECT * FROM execution_runs WHERE device_id = $1 AND workspace_id = $2 AND owner_id = $3
+        ORDER BY created_at DESC, id DESC LIMIT $4`, [deviceId, workspaceId, ownerId, Math.min(Math.max(1, limit), 200)])).rows.map(execRow);
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {

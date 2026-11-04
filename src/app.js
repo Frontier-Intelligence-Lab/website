@@ -18,6 +18,7 @@ import { registerAccountRoutes } from './accounts.js';
 import { registerDatasetRoutes } from './datasets.js';
 import { registerWorkspaceDataRoutes } from './workspace-data.js';
 import { registerModelRoutes } from './models.js';
+import { registerDeviceRoutes } from './devices.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -69,8 +70,9 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
         'img-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'media-src': ["'self'", 'blob:', ...(config.ingest ? [config.ingest.publicUrl] : [])],
         'font-src': ["'self'"],
-        // Sample uploads go straight to the ingest service, so the browser may also connect to it.
-        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : [])],
+        // Sample uploads go straight to the ingest service, so the browser may also connect to it. Run on this device
+        // talks to a runtime on the visitor's own loopback address; the server never proxies it.
+        'connect-src': ["'self'", ...(config.ingest ? [config.ingest.publicUrl] : []), ...config.localRuntimeOrigins],
         'form-action': ["'self'"],
         'base-uri': ["'self'"],
         'frame-ancestors': ["'none'"],
@@ -153,6 +155,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   registerDatasetRoutes(app, { config, store: accountStore, helpers, guards, ingestClient });
   registerWorkspaceDataRoutes(app, { config, store: accountStore, helpers, guards });
   registerModelRoutes(app, { config, store: accountStore, helpers, guards });
+  registerDeviceRoutes(app, { config, store: accountStore, helpers, guards });
 
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,

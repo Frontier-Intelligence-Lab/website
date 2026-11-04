@@ -73,6 +73,14 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 | `createEnhanceRun({ workspaceId, createdBy, run })` / `updateEnhanceRun({ workspaceId, runId, run })` | run, a `draft`. The route validates `run` (`validateEnhanceRun` in `src/lib/models.js`). Updating a requested run throws `invalid_state`. Each update gets an `updatedAt` strictly later than the previous one, so every edit is a distinct plan version. |
 | `requestEnhanceRun({ workspaceId, runId, requestedBy, expectedUpdatedAt })` | `expectedUpdatedAt` is the plan version the approver reviewed; missing or no longer current throws `stale_plan`, checked under the row lock, so a concurrently changed cap is never frozen. Otherwise the run, now `requested`, with `requestedBy` and `requestedAt`, plus an `enhance_run.requested` audit event. Needs datasets, steps, compute and a cap, and a draft, else `invalid_state`. The plan never changes afterwards. |
 | `listDatasetVersions({ workspaceId, projectId })` | versions, oldest first |
+| `createDevice({ workspaceId, ownerId, label, runtime })` | device `{ id, workspaceId, ownerId, label, runtime: 'ollama', status: 'active'\|'revoked', lastSeenAt, revokedAt, createdAt, latestReport: null }`, plus a `device.registered` audit event. A device belongs to one user in one workspace. |
+| `listDevices({ workspaceId, ownerId })` / `getDevice({ workspaceId, ownerId, deviceId })` | the owner's devices, each with `latestReport` / one device or null. Any other user, owners and admins included, gets an empty list or null. |
+| `revokeDevice({ workspaceId, ownerId, deviceId })` | device, now `revoked`, plus `device.revoked`. History is kept. `not_found`; `invalid_state` if already revoked. |
+| `recordDeviceReport({ workspaceId, ownerId, deviceId, report })` | report `{ id, deviceId, reachable, runtimeVersion, models, running, browser, provenance: 'client_reported', createdAt }`; sets the device's `lastSeenAt`. `not_found`; `invalid_state` when revoked. The route validates `report` (`validateReport` in `src/lib/devices.js`). |
+| `saveModelInstall({ workspaceId, ownerId, deviceId, install })` | install `{ id, deviceId, runtimeRef, catalogId, digest, sizeBytes, details, state, failure, verifiedAt, provenance, createdAt, updatedAt }`, one per `(deviceId, runtimeRef)`. `state` is `downloading`, `installed`, `verified`, `ready`, `failed` or `removed`; `verified` and `ready` need a digest, and `verifiedAt` is kept while the same digest stays verified or ready. A state change writes `model_install.<state>`. `not_found`; `invalid_state` when revoked. |
+| `listModelInstalls({ workspaceId, ownerId, deviceId })` | installs by `runtimeRef`; empty for any other user. |
+| `recordExecutionRun({ workspaceId, ownerId, deviceId, run })` | run `{ id, deviceId, installId, modelRef, modelDigest, location: 'local_runtime', kind: 'chat'\|'compat_test', warm, status: 'completed'\|'stopped'\|'failed', failure, settings, metrics, task, promptSha256, provenance, createdAt }`. `installId` must be an install on the same device (`not_found`); `invalid_state` when revoked. Prompts and replies are never stored. |
+| `listExecutionRuns({ workspaceId, ownerId, deviceId, limit })` | runs, newest first, at most 200. |
 | `upsertReviewer({ username, name, role, passwordHash })` | reviewer `{ username, name, role, enabled }`. `passwordHash` is required for a new account; omitted, the existing hash is kept. External demo reviewers only, separate from users and staff. |
 | `getReviewer(username)` / `getReviewerAuth(username)` | reviewer / `{ account, passwordHash }`, or null |
 | `setReviewerEnabled({ username, enabled })` / `listReviewers()` | reviewer · `not_found` / reviewers |
@@ -97,6 +105,8 @@ project    { id, workspaceId, createdBy, name, task, modalities: string[], start
 `profile`, `success`, `dataSource` and `model` are JSON objects that the routes validate before they're stored. Store them as `jsonb`.
 
 ## Changelog
+
+- **v12:** Run on this device: `devices`, `device_reports`, `model_installs` and `execution_runs` (`012_devices.sql`), all scoped to one owner and marked `client_reported`. Failures store only an error category, never runtime text.
 
 - **v11:** Enhance-run approval names the plan version it approves (`expectedUpdatedAt`, `stale_plan`), and every plan edit gets a strictly later `updatedAt`. Training eligibility (`allowsTraining` in `src/lib/models.js`) needs an uploaded rights record that allows training and at least one delivered file. Plans refuse more than 20 dataset versions instead of truncating.
 
