@@ -6,7 +6,9 @@ The Valcairn Runner runs Valcairn jobs on your own machine: a workstation, a GPU
 | --- | --- |
 | `probe`: start a sandbox with no network, read the GPUs from inside it, check Ollama | Implemented and run against a real RTX 5090 with Docker Desktop and Ollama 0.40.13. |
 | `train`: LoRA fine-tuning of an approved plan's base model on its frozen dataset versions, with held-out loss of the base and the tuned model | Implemented (runner 0.2). Run against a real RTX 5090: on a synthetic 252-example support set with Qwen3-0.6B, held-out loss fell from 4.4707 on the base model to 0.0785 after 58 steps (38 s), with the same adapter hash on a second run. |
-| `evaluate`, `export` | **Planned**, as separate increments. A job of these kinds ends as `unsupported` until its handler lands. |
+| Held-out answers (part of `train`): base and tuned each answer the held-out examples; token F1 and exact match against the reference | Implemented. Same run: token F1 21.7% → 99.1%, exact match 0% → 83% on 24 held-out examples. |
+| `export`: merge the adapter, convert base and tuned to GGUF (Q8_0), load both into Ollama on this machine, load-test them on held-out conversations, write a manifest, checksums and a model card | Implemented (runner 0.3). Same run: a 639 MB GGUF, loaded natively into Ollama 0.40.13, 468 tok/s tuned against 453 tok/s base. |
+| `evaluate` (re-evaluating a finished run later) | **Planned**. Ends as `unsupported`. |
 
 ## Requirements
 
@@ -21,6 +23,18 @@ docker build -t valcairn-train:0.1 images/train
 ```
 
 The image pins PyTorch 2.15 (CUDA 13.4), transformers 5.22.1, peft 0.21.2, trl 1.17.1, accelerate 1.15.0, datasets 5.1.0 and huggingface_hub 2.4.0. It needs an NVIDIA driver that supports CUDA 13.4.
+
+## Export to Ollama
+
+An export job names a finished training run on the same runner (Valcairn freezes the adapter's SHA-256 into the job, and the runner refuses an adapter that does not match). It then:
+
+1. Merges the adapter into the base model in the training image, with no network. The base model's tokenizer files are copied unchanged.
+2. Converts the tuned model and, once per runner, the base model to GGUF Q8_0. This uses llama.cpp's published image, pinned by digest (`VALCAIRN_CONVERT_IMAGE`), with no network.
+3. Loads both into the Ollama on this machine with `ollama create`, as `valcairn-<job>` and `valcairn-base-<model>`. If every training example used the same system prompt, it becomes the tuned model's default.
+4. Load-tests both on up to three held-out conversations (greedy decoding), using Ollama's own token counters for speed.
+5. Writes `manifest.json` (base, adapter and GGUF hashes, quantization, Ollama names), `MODEL_CARD.md` and the base model's `LICENSE` next to the GGUF.
+
+Earlier exports stay in Ollama under their own names, so rolling back means using the previous name; `ollama rm <name>` removes one.
 
 ## Link and run
 

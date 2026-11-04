@@ -23,6 +23,6 @@ ENV HOME=/cache \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-COPY fetch.py train.py /app/
+COPY fetch.py train.py merge.py /app/
 WORKDIR /app
 USER 65534:65534

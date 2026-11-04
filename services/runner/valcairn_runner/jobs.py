@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .machine import parse_nvidia_smi
 from .sandbox import Limits, Step
+from .export import export
 from .training import JobFailure, train
 
 
@@ -34,4 +35,4 @@ def probe(ctx) -> dict:
     return {**result, "sandbox": True, "network": "none", "sandboxGpus": seen}
 
 
-HANDLERS = {"probe": probe, "train": train}
+HANDLERS = {"probe": probe, "train": train, "export": export}

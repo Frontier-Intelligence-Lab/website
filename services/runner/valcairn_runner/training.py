@@ -57,6 +57,46 @@ def download(url: str, dest: Path, expected_sha: str, opener=None) -> None:
     tmp.replace(dest)
 
 
+WEIGHTS = ".valcairn-weights.json"
+
+
+def weight_hashes(folder: Path) -> dict:
+    return {p.name: sha256_file(p) for p in sorted(folder.glob("*.safetensors"))}
+
+
+def cached_model(ctx, home: Path, source: str) -> tuple[Path, dict]:
+    """Base weights for `source`, fetched once. A fetch writes into a fresh folder and is moved into the cache only
+    after it succeeded and each weight file's SHA-256 was recorded; every later use checks those hashes, so a
+    half-finished or altered cache is never trained on. The hashes go to Valcairn with the result. The weights
+    themselves are trusted on first fetch from the catalog's source."""
+    cache = home / "models" / safe_name(source)
+    model_dir, record = cache / "model", cache / "model" / WEIGHTS
+    if record.exists():
+        expected = json.loads(record.read_text(encoding="utf-8"))
+        if weight_hashes(model_dir) == expected:
+            ctx.emit("stage", name="fetch_model", status="skipped")
+            return model_dir, expected
+        ctx.log("Cached base weights no longer match their recorded hashes; fetching them again.", "warn")
+    ctx.emit("stage", name="fetch_model", status="started")
+    staging = cache / f"fetching-{ctx.job['id']}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    fetch = Step(image=ctx.settings.train_image, command=["python", "fetch.py"], network="bridge", output=str(staging),
+                 env={"VALCAIRN_MODEL_SOURCE": source}, limits=Limits(cpus=4, memory="4g", seconds=3600, tmpfs_mb=2048))
+    try:
+        code = ctx.sandbox.run(fetch, lambda line: forward(ctx, line), ctx.cancelled)
+        hashes = weight_hashes(staging / "model") if (staging / "model").is_dir() else {}
+        if code != 0 or not hashes:
+            raise JobFailure("model_unavailable", f"The base model could not be fetched from {source}.", retryable=True)
+        (staging / "model" / WEIGHTS).write_text(json.dumps(hashes, indent=2), encoding="utf-8")
+        shutil.rmtree(model_dir, ignore_errors=True)
+        (staging / "model").replace(model_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    ctx.emit("stage", name="fetch_model", status="finished")
+    return model_dir, hashes
+
+
 def forward(ctx, line: str) -> None:
     """Turn a progress line from the image into a Valcairn event; other output is not sent."""
     # Progress bars redraw with carriage returns, so a progress line can arrive glued to other output.
@@ -108,20 +148,7 @@ def train(ctx) -> dict:
     ctx.emit("stage", name="download_data", status="finished")
 
     source = inputs["baseModel"]["source"]
-    cache = home / "models" / safe_name(source)
-    model_dir = cache / "model"
-    if not any(model_dir.glob("*.safetensors")):
-        ctx.emit("stage", name="fetch_model", status="started")
-        cache.mkdir(parents=True, exist_ok=True)
-        lines: list[str] = []
-        fetch = Step(image=ctx.settings.train_image, command=["python", "fetch.py"], network="bridge", output=str(cache),
-                     env={"VALCAIRN_MODEL_SOURCE": source}, limits=Limits(cpus=4, memory="4g", seconds=3600, tmpfs_mb=2048))
-        code = ctx.sandbox.run(fetch, lambda line: (lines.append(line), forward(ctx, line)), ctx.cancelled)
-        if code != 0 or not any(model_dir.glob("*.safetensors")):
-            raise JobFailure("model_unavailable", f"The base model could not be fetched from {source}.", retryable=True)
-        ctx.emit("stage", name="fetch_model", status="finished")
-    else:
-        ctx.emit("stage", name="fetch_model", status="skipped")
+    model_dir, weights = cached_model(ctx, home, source)
 
     gpus = len(ctx.capabilities["gpus"])
     command = ["python", "train.py"] if gpus == 1 else ["accelerate", "launch", "--multi_gpu", "--num_processes", str(gpus), "train.py"]
@@ -134,7 +161,7 @@ def train(ctx) -> dict:
 
     step = Step(image=ctx.settings.train_image, command=command, gpus=True, output=str(out),
                 inputs={str(model_dir): "/in/model", str(data): "/in/data"}, env={"VALCAIRN_TRAIN": json.dumps({"epochs": 2, "rank": 32})},
-                limits=Limits(cpus=8, memory=ctx.settings.train_memory, pids=1024, seconds=ctx.settings.train_seconds, tmpfs_mb=4096, exec_cache_mb=2048))
+                limits=Limits(cpus=8, memory=ctx.settings.train_memory, pids=1024, seconds=ctx.settings.train_seconds, tmpfs_mb=4096, exec_cache_mb=2048, shm="2g"))
     code = ctx.sandbox.run(step, on_line, ctx.cancelled)
     if code != 0:
         text = "\n".join(tail)
@@ -149,7 +176,8 @@ def train(ctx) -> dict:
     return {
         **{k: report[k] for k in ("method", "rank", "alpha", "epochs", "steps", "trainExamples", "heldOutExamples", "skippedLines",
                                   "baseHeldOutLoss", "tunedHeldOutLoss", "trainSeconds", "gpus", "peakGpuMemoryMb")},
-        "baseModel": {"id": inputs["baseModel"]["id"], "source": source},
+        "evaluation": report.get("evaluation"), "samples": report.get("samples", [])[:3],
+        "baseModel": {"id": inputs["baseModel"]["id"], "source": source, "weightsSha256": weights},
         "adapter": {"sha256": digest, "sizeBytes": size, "location": f"jobs/{ctx.job['id']}/attempt-{ctx.job['attempt']}/out/adapter"},
         "splitSha256": sha256_file(out / "split.json"),
         "datasetFiles": len(files),

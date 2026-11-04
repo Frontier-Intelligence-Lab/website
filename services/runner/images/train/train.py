@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,43 @@ def split(examples, holdout_every=10):
     if not held and len(train) >= 5:  # tiny sets: still keep one example out
         held.append(train.pop())
     return train, held
+
+
+def tokens(text):
+    return re.findall(r"\w+", text.lower())
+
+
+def token_f1(prediction, reference):
+    """SQuAD-style token overlap between a generated answer and the reference answer."""
+    p, r = tokens(prediction), tokens(reference)
+    if not p or not r:
+        return float(p == r)
+    common = sum(min(p.count(t), r.count(t)) for t in set(p))
+    if not common:
+        return 0.0
+    precision, recall = common / len(p), common / len(r)
+    return 2 * precision * recall / (precision + recall)
+
+
+def generate(model, tokenizer, rows, max_new_tokens=160):
+    """Greedy answers to each held-out example's last user turn, without the reference answer."""
+    import torch
+    answers = []
+    model.eval()
+    for row in rows:
+        turns = row["messages"][: max(i for i, m in enumerate(row["messages"]) if m["role"] == "assistant")]
+        inputs = tokenizer.apply_chat_template(turns, add_generation_prompt=True, return_tensors="pt", return_dict=True, enable_thinking=False).to(model.device)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+        answers.append(tokenizer.decode(out[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip())
+    return answers
+
+
+def scores(answers, rows):
+    refs = [next(m["content"] for m in reversed(r["messages"]) if m["role"] == "assistant") for r in rows]
+    f1 = [token_f1(a, ref) for a, ref in zip(answers, refs)]
+    exact = [a.strip() == ref.strip() for a, ref in zip(answers, refs)]
+    return {"f1": sum(f1) / len(f1), "exact": sum(exact) / len(exact), "n": len(rows)}
 
 
 def main() -> int:
@@ -129,6 +167,18 @@ def main() -> int:
     say("metric", name="tuned_held_out_loss", value=float(tuned_loss))
     say("stage", name="tuned_eval", status="finished")
 
+    # Answers on the same held-out examples, base (adapter off) and tuned, scored against the reference answers.
+    say("stage", name="answer_eval", status="started")
+    with trainer.model.disable_adapter():
+        base_answers = generate(trainer.model, tokenizer, held_rows)
+    tuned_answers = generate(trainer.model, tokenizer, held_rows)
+    evaluation = {"base": scores(base_answers, held_rows), "tuned": scores(tuned_answers, held_rows), "metric": "token F1 and exact match against the reference answer"}
+    say("metric", name="base_answer_f1", value=evaluation["base"]["f1"])
+    say("metric", name="tuned_answer_f1", value=evaluation["tuned"]["f1"])
+    say("stage", name="answer_eval", status="finished")
+    samples = [{"prompt": next(m["content"] for m in r["messages"] if m["role"] == "user")[:300], "base": b[:400], "tuned": t[:400]}
+               for r, b, t in list(zip(held_rows, base_answers, tuned_answers))[:3]]
+
     trainer.model.save_pretrained("/out/adapter", safe_serialization=True)
     tokenizer.save_pretrained("/out/adapter")
     report = {
@@ -136,7 +186,9 @@ def main() -> int:
         "trainExamples": len(train_rows), "heldOutExamples": len(held_rows), "skippedLines": skipped,
         "baseHeldOutLoss": float(base_loss), "tunedHeldOutLoss": float(tuned_loss), "trainSeconds": round(seconds, 1),
         "gpus": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
-        "peakGpuMemoryMb": int(torch.cuda.max_memory_allocated() / 2**20),
+        # This process's devices: under accelerate each process holds one GPU, so this is the reporting process's GPU.
+        "peakGpuMemoryMb": max(int(torch.cuda.max_memory_allocated(i) / 2**20) for i in range(torch.cuda.device_count())),
+        "evaluation": evaluation, "samples": samples,
     }
     Path("/out/report.json").write_text(json.dumps(report, indent=2))
     say("log", level="info", message=f"Held-out loss {base_loss:.4f} on the base model, {tuned_loss:.4f} after training.")

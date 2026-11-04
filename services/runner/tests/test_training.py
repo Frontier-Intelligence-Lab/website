@@ -26,6 +26,9 @@ class Ctx:
     def emit(self, kind, **data):
         self.events.append((kind, data))
 
+    def log(self, message, level="info"):
+        self.emit("log", level=level, message=message)
+
 
 DATA = b'{"prompt":"a","completion":"b"}\n'
 
@@ -96,9 +99,16 @@ class TrainTests(unittest.TestCase):
         self.assertIn(("stage", {"name": "dpo", "status": "skipped"}), ctx.events, "steps that do not run yet are shown as skipped")
         self.assertIn(("metric", {"name": "train_loss", "value": 0.5, "step": 5}), ctx.events, "a progress line glued to a bar redraw still arrives")
         self.assertFalse(any("ordinary output" in json.dumps(e) for e in ctx.events), "other output stays on the machine")
+        self.assertEqual(result["baseModel"]["weightsSha256"], {"model.safetensors": hashlib.sha256(b"w").hexdigest()})
         box2 = FakeSandbox()
         training.train(Ctx(Api(self.files), box2, self.home))
         self.assertEqual([s.command[-1] for s in box2.steps], ["train.py"], "cached weights are not fetched again")
+        weights = next((self.home / "models").rglob("model.safetensors"))
+        weights.write_bytes(b"tampered")
+        box3 = FakeSandbox()
+        training.train(Ctx(Api(self.files), box3, self.home))
+        self.assertEqual(box3.steps[0].command[-1], "fetch.py", "altered cached weights are fetched again, never trained on")
+        self.assertFalse(list((self.home / "models").rglob("fetching-*")), "no staging folder is left behind")
 
     def test_several_gpus_train_through_accelerate(self):
         box = FakeSandbox()
@@ -115,9 +125,11 @@ class TrainTests(unittest.TestCase):
         with self.assertRaises(JobFailure) as e:
             training.train(Ctx(Api([{**self.files[0], "filename": "notes.txt"}]), FakeSandbox(), self.home))
         self.assertEqual(e.exception.category, "dataset_error")
+        empty = Path(tempfile.mkdtemp())
         with self.assertRaises(JobFailure) as e:
-            training.train(Ctx(Api(self.files), FakeSandbox(fetch_ok=False), Path(tempfile.mkdtemp())))
+            training.train(Ctx(Api(self.files), FakeSandbox(fetch_ok=False), empty))
         self.assertEqual((e.exception.category, e.exception.retryable), ("model_unavailable", True))
+        self.assertFalse(list(empty.rglob("*.safetensors")), "a failed fetch leaves nothing that looks like a cache")
         with self.assertRaises(JobFailure) as e:
             training.train(Ctx(Api(self.files), FakeSandbox(train_code=1), self.home))
         self.assertEqual(e.exception.category, "out_of_memory")

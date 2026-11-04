@@ -17,6 +17,7 @@ class Limits:
     pids: int = 512
     seconds: int = 3600
     tmpfs_mb: int = 1024
+    shm: str = "64m"
     exec_cache_mb: int = 0  # >0 mounts a scratch /cache tmpfs where compiled GPU kernels may be loaded
 
 
@@ -25,6 +26,7 @@ class Step:
     image: str
     command: list[str]
     gpus: bool = False
+    entrypoint: str | None = None  # "" clears the image's own entrypoint
     network: str = "none"  # only the fetch step uses "bridge"
     inputs: dict[str, str] = field(default_factory=dict)  # host path -> container path, mounted read-only
     output: str | None = None  # host directory mounted at /out
@@ -36,9 +38,11 @@ def docker_args(step: Step, name: str) -> list[str]:
     args = ["docker", "run", "--rm", "--name", name, "--network", step.network, "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", str(step.limits.pids), "--memory", step.limits.memory, "--cpus", str(step.limits.cpus),
-            "--tmpfs", f"/tmp:rw,noexec,nosuid,size={step.limits.tmpfs_mb}m", "--shm-size", "2g", "--user", "65534:65534"]
+            "--tmpfs", f"/tmp:rw,noexec,nosuid,size={step.limits.tmpfs_mb}m", "--shm-size", step.limits.shm, "--user", "65534:65534"]
     if step.limits.exec_cache_mb:
         args += ["--tmpfs", f"/cache:rw,exec,nosuid,size={step.limits.exec_cache_mb}m,mode=1777"]
+    if step.entrypoint is not None:
+        args += ["--entrypoint", step.entrypoint]
     if step.gpus:
         args += ["--gpus", "all"]
     for host, inside in step.inputs.items():
