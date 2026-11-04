@@ -25,6 +25,10 @@ export function registerDeviceRoutes(app, { config, store, helpers, guards }) {
     runtimeOrigins: config.localRuntimeOrigins,
   }));
 
+  // Memory: a Provena gateway on the visitor's machine. Same rule: the browser connects, the server never does, and
+  // the bearer key for it never reaches this server. Only the exact origins the CSP allows are listed.
+  app.get('/api/local-memory', get([signedIn]), async () => ({ origins: config.localMemoryOrigins }));
+
   app.get(base, get(mine), async (request) => ({ devices: await store.listDevices({ workspaceId: request.params.workspaceId, ownerId: request.user.id }) }));
 
   app.post(base, post(mine), async (request, reply) => {
