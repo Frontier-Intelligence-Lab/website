@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
-import { checkAnnotation, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
+import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
@@ -269,6 +269,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       const project = editableProject(workspaceId, projectId);
       const upload = uploads.find((u) => u.id === uploadId && u.projectId === project.id);
       if (!upload) throw new StoreError('not_found');
+      if ('kind' in patch) checkKind(upload, patch.kind);
       if ('kind' in patch && !kindFitsAnnotations(kindOf({ ...upload, kind: patch.kind }), annotations.filter((a) => a.uploadId === uploadId))) throw new StoreError('label_in_use', upload.filename);
       for (const key of ['kind', 'offsetMs']) if (key in patch) upload[key] = patch[key] ?? null;
       return copy(upload);

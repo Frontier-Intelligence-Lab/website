@@ -747,3 +747,61 @@ withStore('label set edits and labelling serialize: no orphan label ids', async 
   const set = new Set((await store.getProject(where)).labelSet.map((l) => l.id));
   for (const a of await store.listAnnotations(where)) assert.ok(set.has(a.labelId), `annotation ${a.id} points at a label in the set`);
 });
+
+withStore('direct SQL cannot change any column of an upload once its project is frozen', async (store, pool) => {
+  const { owner, ws, p, video } = await labelledProject(store);
+  const other = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Other', task: 't', modalities: [], startingPoint: 'own' });
+  const loose = await store.createUpload({ workspaceId: ws.id, projectId: p.id, uploadedBy: owner.id, objectKey: 'loose', sha256: 'e'.repeat(64), sizeBytes: 3, contentType: 'image/png', filename: 'loose.png' });
+  const changes = [
+    ['filename', "filename = 'changed.png'"], ['content_type', "content_type = 'text/plain'"], ['size_bytes', 'size_bytes = 7'],
+    ['sha256', `sha256 = '${'f'.repeat(64)}'`], ['object_key', "object_key = 'moved/elsewhere'"], ['kind', "kind = 'audio'"],
+    ['offset_ms', 'offset_ms = 5'], ['uploaded_by', 'uploaded_by = uploaded_by'], ['duplicate_of', 'duplicate_of = NULL'],
+    ['created_at', 'created_at = now()'],
+  ];
+  for (const status of ['in_review', 'approved', 'versioned']) {
+    await pool.query('UPDATE projects SET status = $2 WHERE id = $1', [p.id, status]);
+    for (const [column, set] of changes) {
+      await assert.rejects(pool.query(`UPDATE uploads SET ${set} WHERE id = $1`, [video.id]), /project_frozen/, `${status}: ${column}`);
+    }
+    // Moving a file out of a frozen project is refused for the old parent; moving one in, for the new parent.
+    await assert.rejects(pool.query('UPDATE uploads SET project_id = $2 WHERE id = $1', [loose.id, other.id]), /project_frozen/, `${status}: move out`);
+  }
+  await pool.query("UPDATE projects SET status = 'draft' WHERE id = $1", [p.id]);
+  await pool.query("UPDATE projects SET status = 'in_review' WHERE id = $1", [other.id]);
+  await assert.rejects(pool.query('UPDATE uploads SET project_id = $2 WHERE id = $1', [loose.id, other.id]), /project_frozen/, 'move into a frozen project');
+  const row = (await pool.query('SELECT filename, content_type, size_bytes, sha256, object_key, kind FROM uploads WHERE id = $1', [video.id])).rows[0];
+  assert.deepEqual({ ...row, size_bytes: Number(row.size_bytes) }, { filename: 'dock.mp4', content_type: 'video/mp4', size_bytes: 10, sha256: 'a'.repeat(64), object_key: 'v1', kind: null });
+
+  // Editable projects keep every normal write: metadata changes, duplicate promotion on delete, plain SQL edits.
+  await pool.query("UPDATE projects SET status = 'draft' WHERE id = $1", [other.id]);
+  const where = { workspaceId: ws.id, projectId: p.id };
+  assert.equal((await store.updateUpload({ ...where, uploadId: video.id, patch: { offsetMs: 250 } })).offsetMs, 250);
+  const copy = await store.createUpload({ ...where, uploadedBy: owner.id, objectKey: 'loose-copy', sha256: 'e'.repeat(64), sizeBytes: 3, contentType: 'image/png', filename: 'loose copy.png' });
+  assert.equal(copy.duplicateOf, loose.id);
+  await store.deleteUpload({ ...where, uploadId: loose.id, actorId: owner.id });
+  assert.equal((await store.listUploads(where)).find((u) => u.id === copy.id).duplicateOf, null, 'the copy is promoted');
+  assert.equal((await pool.query("UPDATE uploads SET filename = 'renamed.mp4' WHERE id = $1", [video.id])).rowCount, 1);
+});
+
+withStore('an upload metadata write waits for an in-flight freeze, then is refused', async (store, pool) => {
+  const { p, video } = await labelledProject(store);
+  const freezer = await pool.connect();
+  const writer = await pool.connect();
+  try {
+    await freezer.query('BEGIN');
+    await freezer.query("UPDATE projects SET status = 'in_review' WHERE id = $1", [p.id]);
+    await writer.query('BEGIN');
+    const write = watch(writer.query("UPDATE uploads SET filename = 'late.mp4', sha256 = $2 WHERE id = $1", [video.id, 'f'.repeat(64)]));
+    await pause(150);
+    assert.equal(write.done, false, 'waits for the freeze');
+    await freezer.query('COMMIT');
+    const outcome = await write.result;
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error.message, /project_frozen/);
+  } finally {
+    await writer.query('ROLLBACK').catch(() => {});
+    writer.release();
+    freezer.release();
+  }
+  assert.equal((await pool.query('SELECT filename FROM uploads WHERE id = $1', [video.id])).rows[0].filename, 'dock.mp4');
+});

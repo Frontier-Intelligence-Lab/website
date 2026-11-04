@@ -30,7 +30,7 @@ export function registerWorkspaceDataRoutes(app, { config, store, helpers, guard
   const locked = (reply) => problem(reply, 409, 'This project is locked while it is in review or approved. Withdraw or reopen it to make changes.', { code: 'project_locked' });
   const storeFail = (reply, err) => {
     if (err instanceof StoreError && err.code === 'invalid_state') return locked(reply);
-    if (err instanceof StoreError && err.code === 'invalid_label') return problem(reply, 400, err.message);
+    if (err instanceof StoreError && (err.code === 'invalid_label' || err.code === 'invalid_kind')) return problem(reply, 400, err.message, { code: err.code });
     if (err instanceof StoreError && err.code === 'label_in_use') return problem(reply, 409, `“${err.message}” has labels that would no longer fit. Delete or move those labels first.`, { code: 'label_in_use' });
     if (err instanceof StoreError && err.code === 'not_found') return problem(reply, 404, 'Not found.');
     return fail(reply, err);

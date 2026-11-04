@@ -159,7 +159,7 @@ function Unavailable({ item, reason }) {
  * The file itself where a browser can show it safely (images, video, audio, the start of text files),
  * otherwise an honest placeholder. Nothing here is generated: no stand-in waveforms or frames.
  */
-export function Preview({ item, h = 140, controls = false, contain = false, localUrl, boxes }) {
+export function Preview({ item, h = 140, controls = false, contain = false, localUrl, boxes, placeholder }) {
   const [timing, setTiming] = useState({ id: null, ms: null });
   const setDuration = (ms) => setTiming({ id: item.id, ms });
   const duration = timing.id === item.id ? timing.ms : null;
@@ -167,7 +167,10 @@ export function Preview({ item, h = 140, controls = false, contain = false, loca
   const media = ['image', 'video'].includes(item.kind) || (item.kind !== 'audio' && /^(image|video)\//.test(item.contentType));
   const cls = `ds-preview k-${item.kind}${media && url ? ' ds-preview--media' : ''}${contain ? ' ds-preview--contain' : ''}`;
   let body;
-  if (!url) {
+  if (!url && placeholder) {
+    // A file still on its way (Import): say what will happen, not that storage is missing.
+    body = <Unavailable item={item} reason={TEXT_TYPES.includes(item.contentType) || /^(image|audio|video)\//.test(item.contentType) ? placeholder : 'No preview for this format yet.'} />;
+  } else if (!url) {
     body = <Unavailable item={item} reason={item.sizeBytes === 0 ? 'Empty file.' : TEXT_TYPES.includes(item.contentType) || /^(image|audio|video)\//.test(item.contentType) ? 'Previews need file storage, which is not configured here.' : 'No preview for this format yet. It is stored and versioned as is.'} />;
   } else if (item.contentType.startsWith('image/') && boxes?.length) {
     body = <BoxedImage key={item.id} url={url} alt={item.filename} boxes={boxes} />;

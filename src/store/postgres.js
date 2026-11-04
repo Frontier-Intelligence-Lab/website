@@ -1,6 +1,6 @@
 import { Pool } from 'pg';
 import { StoreError } from './errors.js';
-import { checkAnnotation, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
+import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
@@ -441,6 +441,7 @@ export function createPostgresStore(options) {
         const current = uploadRow((await query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 AND id = $3', [workspaceId, projectId, uploadId], client)).rows[0]);
         if (!current) throw new StoreError('not_found');
         if ('kind' in changes) {
+          checkKind(current, changes.kind);
           const labels = (await query('SELECT * FROM annotations WHERE upload_id = $1', [uploadId], client)).rows.map(annotationRow);
           if (!kindFitsAnnotations(kindOf({ ...current, kind: changes.kind }), labels)) throw new StoreError('label_in_use', current.filename);
         }
@@ -524,11 +525,10 @@ export function createPostgresStore(options) {
         if (!EDITABLE.includes(project.status)) throw new StoreError('invalid_state');
         if (requireResolved && project.data_source?.mode === 'upload') {
           // The gate reads files, labels and notes under the lock every write to them takes, so nothing slips in after the check.
-          const [uploads, annotations, notes] = await Promise.all([
-            query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId], client),
-            query('SELECT * FROM annotations WHERE project_id = $1', [projectId], client),
-            query('SELECT * FROM issue_notes WHERE project_id = $1', [projectId], client),
-          ]);
+          // One transaction client runs one query at a time, so these are sequential awaits.
+          const uploads = await query('SELECT * FROM uploads WHERE workspace_id = $1 AND project_id = $2 ORDER BY created_at, id', [workspaceId, projectId], client);
+          const annotations = await query('SELECT * FROM annotations WHERE project_id = $1', [projectId], client);
+          const notes = await query('SELECT * FROM issue_notes WHERE project_id = $1', [projectId], client);
           const open = computeIssues({ project: projectRow(project), uploads: uploads.rows.map(uploadRow), annotations: annotations.rows.map(annotationRow), notes: notes.rows.map(noteRow) }).filter(i => i.open).length;
           if (open) throw Object.assign(new StoreError('issues_open'), { open });
         }

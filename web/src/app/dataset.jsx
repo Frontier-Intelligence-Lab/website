@@ -194,7 +194,8 @@ export function DatasetOverview() {
                       <span style={{ fontSize: 13.5, fontWeight: 600 }}>Data type</span>
                       <select className="ds-select" value={sel.chosenKind ?? ''} disabled={d.pending} onChange={(e) => d.act(() => api.updateItem(d.entry.id, d.project.id, sel.id, { kind: e.target.value || null }))}>
                         <option value="">Detected: {KIND_ONE[sel.detectedKind]}</option>
-                        {KINDS.filter((k) => k !== sel.detectedKind).map((k) => <option key={k} value={k}>{KIND_ONE[k]}</option>)}
+                        {/* Image needs image bytes: a type set by hand describes the data, it cannot make text drawable. */}
+                        {KINDS.filter((k) => k !== sel.detectedKind && (k !== 'image' || sel.contentType.startsWith('image/'))).map((k) => <option key={k} value={k}>{KIND_ONE[k]}</option>)}
                       </select>
                     </label>
                   )}
@@ -408,7 +409,8 @@ export function DatasetAnnotate() {
   const spanLabels = d.labelSet.filter((l) => l.scope === 'span');
   const boxLabels = d.labelSet.filter((l) => l.scope === 'box');
   const fileLabels = d.labelSet.filter((l) => l.scope === 'file');
-  const toolLabels = item && TIMED.includes(item.kind) ? spanLabels : item?.kind === 'image' ? boxLabels : [];
+  const drawable = item?.kind === 'image' && item.contentType.startsWith('image/');
+  const toolLabels = item && TIMED.includes(item.kind) ? spanLabels : drawable ? boxLabels : [];
   const [tool, setTool] = useState(toolLabels[0]?.id ?? null);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(null);
@@ -524,7 +526,7 @@ export function DatasetAnnotate() {
           ) : (
             <div className="ob-card" style={{ padding: 0, overflow: 'hidden' }}><Preview item={item} h={320} contain controls /></div>
           )}
-          {item.kind === 'image' && d.canEdit && boxLabels.length > 0 && <p className="ds-kbd-help">Drag on the image to draw a “{d.labelSet.find((l) => l.id === tool)?.name ?? boxLabels[0].name}” box. 1–9 picks the label.</p>}
+          {drawable && d.canEdit && boxLabels.length > 0 && <p className="ds-kbd-help">Drag on the image to draw a “{d.labelSet.find((l) => l.id === tool)?.name ?? boxLabels[0].name}” box. 1–9 picks the label.</p>}
           {playable && (
             <div className="ds-transport">
               <button type="button" className="btn-small" onClick={() => seek(time - 5000)} aria-label="Back 5 seconds">−5s</button>
@@ -565,7 +567,7 @@ export function DatasetAnnotate() {
               </div>
             )}
             {!timed && spanLabels.length > 0 && <p className="ob-muted">{KIND_ONE[item.kind]} files have no timeline, so time-span labels do not apply here.</p>}
-            {item.kind !== 'image' && boxLabels.length > 0 && <p className="ob-muted">Box labels apply to images only.</p>}
+            {!drawable && boxLabels.length > 0 && <p className="ob-muted">Box labels apply only to files whose content is an image.</p>}
           </section>
           {d.canEdit && <LabelSetEditor d={d} />}
           <ItemLabels d={d} item={item} selected={selected} onSelect={setSelected} seek={seek} />
@@ -815,7 +817,8 @@ export function DatasetImport() {
                   const kind = r.kind ?? detectKind({ contentType: r.type, filename: r.name });
                   return (
                     <li key={n} className="ds-file-row">
-                      <div className="ds-issue-thumb"><Preview item={{ id: `local-${n}`, kind, contentType: r.contentType ?? r.type ?? '', filename: r.name, sizeBytes: r.size, previewUrl: null }} h={56} localUrl={r.local} /></div>
+                      <div className="ds-issue-thumb"><Preview item={{ id: `local-${n}`, kind, contentType: r.contentType ?? r.type ?? '', filename: r.name, sizeBytes: r.size, previewUrl: null }} h={56} localUrl={r.local}
+                        placeholder={r.state === 'failed' ? 'Not stored.' : r.state === 'done' || r.state === 'duplicate' ? 'Stored. Preview in the dataset view.' : 'Preview after upload.'} /></div>
                       <div style={{ flex: '1 1 220px' }}>
                         <strong style={{ overflowWrap: 'anywhere' }}>{r.name}</strong>
                         <span className="ob-muted">{fmtBytes(r.size)}{r.contentType ? ` · read as ${formatName(r.contentType)}` : ''}{r.contentType && r.type && r.contentType !== r.type ? ` (named as ${r.type})` : ''}</span>

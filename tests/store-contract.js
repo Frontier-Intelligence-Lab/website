@@ -343,6 +343,44 @@ export function runStoreContract(test, makeStore, label) {
     assert.ok(!(remove.status === 'fulfilled' && use.status === 'fulfilled'), 'a label cannot be removed and used at once');
   });
 
+  withStore('boxes need image bytes, not just an Image type, and are validated as stored', async (store) => {
+    const owner = await store.createUser({ email: 'o@acme.com', name: 'O', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'Acme', slug: 'acme', ownerId: owner.id });
+    const p = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'P', task: 'Spot tears', modalities: ['Images'], startingPoint: 'own' });
+    const where = { workspaceId: ws.id, projectId: p.id };
+    await store.setLabelSet({ ...where, labelSet: [{ id: 'b', name: 'tear', scope: 'box', tone: 'orange' }] });
+    const file = (key, contentType, filename) => store.createUpload({ ...where, uploadedBy: owner.id, objectKey: key, sha256: key.padEnd(64, '0').slice(0, 64).replace(/[^0-9a-f]/g, 'a'), sizeBytes: 9, contentType, filename });
+    const text = await file('t1', 'text/plain', 'notes.txt');
+    const csv = await file('c1', 'text/csv', 'readings.csv');
+    const png = await file('p1', 'image/png', 'carton.png');
+    const box = (uploadId, b) => store.createAnnotation({ ...where, uploadId, labelId: 'b', box: b, createdBy: owner.id });
+
+    // A type set by hand describes meaning (CSV readings are sensor data) but cannot claim image content.
+    await assert.rejects(store.updateUpload({ ...where, uploadId: text.id, patch: { kind: 'image' } }), (err) => err.code === 'invalid_kind' && /text\/plain/.test(err.message));
+    assert.equal((await store.updateUpload({ ...where, uploadId: csv.id, patch: { kind: 'sensor' } })).kind, 'sensor');
+    await assert.rejects(box(text.id, { x: 0.1, y: 0.1, w: 0.2, h: 0.2 }), (err) => err.code === 'invalid_label' && /not an image/.test(err.message));
+    // Real image bytes typed as something else: the box waits until the type is Image again.
+    await store.updateUpload({ ...where, uploadId: png.id, patch: { kind: 'file' } });
+    await assert.rejects(box(png.id, { x: 0.1, y: 0.1, w: 0.2, h: 0.2 }), (err) => err.code === 'invalid_label' && /back to Image/.test(err.message));
+    await store.updateUpload({ ...where, uploadId: png.id, patch: { kind: null } });
+
+    // Geometry is checked on the rounded values that are stored.
+    for (const bad of [{ x: 0.1, y: 0.1, w: 0.0000001, h: 0.2 }, { x: 0.1, y: 0.1, w: 0.2, h: 0.0004 }, { x: 0.1, y: 0.1, w: 0.0009, h: 0.2 },
+      { x: 0.9, y: 0, w: 0.2, h: 0.2 }, { x: -0.000001, y: 0, w: 0.5, h: 0.5 }, { x: Number.NaN, y: 0, w: 0.5, h: 0.5 },
+      { x: 0, y: 0, w: Number.POSITIVE_INFINITY, h: 0.5 }, { x: '0.1', y: 0, w: 0.5, h: 0.5 }, null]) {
+      await assert.rejects(box(png.id, bad), { code: 'invalid_label' }, JSON.stringify(bad));
+    }
+    assert.deepEqual((await box(png.id, { x: 0, y: 0, w: 1, h: 1 })).box, { x: 0, y: 0, w: 1, h: 1 });
+    assert.ok(Object.is((await box(png.id, { x: -0.0000001, y: 0, w: 0.5, h: 0.5 })).box.x, 0), 'a value that rounds to 0 is stored as 0, never -0');
+    assert.deepEqual((await box(png.id, { x: 0.1, y: 0.2, w: 0.001, h: 0.001 })).box, { x: 0.1, y: 0.2, w: 0.001, h: 0.001 }, 'the smallest allowed box');
+    // Rounding at the edge can overrun 1 by one step; that is inside the stored tolerance and accepted by both stores.
+    assert.deepEqual((await box(png.id, { x: 0.3333335, y: 0, w: 0.6666665, h: 1 })).box, { x: 0.333334, y: 0, w: 0.666667, h: 1 });
+    const ok = await box(png.id, { x: 0.25, y: 0.5, w: 0.5, h: 0.25 });
+    await assert.rejects(store.updateAnnotation({ ...where, annotationId: ok.id, patch: { box: { x: 0.25, y: 0.5, w: 0.0000001, h: 0.25 } } }), { code: 'invalid_label' });
+    await assert.rejects(store.updateAnnotation({ ...where, annotationId: ok.id, patch: { box: { x: 0.25, y: 0.5, w: 0.8, h: 0.25 } } }), { code: 'invalid_label' });
+    assert.deepEqual((await store.updateAnnotation({ ...where, annotationId: ok.id, patch: { box: { x: 0.1234564, y: 0.5, w: 0.2, h: 0.25 } } })).box, { x: 0.123456, y: 0.5, w: 0.2, h: 0.25 });
+  });
+
   withStore('reviewer accounts are separate from customer users and never expose hashes', async (store) => {
     await store.upsertReviewer({ username: 'YCInsider', name: 'YC reviewer', role: 'viewer', passwordHash: 'scrypt$a' });
     await store.upsertReviewer({ username: 'admin', name: 'Admin', role: 'admin', passwordHash: 'scrypt$b' });

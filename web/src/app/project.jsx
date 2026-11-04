@@ -13,9 +13,9 @@ const STARTS = [
   { id: 'unsure', icon: 'question', tone: 'violet', title: 'Not sure yet', body: 'Book a short call and we will scope it with you.' },
 ];
 const PLANS = {
-  own: [['Describe the task', 'You are here'], ['Record your data and its rights', 'Where it came from and how it may be used'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Approve dataset version 1', 'Locked, versioned, private to you'], ['Train and evaluate', 'Starts only after you approve a cost estimate'], ['Accept the model and deploy', 'Your cloud, your servers or a supported device']],
-  need: [['Describe the task', 'You are here'], ['Shortlist or commission data', 'Compare samples, coverage and allowed uses'], ['Agree license terms', 'Nothing is bought until you approve'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Train and evaluate', 'Starts only after you approve a cost estimate'], ['Accept the model and deploy', 'Your cloud, your servers or a supported device']],
-  model: [['Describe the task', 'You are here'], ['Connect your model', 'An endpoint or a model file you are allowed to use'], ['Add a test set', 'Examples with the answers you expect'], ['Compare against a baseline', 'See where it passes and fails'], ['Deploy', 'Readiness checks before anything goes live']],
+  own: [['Describe the task', 'You are here'], ['Record your data and its rights', 'Where it came from and how it may be used'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Approve dataset version 1', 'Locked, versioned, private to you'], ['Train and evaluate', 'Planned. Will start only after you approve a cost estimate', true], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
+  need: [['Describe the task', 'You are here'], ['Shortlist or commission data', 'Compare samples, coverage and allowed uses'], ['Agree license terms', 'Nothing is bought until you approve'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Train and evaluate', 'Planned. Will start only after you approve a cost estimate', true], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
+  model: [['Describe the task', 'You are here'], ['Connect your model', 'An endpoint or a model file you are allowed to use'], ['Add a test set', 'Examples with the answers you expect'], ['Compare against a baseline', 'Planned. See where it passes and fails', true], ['Deploy', 'Planned. Readiness checks before anything goes live', true]],
   unsure: [['Describe the task', 'You are here'], ['Scoping call', '30 minutes with our team'], ['Get a written plan', 'Data, approach, test method and a cost range']],
 };
 
@@ -95,8 +95,8 @@ export function ProjectGoal() {
           <div className="ob-card">
             <div className="ob-intro" style={{ gap: 4 }}><h2>Your project plan</h2><span className="ob-muted">Updates as you answer. Only the steps your path needs.</span></div>
             <ol className="ob-list">
-              {PLANS[start].map(([label, note], i) => (
-                <li key={label}><span className={`ob-num${i === 0 ? ' ob-num--now' : ''}`}>{i + 1}</span><div><strong>{label}</strong><span className="ob-muted">{note}</span></div></li>
+              {PLANS[start].map(([label, note, planned], i) => (
+                <li key={label}><span className={`ob-num${i === 0 ? ' ob-num--now' : ''}`}>{i + 1}</span><div><strong>{label}</strong><span className="ob-muted">{note}</span></div>{planned && <span className="ob-badge">Planned</span>}</li>
               ))}
             </ol>
           </div>
@@ -165,7 +165,7 @@ export function ProjectSuccess() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">How will you know it works?</h1>
-            <p className="ob-lede">Set the bar before any training. Every model version is tested against it, and you decide whether to accept it.</p>
+            <p className="ob-lede">Set the bar before any training. Training and testing are planned, not running yet: when they open, every model version will be tested against this bar and you decide whether to accept it.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           <div className="ob-grid">
@@ -215,14 +215,14 @@ export function ProjectSuccess() {
           <div className="ob-card">
             <h2>Your acceptance rule</h2>
             <p style={{ lineHeight: 1.6 }}>Accept a model when it scores <strong>{target || '[target]'}</strong> on <strong>{measureLabel}</strong> against held-out examples, does better than <strong>{baselineLabel}</strong>{runsOn === 'device' ? <>, and runs on <strong>{device || '[your device]'}</strong></> : ''}.</p>
-            <span className="ob-muted">You can change this until the first training run is approved. After that, changes start a new version.</span>
+            <span className="ob-muted">You can change this until you send the project for review. Reopening the project lets you change it again.</span>
           </div>
           <div className="ob-card">
             <h2>Nothing runs on its own</h2>
             <ul className="ob-list">
               <li><Tile icon="shield" tone="blue" size="sm" /><div><span className="ob-muted">We check your data, model and device fit together first.</span></div></li>
               <li><Tile icon="check" tone="green" size="sm" /><div><span className="ob-muted">You see a cost estimate and approve it before any training.</span></div></li>
-              <li><Tile icon="layers" tone="violet" size="sm" /><div><span className="ob-muted">Results come from real tests on your held-out data.</span></div></li>
+              <li><Tile icon="layers" tone="violet" size="sm" /><div><span className="ob-muted">Planned: results will come from tests on your held-out data. Nothing has been trained or tested yet.</span></div></li>
             </ul>
           </div>
         </aside>

@@ -10,8 +10,15 @@ export const TONES = ['orange', 'blue', 'violet', 'green', 'amber', 'teal', 'pla
 export const SCOPES = ['span', 'file', 'box'];
 const MAX_MS = 31622400000;
 const isMs = (n) => Number.isSafeInteger(n) && n >= 0 && n <= MAX_MS;
-const unit = (n) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
 const invalid = (message) => new StoreError('invalid_label', message);
+// Boxes are stored as fractions of the image with six decimals. Each side must be at least 0.1% of the image,
+// and a box may overrun the edge only by the rounding tolerance the database allows (1e-6).
+const BOX_DECIMALS = 1e6;
+export const MIN_BOX_SIDE = 0.001;
+const EDGE_UNITS = 1000001; // 1 + 1e-6, in millionths
+
+/** Whether the stored bytes are an image a browser can draw on. Ingest refuses SVG, so every image/* type is raster. */
+export const isImageContent = (upload) => /^image\/[\w.+-]+$/.test(upload?.contentType ?? '') && upload.contentType !== 'image/svg+xml';
 
 const TEXT_TYPES = ['text/plain', 'text/csv', 'text/tab-separated-values', 'text/markdown', 'application/json', 'application/x-ndjson'];
 const ARCHIVES = ['application/zip', 'application/gzip', 'application/x-tar', 'application/x-7z-compressed', 'application/x-bzip2', 'application/zstd'];
@@ -48,11 +55,18 @@ export function checkAnnotation({ label, upload, startMs = null, endMs = null, b
     return { startMs, endMs, box: null };
   }
   if (label.scope === 'box') {
-    if (kind !== 'image') throw invalid(`“${label.name}” is a box on an image, and this file is not an image.`);
+    // The file's type can be changed by hand, so the bytes decide whether there is an image to draw on.
+    if (!isImageContent(upload)) throw invalid(`“${label.name}” is a box on an image, and this file’s content is not an image (${upload.contentType}). Use a whole-file label.`);
+    if (kind !== 'image') throw invalid(`“${label.name}” is a box on an image. Set this file’s data type back to Image first.`);
     const b = box ?? {};
-    if (![b.x, b.y, b.w, b.h].every(unit) || b.w <= 0 || b.h <= 0 || b.x + b.w > 1.000001 || b.y + b.h > 1.000001) throw invalid('Draw the box inside the image.');
-    const round = (n) => Math.round(n * 1e6) / 1e6;
-    return { startMs: null, endMs: null, box: { x: round(b.x), y: round(b.y), w: round(b.w), h: round(b.h) } };
+    if (![b.x, b.y, b.w, b.h].every((n) => typeof n === 'number' && Number.isFinite(n))) throw invalid('A box needs numeric x, y, width and height.');
+    // Validate exactly what will be stored, in whole millionths so the sums are exact (as Postgres' numeric check is).
+    const [X, Y, W, H] = [b.x, b.y, b.w, b.h].map((n) => Math.round(n * BOX_DECIMALS) + 0); // + 0 turns -0 into 0
+    if (X < 0 || Y < 0 || X > BOX_DECIMALS || Y > BOX_DECIMALS) throw invalid('Draw the box inside the image.');
+    if (W < MIN_BOX_SIDE * BOX_DECIMALS || H < MIN_BOX_SIDE * BOX_DECIMALS) throw invalid('Draw a larger box: each side must be at least 0.1% of the image.');
+    if (X + W > EDGE_UNITS || Y + H > EDGE_UNITS) throw invalid('Draw the box inside the image.');
+    const [x, y, w, h] = [X, Y, W, H].map((n) => n / BOX_DECIMALS);
+    return { startMs: null, endMs: null, box: { x, y, w, h } };
   }
   return { startMs: null, endMs: null, box: null };
 }
@@ -60,6 +74,14 @@ export function checkAnnotation({ label, upload, startMs = null, endMs = null, b
 /** A label in use cannot be removed or change what it marks. Returns the first label that would break, or null. */
 export function labelSetConflict(current, next, usedIds) {
   return current.find((l) => usedIds.has(l.id) && next.find((n) => n.id === l.id)?.scope !== l.scope) ?? null;
+}
+
+/**
+ * A type set by hand may describe what the data means (a CSV of readings is Sensor) but cannot claim content the file
+ * does not have: Image needs image bytes. Throws `invalid_kind` with a message for the person.
+ */
+export function checkKind(upload, kind) {
+  if (kind === 'image' && !isImageContent(upload)) throw new StoreError('invalid_kind', `This file’s content is ${upload.contentType}, not an image, so it cannot be typed as Image.`);
 }
 
 /** Whether a file can keep its labels after its data type changes to `kind`. */

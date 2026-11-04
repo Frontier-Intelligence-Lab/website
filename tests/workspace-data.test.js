@@ -256,8 +256,29 @@ test('box labels only on images and inside them; spans edit in place; renames ke
   assert.equal(annotations.length, 2, 'renaming kept both labels');
   assert.equal(live[0].name, 'torn carton');
 
-  assert.equal((await owner.post(`${base}/items/${video.id}`, { kind: 'image' })).json().code, 'label_in_use', 'a video with spans cannot become an image');
+  assert.equal((await owner.post(`${base}/items/${video.id}`, { kind: 'text' })).json().code, 'label_in_use', 'a video with spans cannot become a type without a timeline');
+  assert.equal((await owner.post(`${base}/items/${video.id}`, { kind: 'image' })).json().code, 'invalid_kind', 'video bytes are not an image');
   assert.equal((await owner.post(`${base}/items/${image.id}`, { kind: 'text' })).json().code, 'label_in_use', 'an image with boxes cannot become text');
   assert.equal((await owner.post(`${base}/items/${video.id}`, { kind: 'audio' })).statusCode, 200, 'still timed, so spans stay valid');
+  await app.close();
+});
+
+test('the API refuses an Image type for text bytes and boxes on them, with a message the person can act on', async () => {
+  const { app, owner, base, add } = await setup();
+  const text = await add({ contentType: 'text/plain', filename: 'notes.txt', sha256: '4'.repeat(64) });
+  const csv = await add({ contentType: 'text/csv', filename: 'readings.csv', sha256: '5'.repeat(64) });
+  const { labelSet } = (await owner.post(`${base}/label-set`, { labels: [{ name: 'tear', scope: 'box' }] })).json();
+  const typed = await owner.post(`${base}/items/${text.id}`, { kind: 'image' });
+  assert.equal(typed.statusCode, 400);
+  assert.equal(typed.json().code, 'invalid_kind');
+  assert.match(typed.json().error, /not an image/);
+  assert.equal((await owner.post(`${base}/items/${csv.id}`, { kind: 'sensor' })).json().item.kind, 'sensor', 'semantic reclassification still works');
+  const boxed = await owner.post(`${base}/items/${text.id}/annotations`, { labelId: labelSet[0].id, box: { x: 0.1, y: 0.1, w: 0.2, h: 0.2 } });
+  assert.equal(boxed.statusCode, 400);
+  assert.equal(boxed.json().code, 'invalid_label');
+  const image = await add({ contentType: 'image/png', filename: 'carton.png', sha256: '6'.repeat(64) });
+  const tiny = await owner.post(`${base}/items/${image.id}/annotations`, { labelId: labelSet[0].id, box: { x: 0.1, y: 0.1, w: 0.0000001, h: 0.2 } });
+  assert.equal(tiny.statusCode, 400, 'a box that rounds to zero is a clean 400, never a server error');
+  assert.match(tiny.json().error, /at least 0\.1%/);
   await app.close();
 });
