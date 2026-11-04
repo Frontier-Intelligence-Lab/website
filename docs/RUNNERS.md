@@ -20,7 +20,7 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 
 ## In the app
 
-**Compute** (`/w/:slug/compute`) lists the workspace's runners with what each one reports: GPUs, sandbox, Ollama models and platform, and whether it is online (reported within the last 90 seconds). Owners and admins link a machine there, which shows the key once with the commands to start the runner. They can also run a sandbox check or disconnect a runner. Each job shows its status, its attempt and a live event timeline. A job that has not finished can be cancelled.
+**Compute** (`/w/:slug/compute`) lists the workspace's runners with what each one reports: GPUs, sandbox, Ollama models and platform, and whether it is online (reported within the last 90 seconds). Owners and admins link a machine there, which shows the key once with the commands to start the runner. Plans approved with compute set to **Your Valcairn Runner** are listed with **Start training**. A finished training job shows the held-out loss of the base and the tuned model, the example counts, the steps and time, the adapter's SHA-256 and the loss curve. They can also run a sandbox check or disconnect a runner. Each job shows its status, its attempt and a live event timeline. A job that has not finished can be cancelled.
 
 ## Rules
 
@@ -32,7 +32,7 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 - **Cancel.** Cancelling a queued job ends it at once. Cancelling a held job sets `cancel_requested`. The runner sees `cancelRequested: true` on its next heartbeat or event call, stops its sandbox and reports the end, which is recorded as `cancelled`. If the runner never reports, the lease runs out and the job is still recorded as `cancelled`.
 - **Revoke.** Revoking a runner cancels its waiting jobs and fails the job it holds (`runner_revoked`).
 - **Frozen inputs.** A job's `spec` is copied when it is created: the approved plan, its plan version and the model's catalog entry. Later catalog or plan changes never alter what a job runs. In Postgres a trigger refuses any change to a job's inputs or to a finished job, and job events are append-only.
-- **Plans.** Training, evaluation and export jobs need an enhance plan that was approved (`requested`) with compute set to **Your Valcairn Runner**. A plan approved for a GPU provider is not run on a runner.
+- **Plans.** Training, evaluation and export jobs need an enhance plan that was approved (`requested`) with compute set to **Your Valcairn Runner** (`runner`; migration 014 adds it to the `enhance_runs.compute` check). A plan approved for a GPU provider is not run on a runner.
 - **What is stored.** Events are bounded and typed: `log` (level and up to 2,000 characters), `metric` (a name and a finite number), `stage` (a name and started, finished, skipped or failed) and `artifact` (a name, SHA-256 and size). Failures are stored as a category only (`cancelled`, `sandbox_unavailable`, `sandbox_error`, `out_of_memory`, `disk_full`, `dataset_error`, `model_unavailable`, `runtime_error`, `timeout`, `unsupported`), never as raw error text, which could echo training data. Runner capabilities (platform, GPUs, Ollama models, sandbox) are self-reported by the runner and shown as such.
 - **Idempotency.** Queuing a job takes a request key. Sending the same key again returns the same job; reusing it for a different job is `409 idempotency_conflict`. Event batches carry a sequence number per attempt, so a retried batch is stored once.
 

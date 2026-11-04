@@ -22,12 +22,14 @@ const online = (r) => r.status === 'active' && r.lastSeenAt && Date.now() - new 
 
 export async function computeLoader({ params }) {
   const { account, entry } = await requireWorkspace(params.slug);
-  const [{ runners }, { jobs }] = await Promise.all([api.runners(entry.id), api.jobs(entry.id)]);
-  return { account, entry, runners, jobs };
+  const [{ runners }, { jobs }, models] = await Promise.all([api.runners(entry.id), api.jobs(entry.id), api.models(entry.id)]);
+  // Plans approved to run on a runner; the server checks the plan again when a job is queued.
+  const plans = models.runs.filter((r) => r.status === 'requested' && r.compute === 'runner');
+  return { account, entry, runners, jobs, plans, catalog: models.catalog };
 }
 
 export function Compute() {
-  const { account, entry, runners: initialRunners, jobs: initialJobs } = useLoaderData();
+  const { account, entry, runners: initialRunners, jobs: initialJobs, plans, catalog } = useLoaderData();
   const [runners, setRunners] = useState(initialRunners);
   const [jobs, setJobs] = useState(initialJobs);
   const [open, setOpen] = useState(null);
@@ -48,13 +50,14 @@ export function Compute() {
     return () => clearInterval(t);
   }, [live, refresh]);
 
-  const queueProbe = async (runner) => {
-    const res = await api.createJob(entry.id, { kind: 'probe', runnerId: runner.id, idempotencyKey: crypto.randomUUID() }).catch(() => null);
-    if (!res?.ok) return setNotice({ text: res?.data?.error ?? 'Valcairn could not be reached. Try again.' });
-    setNotice({ tone: 'ok', text: `Sandbox check queued on ${runner.label}. It starts when the runner next checks in.` });
+  const queue = async (runner, body, what) => {
+    const res = await api.createJob(entry.id, { runnerId: runner.id, idempotencyKey: crypto.randomUUID(), ...body }).catch(() => null);
+    if (!res?.ok) return setNotice({ text: Object.values(res?.data?.errors ?? {})[0] ?? res?.data?.error ?? 'Valcairn could not be reached. Try again.' });
+    setNotice({ tone: 'ok', text: `${what} queued on ${runner.label}. It starts when the runner next checks in.` });
     setOpen(res.data.job.id);
     refresh();
   };
+  const queueProbe = (runner) => queue(runner, { kind: 'probe' }, 'Sandbox check');
 
   const active = runners.filter((r) => r.status === 'active');
   return (
@@ -65,13 +68,14 @@ export function Compute() {
         <p className="ob-lede">Link your own machines as Valcairn Runners. Jobs run there in a locked-down sandbox with no network access. Valcairn never connects to the machine: the runner calls in.</p>
         <div className="ob-chips" style={{ gap: 6 }} aria-label="What runs on a runner">
           <span className="ob-badge tile--green">Available · Sandbox check</span>
-          <span className="ob-badge">Planned · Training</span>
+          <span className="ob-badge tile--green">Fine-tuning (LoRA) · runner 0.2 or later</span>
           <span className="ob-badge">Planned · Evaluation</span>
           <span className="ob-badge">Planned · Export</span>
         </div>
       </div>
       {notice && <p className={`ob-alert${notice.tone === 'ok' ? ' ob-alert--ok' : ''}`} role="status">{notice.text}</p>}
       {manager ? <LinkCard workspaceId={entry.id} onLinked={refresh} /> : <p className="ob-muted">Owners and admins link runners and start jobs. You can see them here.</p>}
+      {manager && plans.length > 0 && <PlansCard plans={plans} catalog={catalog} runners={active} onStart={(runner, plan) => queue(runner, { kind: 'train', enhanceRunId: plan.id }, `Training “${plan.name}”`)} />}
       <RunnersCard runners={runners} manager={manager} onProbe={queueProbe} workspaceId={entry.id} onChange={refresh} />
       <JobsCard jobs={jobs} runners={runners} manager={manager} workspaceId={entry.id} open={open} setOpen={setOpen} onChange={refresh} hasRunner={active.length > 0} />
     </WorkspaceShell>
@@ -126,6 +130,51 @@ function LinkCard({ workspaceId, onLinked }) {
         </>
       )}
     </section>
+  );
+}
+
+function PlansCard({ plans, catalog, runners, onStart }) {
+  const [runnerId, setRunnerId] = useState(runners[0]?.id ?? '');
+  const [pending, setPending] = useState(null);
+  const runner = runners.find((r) => r.id === runnerId) ?? runners[0];
+  const model = (id) => catalog.find((m) => m.id === id)?.name ?? id;
+  return (
+    <section className="ob-card" aria-labelledby="plans-h">
+      <div className="row-between"><h2 id="plans-h">Approved plans for your runner</h2><Tile icon="target" tone="violet" /></div>
+      <p className="ob-muted">Each was approved with compute set to your runner. Training runs in the sandbox with no network; about 10% of the examples are held out to compare the base and the tuned model.</p>
+      {runners.length > 1 && (
+        <div className="ob-field" style={{ maxWidth: 320 }}>
+          <label htmlFor="plan-runner">Runner</label>
+          <select id="plan-runner" value={runnerId} onChange={(e) => setRunnerId(e.target.value)}>{runners.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}</select>
+        </div>
+      )}
+      {plans.map((p) => (
+        <div key={p.id} className="row-between" style={{ flexWrap: 'wrap', gap: 10, marginTop: 10 }}>
+          <div className="cell-stack">
+            <strong>{p.name}</strong>
+            <span className="ob-muted" style={{ fontSize: 13 }}>{model(p.baseModelId)} · {plural(p.datasets.length, 'dataset version')} · {p.steps.join(', ')}</span>
+          </div>
+          <button type="button" className="btn-app" disabled={!runner || pending === p.id} onClick={async () => { setPending(p.id); await onStart(runner, p); setPending(null); }}>
+            {runner ? `Start training on ${runner.label}` : 'Link a runner first'}
+          </button>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function LossChart({ points }) {
+  if (points.length < 2) return null;
+  const w = 320, h = 90, max = Math.max(...points.map((p) => p.value)), min = Math.min(...points.map((p) => p.value));
+  const x = (i) => (i / (points.length - 1)) * (w - 8) + 4;
+  const y = (v) => h - 6 - ((v - min) / (max - min || 1)) * (h - 12);
+  return (
+    <figure style={{ margin: 0 }}>
+      <svg viewBox={`0 0 ${w} ${h}`} width="100%" style={{ maxWidth: w }} role="img" aria-label={`Training loss over ${points.length} logged steps, from ${points[0].value.toFixed(3)} to ${points.at(-1).value.toFixed(3)}`}>
+        <polyline fill="none" stroke="currentColor" strokeWidth="2" points={points.map((p, i) => `${x(i)},${y(p.value)}`).join(' ')} />
+      </svg>
+      <figcaption className="ob-muted" style={{ fontSize: 12 }}>Training loss by step, {points[0].value.toFixed(3)} → {points.at(-1).value.toFixed(3)}</figcaption>
+    </figure>
   );
 }
 
@@ -212,6 +261,9 @@ function JobsCard({ jobs, runners, manager, workspaceId, open, setOpen, onChange
   );
 }
 
+// Every stage, log and artifact; for each metric only its latest value, so a long training run stays readable.
+const visible = (events) => events.filter((e, i) => e.kind !== 'metric' || !events.slice(i + 1).some((n) => n.kind === 'metric' && n.data.name === e.data.name));
+
 function JobDetail({ workspaceId, jobId, manager, onChange }) {
   const [job, setJob] = useState(null);
   const [events, setEvents] = useState([]);
@@ -251,8 +303,18 @@ function JobDetail({ workspaceId, jobId, manager, onChange }) {
       {job.kind === 'probe' && job.status === 'succeeded' && (
         <p>Sandbox ran with network <strong>{result.network}</strong>; {plural(result.sandboxGpus?.length ?? 0, 'GPU')} visible inside it{result.sandboxGpus?.length ? ` (${result.sandboxGpus.map((g) => `${g.name}, ${Math.round(g.memoryMb / 1024)} GB`).join('; ')})` : ''}. Ollama {result.ollamaReachable ? 'reachable' : 'not reachable'} on the runner.</p>
       )}
+      {job.kind === 'train' && job.status === 'succeeded' && (
+        <dl className="dev-facts" style={{ display: 'grid', gap: 8 }}>
+          <div className="dev-fact"><dt>Held-out loss, base model</dt><dd>{result.baseHeldOutLoss?.toFixed(4)}</dd></div>
+          <div className="dev-fact"><dt>Held-out loss, tuned</dt><dd><strong>{result.tunedHeldOutLoss?.toFixed(4)}</strong></dd></div>
+          <div className="dev-fact"><dt>Examples</dt><dd>{result.trainExamples} trained · {result.heldOutExamples} held out</dd></div>
+          <div className="dev-fact"><dt>Training</dt><dd>{result.steps} steps · {result.trainSeconds} s · {result.gpus?.join(', ')}</dd></div>
+          <div className="dev-fact"><dt>Adapter</dt><dd><code>{result.adapter?.sha256?.slice(0, 16)}…</code> · {Math.round((result.adapter?.sizeBytes ?? 0) / 2 ** 20)} MB, on the runner</dd></div>
+        </dl>
+      )}
+      {job.kind === 'train' && <LossChart points={events.filter((e) => e.kind === 'metric' && e.data.name === 'train_loss').map((e) => e.data)} />}
       <ol className="dev-steps" aria-label="Job events">
-        {events.length === 0 ? <li className="ob-muted">No events yet.</li> : events.map((e) => (
+        {events.length === 0 ? <li className="ob-muted">No events yet.</li> : visible(events).map((e) => (
           <li key={e.id}>
             <span className="ob-muted" style={{ fontSize: 12 }}>{when(e.createdAt)} · attempt {e.attempt}</span>{' '}
             {e.kind === 'stage' && <>Stage <strong>{e.data.name}</strong> {e.data.status}</>}

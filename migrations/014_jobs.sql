@@ -4,6 +4,11 @@
 -- Jobs are the durable queue between the web app and runners: leased one at a time with an expiry, retried a
 -- bounded number of times, cancellable, and append-only in their event log.
 
+-- A plan may now be approved to run on the workspace's own runner as well as on a GPU provider.
+ALTER TABLE enhance_runs DROP CONSTRAINT enhance_runs_compute_check;
+ALTER TABLE enhance_runs ADD CONSTRAINT enhance_runs_compute_check
+  CHECK (compute IS NULL OR compute IN ('nebius', 'coreweave', 'lambda', 'runner'));
+
 CREATE TABLE runners (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,

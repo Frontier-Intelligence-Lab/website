@@ -194,7 +194,7 @@ test('a lost runner: expired leases are retried a bounded number of times, then 
 test('training jobs need an approved plan set to run on the runner; the plan is frozen into the job', async () => {
   const { store, owner, ws, base, link, queue } = await setup();
   const { runner } = await link();
-  const plan = (compute) => store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Support tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId: '00000000-0000-4000-8000-000000000001', version: 1 }], steps: ['sft'], compute, spendCapUsd: 0 } });
+  const plan = (compute) => store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Support tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId: '00000000-0000-4000-8000-000000000001', version: 1 }], steps: ['sft'], compute, spendCapUsd: 1 } });
   const approve = (r) => store.requestEnhanceRun({ workspaceId: ws.id, runId: r.id, requestedBy: owner.id, expectedUpdatedAt: r.updatedAt });
 
   const draft = await plan('runner');
@@ -251,7 +251,7 @@ test('a runner gets a training job’s frozen dataset files only while it holds 
   const manifest = (allowedUses) => ({ dataSource: { mode: 'upload', allowedUses }, files: [{ id: 'f1', filename: 'chats.jsonl', sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'application/json', objectKey: `ws/${ws.id}/f1` }] });
   let current = manifest(['training']);
   store.listDatasetVersions = async ({ workspaceId, projectId: p }) => (workspaceId === ws.id && p === projectId ? [{ number: 1, manifest: current }] : []);
-  const draft = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId, version: 1 }], steps: ['sft'], compute: 'runner', spendCapUsd: 0 } });
+  const draft = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'Tone', baseModelId: 'fixture-dense-8b', datasets: [{ projectId, version: 1 }], steps: ['sft'], compute: 'runner', spendCapUsd: 1 } });
   const plan = await store.requestEnhanceRun({ workspaceId: ws.id, runId: draft.id, requestedBy: owner.id, expectedUpdatedAt: draft.updatedAt });
   const job = (await owner.post(`${base}/jobs`, { kind: 'train', runnerId: runner.id, enhanceRunId: plan.id, idempotencyKey: 'train-key-001' })).json().job;
 

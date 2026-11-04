@@ -687,6 +687,14 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal(await store.getRunner({ workspaceId: other.id, runnerId: runner.id }), null);
     assert.ok((await store.reportRunner({ runnerId: runner.id, capabilities: { gpus: [] } })).lastSeenAt);
 
+    // A plan can be approved to run on the workspace's own runner (migration 014 widens the compute check).
+    const draft = await store.createEnhanceRun({ workspaceId: ws.id, createdBy: owner.id, run: { name: 'r', baseModelId: 'example-base', datasets: [{ projectId: ws.id, version: 1 }], steps: ['sft'], compute: 'runner', spendCapUsd: 1 } });
+    const plan = await store.requestEnhanceRun({ workspaceId: ws.id, runId: draft.id, requestedBy: owner.id, expectedUpdatedAt: draft.updatedAt });
+    assert.deepEqual([plan.compute, plan.status], ['runner', 'requested']);
+    const trainJob = await store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'train', enhanceRunId: plan.id, spec: { plan: {} }, idempotencyKey: 'key-train-0001', createdBy: owner.id });
+    assert.equal(trainJob.enhanceRunId, plan.id);
+    await store.cancelJob({ workspaceId: ws.id, jobId: trainJob.id, actorId: owner.id });
+
     const mk = (key, extra = {}) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: key, createdBy: owner.id, ...extra });
     const job = await mk('key-00000001');
     assert.equal((await mk('key-00000001')).id, job.id, 'same request key, same job');
