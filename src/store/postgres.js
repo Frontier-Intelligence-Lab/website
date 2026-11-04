@@ -2,6 +2,8 @@ import { Pool } from 'pg';
 import { StoreError } from './errors.js';
 import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
 import { boxNotStoredForm, frozenBoxViolations } from '../lib/box-sql.js';
+import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
+import { snapshotHash } from '../lib/capital-hash.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
@@ -35,6 +37,9 @@ function databaseError(error) {
       workspaces_slug_key: 'slug_taken',
       workspaces_personal_owner_id_key: 'personal_exists',
       uploads_object_key_key: 'duplicate_upload',
+      // migrations/013_capital.sql: a revision is submitted once; a credit record is corrected once.
+      capital_submissions_case_id_revision_key: 'invalid_state',
+      credit_records_supersedes_key: 'invalid_state',
     }[error.constraint];
     if (code) return new StoreError(code);
   }
@@ -43,6 +48,8 @@ function databaseError(error) {
   if (error.code === 'P0001' && error.message === 'project_frozen') return new StoreError('invalid_state');
   // Raised by migrations/011_models.sql once an enhance run is requested.
   if (error.code === 'P0001' && error.message === 'run_frozen') return new StoreError('invalid_state');
+  // Raised by migrations/013_capital.sql: submitted revisions and credit records never change.
+  if (error.code === 'P0001' && ['submission_frozen', 'credit_record_frozen', 'review_mark_frozen'].includes(error.message)) return new StoreError('invalid_state');
   // PostgreSQL details can contain complete rows, including hashes or private data.
   const safe = new Error('Postgres operation failed');
   if (typeof error.code === 'string') safe.code = error.code;
@@ -137,6 +144,29 @@ const execRow = (r) => ({
   promptSha256: r.prompt_sha256, provenance: r.provenance, createdAt: iso(r.created_at),
 });
 
+const caseRow = (r) => r ? {
+  id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, enhanceRunId: r.enhance_run_id, title: r.title, status: r.status,
+  draft: r.draft, revision: r.revision, submittedRevision: r.submitted_revision, createdBy: r.created_by, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
+} : null;
+const submissionRow = (r) => r ? {
+  id: r.id, caseId: r.case_id, workspaceId: r.workspace_id, revision: r.revision, snapshot: r.snapshot, contentHash: r.content_hash, submittedBy: r.submitted_by,
+  submittedAt: iso(r.submitted_at), decision: r.decision, decidedBy: r.decided_by, decidedAt: iso(r.decided_at), notes: r.notes,
+} : null;
+// What staff and the queue may see of a case: never its live title, links or draft.
+const caseMetaRow = (r) => ({ id: r.id, workspaceId: r.workspace_id, status: r.status, revision: r.revision, submittedRevision: r.submitted_revision, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at) });
+const markRow = (r) => ({ id: r.id, submissionId: r.submission_id, evidenceId: r.evidence_id, reviewerId: r.reviewer_id, createdAt: iso(r.created_at) });
+// expires_on is a date: read as text so no time zone can shift the day.
+const creditRow = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, provider: r.provider, status: r.status, amountCents: Number(r.amount_cents), expiresOn: r.expires_on_day ?? null,
+  restrictions: r.restrictions, reference: r.reference, supersedes: r.supersedes, supersededBy: r.superseded_by ?? null, createdBy: r.created_by, createdAt: iso(r.created_at),
+});
+const evidenceRow = (r) => ({
+  id: r.id, caseId: r.case_id, workspaceId: r.workspace_id, kind: r.kind, title: r.title, source: r.source, reference: r.reference,
+  verification: r.verification, createdBy: r.created_by, createdAt: iso(r.created_at),
+});
+const CREDITS = `SELECT c.*, c.expires_on::text AS expires_on_day, n.id AS superseded_by FROM credit_records c
+  LEFT JOIN credit_records n ON n.supersedes = c.id`;
+
 // Reads that feed Resolve, the submit gate and history warnings ask Postgres for 010's verdict on the raw jsonb,
 // before node-postgres turns its numbers into JavaScript numbers and can hide digits a double cannot hold.
 const ANNOTATIONS_CHECKED = `SELECT *, ${boxNotStoredForm('box')} AS box_not_stored_form FROM annotations`;
@@ -176,6 +206,19 @@ export function createPostgresStore(options) {
     const d = (await query('SELECT status FROM devices WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 FOR SHARE', [deviceId, workspaceId, ownerId], client)).rows[0];
     if (!d) throw new StoreError('not_found');
     if (d.status !== 'active') throw new StoreError('invalid_state');
+  };
+  // Every capital write takes the case row lock, so submission, edits, evidence changes and decisions are serialized.
+  const lockCase = async (client, workspaceId, caseId) => {
+    if (!isId(workspaceId) || !isId(caseId)) throw new StoreError('not_found');
+    const row = (await query('SELECT * FROM capital_cases WHERE workspace_id = $1 AND id = $2 FOR UPDATE', [workspaceId, caseId], client)).rows[0];
+    if (!row) throw new StoreError('not_found');
+    return row;
+  };
+  // Under the case lock: every reference the draft makes must resolve against the rows that exist right now.
+  const checkCaseReferences = async (client, c, draft) => {
+    const evidence = (await query('SELECT id FROM capital_evidence WHERE case_id = $1', [c.id], client)).rows.map((r) => r.id);
+    const frozen = (await query('SELECT project_id, number FROM dataset_versions WHERE workspace_id = $1', [c.workspace_id], client)).rows.map((r) => ({ projectId: r.project_id, version: r.number }));
+    if (!referencesResolve(draft, { evidenceIds: new Set(evidence), versions: frozen })) throw new StoreError('missing_reference');
   };
   const DEVICE_WITH_REPORT = `SELECT d.*, to_jsonb(r) AS report FROM devices d
     LEFT JOIN LATERAL (SELECT * FROM device_reports WHERE device_id = d.id ORDER BY created_at DESC, id DESC LIMIT 1) r ON true`;
@@ -796,6 +839,196 @@ export function createPostgresStore(options) {
       if (![workspaceId, ownerId, deviceId].every(isId)) return [];
       return (await query(`SELECT * FROM execution_runs WHERE device_id = $1 AND workspace_id = $2 AND owner_id = $3
         ORDER BY created_at DESC, id DESC LIMIT $4`, [deviceId, workspaceId, ownerId, Math.min(Math.max(1, limit), 200)])).rows.map(execRow);
+    },
+
+    // Capital: cases with an editable, revisioned draft; frozen submitted revisions; append-only credit records; evidence references.
+    async listCapitalCases(workspaceId) {
+      if (!isId(workspaceId)) return [];
+      return (await query('SELECT * FROM capital_cases WHERE workspace_id = $1 ORDER BY created_at, id', [workspaceId])).rows.map(caseRow);
+    },
+    async getCapitalCase({ workspaceId, caseId }) {
+      if (!isId(workspaceId) || !isId(caseId)) return null;
+      return caseRow((await query('SELECT * FROM capital_cases WHERE workspace_id = $1 AND id = $2', [workspaceId, caseId])).rows[0]);
+    },
+    async createCapitalCase({ workspaceId, createdBy, title, projectId = null, enhanceRunId = null, draft }) {
+      if (!isId(workspaceId) || (projectId != null && !isId(projectId)) || (enhanceRunId != null && !isId(enhanceRunId))) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        // The composite foreign keys refuse a project or run of another workspace (not_found).
+        const row = (await query(`INSERT INTO capital_cases (workspace_id, project_id, enhance_run_id, title, draft, created_by)
+          VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING *`, [workspaceId, projectId, enhanceRunId, title, JSON.stringify(draft), createdBy], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId: createdBy, action: 'capital_case.created', targetType: 'capital_case', targetId: row.id });
+        return caseRow(row);
+      });
+    },
+    // The caller names the revision it edited; a different revision means someone else saved first.
+    async updateCapitalCase({ workspaceId, caseId, expectedRevision, title, projectId = null, enhanceRunId = null, draft }) {
+      if ((projectId != null && !isId(projectId)) || (enhanceRunId != null && !isId(enhanceRunId))) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const current = await lockCase(client, workspaceId, caseId);
+        if (current.status === 'submitted') throw new StoreError('invalid_state');
+        if (current.revision !== expectedRevision) throw new StoreError('stale_revision');
+        await checkCaseReferences(client, current, draft);
+        const row = (await query(`UPDATE capital_cases SET title = $3, project_id = $4, enhance_run_id = $5, draft = $6::jsonb, revision = revision + 1, updated_at = clock_timestamp()
+          WHERE workspace_id = $1 AND id = $2 AND revision = $7 RETURNING *`, [workspaceId, caseId, title, projectId, enhanceRunId, JSON.stringify(draft), expectedRevision], client)).rows[0];
+        return caseRow(row);
+      });
+    },
+    // Consent binds the exact content: the revision edited and the hash of everything the snapshot will freeze
+    // (draft, links, evidence, current credit records). Both are rechecked under the lock against the data being frozen.
+    async submitCapitalCase({ workspaceId, caseId, submittedBy, expectedRevision, contentHash }) {
+      return transaction(async (client) => {
+        const c = await lockCase(client, workspaceId, caseId);
+        if (c.status === 'submitted') {
+          // A retry of the same revision and content gets the submission it already made; anything else waits for the review.
+          const open = (await query('SELECT * FROM capital_submissions WHERE case_id = $1 AND decision IS NULL', [caseId], client)).rows[0];
+          if (open && c.submitted_revision === expectedRevision) {
+            if (open.content_hash !== contentHash) throw new StoreError('stale_revision', 'content');
+            return submissionRow(open);
+          }
+          throw new StoreError('invalid_state');
+        }
+        if (c.revision !== expectedRevision) throw new StoreError('stale_revision');
+        if (!draftComplete(c.draft)) throw new StoreError('invalid_state');
+        if ((await query('SELECT 1 FROM capital_submissions WHERE case_id = $1 AND revision = $2', [caseId, c.revision], client)).rowCount) throw new StoreError('invalid_state');
+        await checkCaseReferences(client, c, c.draft);
+        // One transaction client runs one query at a time, so these are sequential awaits.
+        const credits = (await query(`${CREDITS} WHERE c.workspace_id = $1 ORDER BY c.created_at, c.id`, [workspaceId], client)).rows.map(creditRow);
+        const evidence = (await query('SELECT * FROM capital_evidence WHERE case_id = $1 ORDER BY created_at, id', [caseId], client)).rows.map(evidenceRow);
+        const snapshot = capitalSnapshot(caseRow(c), credits, evidence);
+        const hash = snapshotHash(snapshot);
+        if (hash !== contentHash) throw new StoreError('stale_revision', 'content');
+        const row = (await query(`INSERT INTO capital_submissions (case_id, workspace_id, revision, snapshot, content_hash, submitted_by)
+          VALUES ($1, $2, $3, $4::jsonb, $5, $6) RETURNING *`, [caseId, workspaceId, c.revision, JSON.stringify(snapshot), hash, submittedBy], client)).rows[0];
+        await query("UPDATE capital_cases SET status = 'submitted', submitted_revision = $3, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2", [workspaceId, caseId, c.revision], client);
+        await addAudit(client, { workspaceId, actorId: submittedBy, action: 'capital.submitted', targetType: 'capital_case', targetId: caseId, metadata: { submissionId: row.id, revision: row.revision } });
+        return submissionRow(row);
+      });
+    },
+    async withdrawCapitalCase({ workspaceId, caseId, actorId }) {
+      return transaction(async (client) => {
+        const c = await lockCase(client, workspaceId, caseId);
+        if (c.status !== 'submitted') throw new StoreError('invalid_state');
+        const open = (await query(`UPDATE capital_submissions SET decision = 'withdrawn', decided_by = $2, decided_at = clock_timestamp()
+          WHERE case_id = $1 AND decision IS NULL RETURNING id, revision`, [caseId, actorId], client)).rows[0];
+        if (!open) throw new StoreError('invalid_state');
+        // The withdrawn revision stays on record; the draft gets a new revision number so it can be sent again.
+        const row = (await query("UPDATE capital_cases SET status = 'draft', revision = revision + 1, updated_at = clock_timestamp() WHERE id = $1 RETURNING *", [caseId], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId, action: 'capital.withdrawn', targetType: 'capital_case', targetId: caseId, metadata: { submissionId: open.id, revision: open.revision } });
+        return caseRow(row);
+      });
+    },
+    async listCapitalSubmissions({ workspaceId, caseId }) {
+      if (!isId(workspaceId) || !isId(caseId)) return [];
+      return (await query('SELECT * FROM capital_submissions WHERE workspace_id = $1 AND case_id = $2 ORDER BY revision', [workspaceId, caseId])).rows.map(submissionRow);
+    },
+
+    async listCreditRecords(workspaceId) {
+      if (!isId(workspaceId)) return [];
+      return (await query(`${CREDITS} WHERE c.workspace_id = $1 ORDER BY c.created_at, c.id`, [workspaceId])).rows.map(creditRow);
+    },
+    // Append-only: a correction is a new row that supersedes one earlier row, which can be corrected only once.
+    async createCreditRecord({ workspaceId, createdBy, record, supersedes = null }) {
+      if (supersedes != null && !isId(supersedes)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        await lockWorkspace(client, workspaceId);
+        if (supersedes != null) {
+          if (!(await query('SELECT 1 FROM credit_records WHERE id = $1 AND workspace_id = $2', [supersedes, workspaceId], client)).rowCount) throw new StoreError('not_found');
+          if ((await query('SELECT 1 FROM credit_records WHERE supersedes = $1', [supersedes], client)).rowCount) throw new StoreError('invalid_state');
+        }
+        const row = (await query(`INSERT INTO credit_records (workspace_id, provider, status, amount_cents, expires_on, restrictions, reference, supersedes, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *, expires_on::text AS expires_on_day`,
+        [workspaceId, record.provider, record.status, record.amountCents, record.expiresOn, record.restrictions, record.reference, supersedes, createdBy], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId: createdBy, action: supersedes ? 'credit_record.corrected' : 'credit_record.created', targetType: 'credit_record', targetId: row.id, metadata: { supersedes } });
+        return creditRow(row);
+      });
+    },
+
+    async listCapitalEvidence({ workspaceId, caseId }) {
+      if (!isId(workspaceId) || !isId(caseId)) return [];
+      return (await query('SELECT * FROM capital_evidence WHERE workspace_id = $1 AND case_id = $2 ORDER BY created_at, id', [workspaceId, caseId])).rows.map(evidenceRow);
+    },
+    async addCapitalEvidence({ workspaceId, caseId, createdBy, item }) {
+      return transaction(async (client) => {
+        const c = await lockCase(client, workspaceId, caseId);
+        if (c.status === 'submitted') throw new StoreError('invalid_state');
+        const row = (await query(`INSERT INTO capital_evidence (case_id, workspace_id, kind, title, source, reference, verification, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8) RETURNING *`, [caseId, workspaceId, item.kind, item.title, item.source, JSON.stringify(item.reference), item.verification, createdBy], client)).rows[0];
+        return evidenceRow(row);
+      });
+    },
+    async deleteCapitalEvidence({ workspaceId, caseId, evidenceId }) {
+      if (!isId(evidenceId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const c = await lockCase(client, workspaceId, caseId);
+        if (c.status === 'submitted') throw new StoreError('invalid_state');
+        // An incurred cost cites its record; the record stays until that item changes (checked on the locked row).
+        if (citedEvidenceIds(c.draft).has(evidenceId)) throw new StoreError('evidence_in_use');
+        const row = (await query('DELETE FROM capital_evidence WHERE case_id = $1 AND id = $2 RETURNING *', [caseId, evidenceId], client)).rows[0];
+        if (!row) throw new StoreError('not_found');
+        return evidenceRow(row);
+      });
+    },
+    async listCapitalReviewMarks({ workspaceId, caseId }) {
+      if (!isId(workspaceId) || !isId(caseId)) return [];
+      return (await query(`SELECT m.* FROM capital_review_marks m JOIN capital_submissions s ON s.id = m.submission_id
+        WHERE s.workspace_id = $1 AND s.case_id = $2 ORDER BY m.created_at, m.id`, [workspaceId, caseId])).rows.map(markRow);
+    },
+
+    // Staff queue across workspaces: only what was sent for review, as frozen in each submission. Live titles,
+    // drafts, evidence and credit records changed since are never returned here.
+    async listCapitalCasesForReview({ status = 'submitted' } = {}) {
+      return (await query(`SELECT c.id, c.workspace_id, c.status, c.revision, c.submitted_revision, c.created_at, c.updated_at, w.name AS workspace_name, to_jsonb(s) AS latest
+        FROM capital_cases c JOIN workspaces w ON w.id = c.workspace_id
+        LEFT JOIN LATERAL (SELECT * FROM capital_submissions WHERE case_id = c.id ORDER BY revision DESC LIMIT 1) s ON true
+        WHERE c.status = $1 ORDER BY c.updated_at, c.id`, [status])).rows.map((r) => ({ ...caseMetaRow(r), workspaceName: r.workspace_name, latestSubmission: submissionRow(r.latest) }));
+    },
+    async getCapitalCaseForReview(caseId) {
+      if (!isId(caseId)) return null;
+      const c = (await query('SELECT * FROM capital_cases WHERE id = $1', [caseId])).rows[0];
+      if (!c) return null;
+      const w = (await query('SELECT id, name, kind, profile FROM workspaces WHERE id = $1', [c.workspace_id])).rows[0];
+      const latest = (await query('SELECT * FROM capital_submissions WHERE case_id = $1 ORDER BY revision DESC LIMIT 1', [caseId])).rows[0];
+      const marks = latest ? (await query('SELECT * FROM capital_review_marks WHERE submission_id = $1 ORDER BY created_at, id', [latest.id])).rows.map(markRow) : [];
+      return { case: caseMetaRow(c), workspace: { id: w.id, name: w.name, kind: w.kind, synthetic: Boolean(w.profile?.synthetic) }, submission: submissionRow(latest), marks };
+    },
+    // A decision names the submission the reviewer saw. If the customer withdrew or sent a newer revision since,
+    // that is a different submission and the decision is refused (stale_revision), never applied to the newer one.
+    async decideCapitalSubmission({ caseId, submissionId, reviewerId, decision, notes = null }) {
+      if (!isId(caseId)) throw new StoreError('not_found');
+      if (!CASE_DECISIONS.includes(decision)) throw new StoreError('invalid_state');
+      return transaction(async (client) => {
+        const c = (await query('SELECT * FROM capital_cases WHERE id = $1 FOR UPDATE', [caseId], client)).rows[0];
+        if (!c) throw new StoreError('not_found');
+        if (c.status !== 'submitted') throw new StoreError('invalid_state');
+        const open = (await query('SELECT id FROM capital_submissions WHERE case_id = $1 AND decision IS NULL', [caseId], client)).rows[0];
+        if (!open) throw new StoreError('invalid_state');
+        if (!isId(submissionId) || open.id !== submissionId) throw new StoreError('stale_revision', 'submission');
+        // The freeze trigger lets a decision be written exactly once; the partial unique index keeps one open submission.
+        const row = (await query(`UPDATE capital_submissions SET decision = $2, decided_by = $3, decided_at = clock_timestamp(), notes = $4
+          WHERE id = $1 AND decision IS NULL RETURNING *`, [open.id, decision, reviewerId, notes], client)).rows[0];
+        if (!row) throw new StoreError('invalid_state');
+        await query('UPDATE capital_cases SET status = $2, updated_at = clock_timestamp() WHERE id = $1', [caseId, decision], client);
+        await addAudit(client, { workspaceId: c.workspace_id, actorId: reviewerId, action: `capital.${decision}`, targetType: 'capital_case', targetId: caseId, metadata: { submissionId: row.id, revision: row.revision } });
+        return submissionRow(row);
+      });
+    },
+    // An append-only mark on one evidence id frozen in the submission the reviewer saw. The customer's record is not touched.
+    async markCapitalEvidenceReviewed({ caseId, submissionId, evidenceId, reviewerId }) {
+      if (!isId(caseId) || !isId(evidenceId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const c = (await query('SELECT * FROM capital_cases WHERE id = $1 FOR UPDATE', [caseId], client)).rows[0];
+        if (!c) throw new StoreError('not_found');
+        if (c.status !== 'submitted') throw new StoreError('invalid_state');
+        const open = (await query('SELECT id, snapshot FROM capital_submissions WHERE case_id = $1 AND decision IS NULL', [caseId], client)).rows[0];
+        if (!open) throw new StoreError('invalid_state');
+        if (!isId(submissionId) || open.id !== submissionId) throw new StoreError('stale_revision', 'submission');
+        if (!(open.snapshot.evidence ?? []).some((e) => e.id === evidenceId)) throw new StoreError('not_found');
+        const inserted = (await query(`INSERT INTO capital_review_marks (submission_id, evidence_id, reviewer_id) VALUES ($1, $2, $3)
+          ON CONFLICT (submission_id, evidence_id) DO NOTHING RETURNING *`, [open.id, evidenceId, reviewerId], client)).rows[0];
+        if (!inserted) return markRow((await query('SELECT * FROM capital_review_marks WHERE submission_id = $1 AND evidence_id = $2', [open.id, evidenceId], client)).rows[0]);
+        await addAudit(client, { workspaceId: c.workspace_id, actorId: reviewerId, action: 'capital.evidence_item_reviewed', targetType: 'capital_submission', targetId: open.id, metadata: { caseId, evidenceId } });
+        return markRow(inserted);
+      });
     },
 
     async upsertReviewer({ username, name, role, passwordHash }) {
