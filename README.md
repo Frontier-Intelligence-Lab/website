@@ -16,7 +16,9 @@ Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, co
 | Sample uploads (Rust `services/ingest`), staff review, dataset versions | Implemented. Submitted content is frozen; versions contain exactly the approved snapshot. |
 | Run on this device (`/w/:slug/device`): connect a local Ollama, download, verify, run, measure | Implemented and tested against a real local Ollama 0.40.13. The browser talks to Ollama on the visitor's own loopback address; the server stores only client-reported records (devices, model installs with digests, measured runs). Not yet deployed. |
 | In-browser (WebGPU) and remote-GPU execution | **Planned.** Labelled planned on the device screen. |
-| Provider onboarding, training, evaluation, deployment, financing | **Planned.** Shown as planned in the app; nothing executes. |
+| Capital (`/w/:slug/capital`): cost plan in US cents, outside credit records, company financing request, evidence package, Valcairn internal review | Implemented for organizations and tested against the memory and Postgres stores. Owners, admins and finance members plan; owners and admins send one exact revision to internal review; staff request changes or mark evidence reviewed. Exports an audited JSON package. Not yet deployed. |
+| Lenders, credit decisions, funding, reservations and reconciliation against a real meter, private finance-document upload | **Planned.** Labelled planned in Capital; no provider is connected and nothing moves money. |
+| Provider onboarding, training, evaluation, deployment | **Planned.** Shown as planned in the app; nothing executes. |
 | `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
 | Light / dark mode | Follows the system setting; a toggle stores the visitor's choice in `localStorage`. |
 | Deployment | Nothing deploys from this repository yet. frontierintelligencelab.com still runs an earlier server-rendered build as a Docker container; this React version needs a new release (see [Deployment](#deployment)). |
