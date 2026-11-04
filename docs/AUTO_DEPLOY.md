@@ -1,0 +1,61 @@
+# Automatic production deployment
+
+The `Valcairn CI and deploy` workflow checks pull requests into `master`, every push to `master`, and manual dispatches. It deploys only the checked revision of this repository's `master`, after all three CI jobs succeed:
+
+- `Web / no database`: install the lockfile, run the build plus tests without database variables, run the standard-library Python release-controller unit tests, and build the production web and migration Docker images.
+- `Web / PostgreSQL 17`: run the same checks against a disposable, loopback-only `valcairn_ci_test` database.
+- `Ingest / Rust 1.99.1`: install the pinned toolchain including clippy, lint with warnings denied, run locked tests and build the production ingest image.
+
+These Docker builds test the actual packaging boundary, not only code checked out by CI. The web build stage must include `src/lib/onboarding.js`, which is imported by `web/src/app/project.jsx`; omitting it can pass a repository build while failing the production Docker build. Images use CI-only tags and are not pushed by these checks.
+
+Pull-request jobs never receive the production environment or deployment key. There is no `pull_request_target` workflow, untrusted checkout in a privileged job, personal SSH key, or production database connection in CI. Official actions are pinned to full commit SHAs.
+
+## One-time configuration
+
+Configure the GitHub **production environment** with a deployment branch policy allowing only `master`. Automatic deployment needs no required human approver; retain repository PR review and require the three CI checks through the existing branch-protection/ruleset process.
+
+Set these environment variables through repository settings or `gh variable set --env production`:
+
+| Variable | Value |
+| --- | --- |
+| `DEPLOY_HOST` | The approved VPS hostname or IPv4 address |
+| `DEPLOY_USER` | The dedicated, locked-down deployment SSH account |
+| `DEPLOY_KNOWN_HOSTS` | The previously verified OpenSSH host-key entry for exactly that hostname/address |
+
+Set the environment secret `VALCAIRN_DEPLOY_KEY` to a **new deployment-only private key** through a protected file or stdin. Do not copy the user's personal VPS private key into GitHub. Never print either key. Do not run `ssh-keyscan` during CI and trust its answer automatically; update the pinned host key only after independently verifying a server identity change.
+
+The deployment account's authorized key must force the server's fixed deployment-request command, disable PTY/agent/port/X11 forwarding and user rc, and have no general shell or Docker access. The server-owned command accepts only `deploy <40-lowercase-hex-SHA>`. It must validate the request again, take a deployment lock and independently confirm that the SHA is the current `master` head of the fixed repository. A stale or invalid request must not deploy arbitrary code. The helper checks the three completed CI jobs for that exact SHA; it does not wait for the overall workflow to finish because deployment itself belongs to that workflow. It checks master again after building and before migrating.
+
+The deploy job has no checkout and sends no script, archive, environment values or production credentials to the VPS. Its only remote request is the SHA. Runtime environment variables remain in the existing VPS secret files and container configuration; this workflow introduces no application environment variables.
+
+## Server deployment contract
+
+The forced command invokes the root-owned release helper installed by the operator. Follow `docs/RELEASE.md`; CI success does not waive its production safeguards.
+
+1. Validate the fixed repository, exact current master SHA and successful required CI jobs; serialize deploys with a server lock. The operator must confirm disk capacity for image builds, the database dump and scratch restore before enabling deployments; the helper does not currently enforce a free-space threshold.
+2. Snapshot the current web/ingest image references and protected runtime configuration for rollback. Never log secret values.
+3. Back up the production database and restore it into a uniquely named scratch database. Verify the restored data before changing production. A dump file alone is not sufficient. Scratch deletion must be explicitly confined to the newly created scratch database, never the live database.
+4. Build migrator, ingest and web images from the same requested revision, with immutable SHA tags and revision labels.
+5. Apply pending numbered migrations with the separate migrator role. Check the migration ledger and require a second run to apply zero. Changed applied checksums are fatal.
+6. Confirm application grants, then execute the read-only operator box query from the release. The query is in `scripts/sql/`; the current migrator image does not include that directory, so mount the checked release query read-only or use the release checkout. Never silently substitute a different query. Validate the constraint only when no violations remain; preserve invalid frozen history and leave `NOT VALID` when required.
+7. Preserve the already-provisioned YC, Speedrun and admin reviewer records. Do not reset or re-provision credentials during every deployment.
+8. Roll the single ingest instance, preserving private storage, network, credentials and routing; verify it. Roll web last, preserving all environment values, mounts, TLS, sessions, staff list, sign-in log and routing.
+9. Confirm the deployed revision and public health/pages/CSP. Revert web/ingest to their recorded prior tags if the rollout fails. Never remove approved data or edit an applied migration as a rollback shortcut.
+
+The production helper and its installation are deliberately outside the workflow's credential boundary. The workflow must remain disabled/unconfigured until that helper, scoped key and backup/restore procedure have been verified. A successful SSH connection is not proof that a release passed its health checks.
+
+## Concurrency, failure and recovery
+
+GitHub permits one running and one pending job in the `valcairn-production` group. A later pending request can supersede an older pending request; running deployment is **not** canceled automatically. The server lock provides a second boundary for manual requests. If master advances before a queued revision begins, the current-master check should reject the stale request; the newer successful workflow remains responsible for deploying the new head.
+
+An interrupted SSH connection is not permission to start a second deployment or assume rollback completed. Check the server receipt and lock state first. Prefer a server-managed job/receipt if the installed helper continues asynchronously; CI must wait for and check its terminal result before reporting success.
+
+Inspect Actions for the checked commit's three CI jobs and deployment result. The release receipt should identify the requested/deployed SHA, prior/new image tags, backup/restore proof, migration files, operator result and health checks without including secrets. Authentication-dependent live QA still requires approved QA access; do not reset reviewer accounts or create customer data to make an unattended deploy appear fully verified.
+
+To recover manually, retain the previous image tags and follow `docs/RELEASE.md`. Database restoration is a separately verified operation into a fresh database, not an automatic destructive rollback. Never use `npm audit fix --force` in deployment.
+
+## Verification of this workflow
+
+Before enabling it: review the YAML, validate its shell, verify the action SHAs against their official repositories, and test the forced command's rejection of malformed/stale requests. Then run the real PR CI and a master deployment, inspect the server's sanitized receipt and verify the deployed revision. A locally parsed YAML file alone is not end-to-end proof.
+
+Primary references: [GitHub deployment controls](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/control-deployments), [secure use of Actions](https://docs.github.com/en/actions/reference/security/secure-use), [workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
