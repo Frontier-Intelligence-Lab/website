@@ -2,8 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { parseReviewers } from './lib/reviewers.js';
-import { parseCatalog } from './lib/devices.js';
 import { parseModelCatalog } from './lib/models.js';
+import { parseCatalog } from './lib/devices.js';
 
 const truthy = (value, fallback) =>
   value == null || value === '' ? fallback : ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());

@@ -107,6 +107,7 @@ project    { id, workspaceId, createdBy, name, task, modalities: string[], start
 ## Changelog
 
 - **v12:** Run on this device: `devices`, `device_reports`, `model_installs` and `execution_runs` (`012_devices.sql`), all scoped to one owner and marked `client_reported`. Failures store only an error category, never runtime text.
+
 - **v11:** Enhance-run approval names the plan version it approves (`expectedUpdatedAt`, `stale_plan`), and every plan edit gets a strictly later `updatedAt`. Training eligibility (`allowsTraining` in `src/lib/models.js`) needs an uploaded rights record that allows training and at least one delivered file. Plans refuse more than 20 dataset versions instead of truncating.
 
 - **v10:** Models. `model_pulls` and `enhance_runs` (`011_models.sql`). A requested run is frozen by a trigger, including against direct SQL updates and deletes. Copying weights and running on GPUs are not automated: a pull stays `requested` and a run stays `requested` until Valcairn acts on it.

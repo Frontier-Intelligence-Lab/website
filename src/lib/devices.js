@@ -42,6 +42,8 @@ export const COMPAT_SETTINGS = { temperature: 0, seed: 7, numPredict: 32, numCtx
 
 /** A reply passes when, ignoring case, surrounding punctuation and whitespace, it is exactly the answer. */
 export const passesTask = (task, reply) => String(reply ?? '').trim().replace(/^[\s"'`*.]+|[\s"'`*.]+$/g, '').toLowerCase() === task.answer.toLowerCase();
+/** Ready is for the exact bytes that were tested: the install must still be verified for that digest, and every task must have run. */
+export const readyAfterTest = (install, digest, results, taskCount) => Boolean(install && digest && install.digest === digest && ['verified', 'ready'].includes(install.state) && results.length === taskCount && results.every((r) => r.ok));
 
 /** Ollama marks models that run on its cloud; Valcairn's local mode must never call them, not even to inspect them. */
 export const isRemoteModel = (m) => Boolean(m?.remote || m?.remote_host || m?.remote_model || /(^|[:-])cloud$/.test(String(m?.name ?? m?.ref ?? m?.runtimeRef ?? '')));

@@ -4,7 +4,7 @@ import { api } from '../api.js';
 import { FieldError, Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
 import { RuntimeError, browserHints, createRuntime } from './runtime.js';
-import { passesTask } from '../../../src/lib/devices.js';
+import { passesTask, readyAfterTest } from '../../../src/lib/devices.js';
 
 // Which device record this browser is. Not a secret: the server ties every device to its owner.
 const deviceKey = (workspaceId, userId) => `valcairn.device.${workspaceId}.${userId}`;
@@ -72,7 +72,7 @@ export function RunOnDevice() {
 
   /** Reads the runtime, tells Valcairn what it found, and reconciles install records with what is actually installed. */
   const probe = useCallback(async (id = deviceId) => {
-    setConn((c) => ({ ...c, status: 'checking' }));
+    setConn((c) => ({ ...c, checking: true })); // the last status stays, so a re-check never unmounts a reply or test in progress
     const hints = await browserHints();
     let snapshot;
     try {
@@ -81,7 +81,7 @@ export function RunOnDevice() {
     } catch (err) {
       snapshot = { status: 'unreachable', error: err, hints, checkedAt: new Date().toISOString() };
     }
-    setConn(snapshot);
+    setConn((c) => (snapshot.status === 'connected' ? snapshot : { models: c.models, running: c.running, version: c.version, ...snapshot })); // a failed re-check keeps what Ollama last reported, so nothing in progress is unmounted
     if (!id) return snapshot;
     const connected = snapshot.status === 'connected';
     await api.deviceReport(entry.id, id, {
@@ -128,10 +128,10 @@ export function RunOnDevice() {
   }
 
   const device = detail?.device;
-  const localModels = conn.status === 'connected' ? conn.models.filter((m) => !m.remote) : [];
+  const localModels = (conn.models ?? []).filter((m) => !m.remote);
   // Embedding-only models turn text into vectors; they cannot chat, so they are listed but not offered to run.
   const chatModels = localModels.filter((m) => !m.capabilities.length || m.capabilities.includes('completion'));
-  const cloudModels = conn.status === 'connected' ? conn.models.filter((m) => m.remote) : [];
+  const cloudModels = (conn.models ?? []).filter((m) => m.remote);
   const installOf = (ref) => detail?.installs.find((i) => i.runtimeRef === ref) ?? null;
   const ctx = { entry, runtime, conn, setConn, probe, refreshDetail, saveInstall, installOf, deviceId, local, selected, setSelected, busy, setBusy };
   const others = devices.filter((d) => d.status === 'active' && d.id !== deviceId);
@@ -153,7 +153,7 @@ export function RunOnDevice() {
       {!deviceId ? <ConnectCard onConnect={connect} others={others} onAdopt={(id) => { writeDeviceId(key, id); setDeviceId(id); }} /> : (
         <>
           <ConnectionCard ctx={ctx} device={device} onDisconnect={() => disconnect(deviceId)} />
-          {conn.status === 'connected' && (
+          {conn.models && (
             <>
               <ModelsCard ctx={ctx} localModels={localModels} cloudModels={cloudModels} />
               <RunCard ctx={ctx} localModels={chatModels} />
@@ -210,7 +210,7 @@ function ConnectCard({ onConnect, others, onAdopt }) {
 }
 
 function ConnectionCard({ ctx, device, onDisconnect }) {
-  const { conn, probe, runtime } = ctx;
+  const { conn, probe, runtime, busy } = ctx;
   const [confirming, setConfirming] = useState(false);
   const hints = conn.hints;
   return (
@@ -219,11 +219,11 @@ function ConnectionCard({ ctx, device, onDisconnect }) {
         <div className="cell-stack">
           <h2 id="conn-h">{device?.label ?? 'This device'}</h2>
           <span className="ob-muted" style={{ fontSize: 13 }} aria-live="polite">
-            {conn.status === 'checking' ? 'Checking Ollama…' : conn.status === 'connected' ? `Connected to Ollama ${conn.version ?? ''} at ${runtime.origin}` : conn.status === 'unreachable' ? 'Ollama is not reachable from this page' : 'Not checked yet'}
+            {conn.checking ? 'Checking Ollama…' : conn.status === 'connected' ? `Connected to Ollama ${conn.version ?? ''} at ${runtime.origin}` : conn.status === 'unreachable' ? (conn.models ? 'Ollama did not answer the last check. Showing what it reported before.' : 'Ollama is not reachable from this page') : 'Not checked yet'}
           </span>
         </div>
         <div className="row-wrap gap-10">
-          <button type="button" className="btn-ghost" onClick={() => probe()} disabled={conn.status === 'checking'}>{conn.status === 'unreachable' ? 'Try again' : 'Refresh'}</button>
+          <button type="button" className="btn-ghost" onClick={() => probe()} disabled={conn.checking}>{conn.status === 'unreachable' ? 'Try again' : 'Refresh'}</button>
           {confirming ? (
             <span className="row-wrap gap-10" role="group" aria-label="Confirm disconnect">
               <button type="button" className="btn-app" onClick={onDisconnect}>Disconnect device</button>
@@ -233,7 +233,7 @@ function ConnectionCard({ ctx, device, onDisconnect }) {
         </div>
       </div>
 
-      {conn.status === 'unreachable' && <SetupHelp origin={runtime.origin} />}
+      {conn.status === 'unreachable' && !busy && <SetupHelp origin={runtime.origin} />}
 
       <div className="ob-grid dev-facts">
         <Facts title="Reported by your browser" note="Hints only. Browsers round, cap or hide these values.">
@@ -724,9 +724,10 @@ function TestCard({ ctx, localModels }) {
   async function run() {
     const controller = new AbortController();
     const { signal } = controller;
+    const untilStopped = new Promise((resolve) => signal.addEventListener('abort', () => resolve(null), { once: true })); // Stop never waits on a stalled read-back
     abortRef.current = controller;
     setRunning(true); setBusy('test'); setResults([]); setError(null);
-    const name = model.name;
+    const { name, digest } = model;
     const out = [];
     const retries = [];
     try {
@@ -742,11 +743,11 @@ function TestCard({ ctx, localModels }) {
         if (retry) retries.push(retry);
         if (!r.ok) { if (!stopped) setError(explain(r.error)); break; }
       }
-      const install = installOf(name);
-      // Ready means every task ran on this device without a runtime error. Correctness is the score, shown separately.
-      if (!signal.aborted && out.length === local.tasks.length && out.every((r) => r.ok) && install && ['verified', 'ready'].includes(install.state)) {
+      const install = (await Promise.race([ctx.refreshDetail(), untilStopped]))?.installs.find((i) => i.runtimeRef === name) ?? installOf(name); // read back: a Verify that overlapped this test may have just changed its state
+      // Ready means every task ran on this device without a runtime error, for exactly the bytes that were tested. Correctness is the score, shown separately.
+      if (!signal.aborted && readyAfterTest(install, digest, out, local.tasks.length)) {
         await saveInstall({ runtimeRef: install.runtimeRef, catalogId: install.catalogId, digest: install.digest, sizeBytes: install.sizeBytes, details: install.details, state: 'ready' });
-      }
+      } else if (!signal.aborted && out.every((r) => r.ok) && install?.digest && install.digest !== digest) setError('The model changed while it was being tested, so it was not marked Ready. Verify it again.');
     } catch (err) {
       if (err.kind !== 'aborted') setError(explain(err));
     } finally {

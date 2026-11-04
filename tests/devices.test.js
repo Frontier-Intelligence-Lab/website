@@ -2,7 +2,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMemoryStore } from '../src/store/memory.js';
-import { COMPAT_TASKS, parseCatalog, passesTask, validateRun } from '../src/lib/devices.js';
+import { COMPAT_TASKS, parseCatalog, passesTask, readyAfterTest, validateRun } from '../src/lib/devices.js';
 import { FIXTURE_DIST, makeApp, json, postHeaders } from './helpers.js';
 
 const CATALOG = path.join(FIXTURE_DIST, '..', 'local-models.json');
@@ -143,6 +143,19 @@ test('compatibility tasks have one exact answer', () => {
   assert.ok(passesTask(classification, 'Yes'));
   assert.ok(!passesTask(classification, 'no'));
   assert.ok(validateRun(run({ kind: 'compat_test', task: { id: 'arithmetic', passed: true } })).values);
+});
+
+test('ready is granted only for the exact digest that was tested', () => {
+  const ok = [{ ok: true }, { ok: true }, { ok: true }];
+  const verified = { state: 'verified', digest };
+  assert.ok(readyAfterTest(verified, digest, ok, 3));
+  assert.ok(readyAfterTest({ ...verified, state: 'ready' }, digest, ok, 3), 'a re-test keeps Ready');
+  assert.ok(!readyAfterTest({ ...verified, digest: 'c'.repeat(64) }, digest, ok, 3), 'the tag now points at other bytes: fail closed');
+  assert.ok(!readyAfterTest(verified, null, ok, 3), 'no digest was read when the test began');
+  assert.ok(!readyAfterTest({ ...verified, state: 'installed' }, digest, ok, 3), 'not verified');
+  assert.ok(!readyAfterTest(verified, digest, ok.slice(0, 2), 3), 'stopped before the last task');
+  assert.ok(!readyAfterTest(verified, digest, [ok[0], { ok: false }], 3), 'a runtime error');
+  assert.ok(!readyAfterTest(null, digest, ok, 3), 'no install record');
 });
 
 test('a download catalog is validated at startup and never offers a cloud model', () => {
