@@ -10,6 +10,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import sys
 import tarfile
 import tempfile
 import types
@@ -801,6 +802,86 @@ class Readiness(unittest.TestCase):
                 release.public_checks()
         self.assertIn("did not become ready in time", str(failure.exception))
         self.assertEqual((opened.call_count, sleep.call_count), (1, 0))
+
+
+class DatabaseHosts(unittest.TestCase):
+    """Migration passes and SQL helper containers must resolve the configured database hostname exactly as the live web does."""
+
+    def release(self, extra):
+        release = object.__new__(deploy.Release)
+        release.config = {"network": "coolify", "migrator_env": "/etc/valcairn/migrator.env", "ca_file": "/etc/valcairn/pg-ca.crt", "web_container": "web"}
+        release.web = {"HostConfig": {"ExtraHosts": extra}, "Config": {"Env": []}}
+        release.images, release.receipt = {"migrate": "valcairn-migrate:" + SHA, "web": "valcairn-site:" + SHA}, {}
+        return release
+
+    def test_host_arguments_repeat_each_mapping_and_tolerate_none(self):
+        for container in ({"HostConfig": {"ExtraHosts": None}}, {"HostConfig": {"ExtraHosts": []}}, {"HostConfig": {}}, {}):
+            self.assertEqual(deploy.host_arguments(container), [])
+        mappings = ["projects-db.internal:10.0.1.5", "db6.internal:fd00::5", "gateway.internal:host-gateway", "projects_db:10.0.1.5"]
+        self.assertEqual(deploy.host_arguments({"HostConfig": {"ExtraHosts": mappings}}),
+                         ["--add-host", mappings[0], "--add-host", mappings[1], "--add-host", mappings[2], "--add-host", mappings[3]])
+        for bad in ("", "nocolon", "db internal:10.0.1.5", "-db:10.0.1.5", "db:10.0.1.5;id", "db:$(x)", "db:10.0.1.5 --privileged", "db:", ":10.0.1.5", 5, None):
+            with self.subTest(mapping=bad), self.assertRaises(deploy.ReleaseError):
+                deploy.host_arguments({"HostConfig": {"ExtraHosts": [bad]}})
+
+    def test_sql_helper_containers_inherit_the_web_host_mappings(self):
+        release = self.release(["projects-db.internal:10.0.1.5"])
+        with patch.object(deploy, "run", return_value=b'{"ok":true}') as execute:
+            release.node("console.log('{}')", release.images["migrate"])
+        command = execute.call_args[0][0]
+        self.assertEqual(command, ["docker", "run", "--rm", "-i", "--network", "coolify", "--env-file", "/etc/valcairn/migrator.env",
+                                   "-v", "/etc/valcairn/pg-ca.crt:/run/pg-ca.crt:ro", "--add-host", "projects-db.internal:10.0.1.5",
+                                   "valcairn-migrate:" + SHA, "node", "--input-type=module"])
+        # The in-place web exec path is unchanged and never carries migrator settings.
+        with patch.object(deploy, "run", return_value=b'{"ok":true}') as execute:
+            release.node("console.log('{}')")
+        self.assertEqual(execute.call_args[0][0], ["docker", "exec", "-i", "web", "node", "--input-type=module"])
+        for extra in (None, []):
+            release = self.release(extra)
+            with patch.object(deploy, "run", return_value=b'{"ok":true}') as execute:
+                release.node("console.log('{}')", release.images["migrate"])
+            self.assertNotIn("--add-host", execute.call_args[0][0])
+            self.assertEqual(execute.call_args[0][0][4:10], ["--network", "coolify", "--env-file", "/etc/valcairn/migrator.env", "-v", "/etc/valcairn/pg-ca.crt:/run/pg-ca.crt:ro"])
+
+    def test_both_migration_passes_carry_the_mappings_with_env_ca_and_network_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = self.release(["projects-db.internal:10.0.1.5", "db6.internal:fd00::5"])
+            release.source = Path(directory)
+            (release.source / "scripts/sql").mkdir(parents=True)
+            (release.source / "scripts/sql/annotation-box-violations.sql").write_text("SELECT 1 AS project_status;")
+            release.ensure_grants = lambda: None
+            programs = []
+            release.node = lambda code, image=None: (programs.append(image), {"violations": [], "validated": True, "ledger": []})[1]
+            with patch.object(deploy, "run", side_effect=[b"Applied 1 migration(s): 013_capital.sql\n", b"Applied 0 migration(s).\n"]) as execute:
+                release.migrate()
+            commands = [call[0][0] for call in execute.call_args_list]
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertEqual(command, ["docker", "run", "--rm", "--network", "coolify", "--env-file", "/etc/valcairn/migrator.env",
+                                           "-v", "/etc/valcairn/pg-ca.crt:/run/pg-ca.crt:ro", "--add-host", "projects-db.internal:10.0.1.5",
+                                           "--add-host", "db6.internal:fd00::5", "valcairn-migrate:" + SHA])
+            self.assertEqual((release.receipt["migration"]["first"], programs), ("Applied 1 migration(s): 013_capital.sql", ["valcairn-migrate:" + SHA]))
+            release = self.release(["db:10.0.1.5 --privileged"])
+            with patch.object(deploy, "run") as execute, self.assertRaises(deploy.ReleaseError):
+                release.migrate()
+            execute.assert_not_called()
+
+    def test_catalog_validation_stays_offline_without_database_settings_or_mappings(self):
+        release = self.release(["projects-db.internal:10.0.1.5"])
+        release.catalogs = {"MODEL_CATALOG_FILE": {"path": "/run/models.json", "source": "/srv/models.json", "sha256": "a" * 64, "bytes": 2}}
+        with patch.object(deploy, "run", return_value=b'{"consumed":{"MODEL_CATALOG_FILE":0,"LOCAL_MODEL_CATALOG_FILE":null}}') as execute:
+            release.validate_catalogs()
+        command = execute.call_args[0][0]
+        self.assertEqual(command[:6], ["docker", "run", "--rm", "-i", "--network", "none"])
+        for forbidden in ("--add-host", "--env-file", "/run/pg-ca.crt:ro", "projects-db.internal"):
+            self.assertNotIn(forbidden, " ".join(command))
+
+    def test_mappings_reach_a_child_process_as_single_arguments_without_a_shell(self):
+        """Bounded local proof with no network: the exact argument list survives process creation unchanged."""
+        release = self.release(["projects-db.internal:10.0.1.5", "db6.internal:fd00::5"])
+        arguments = release.migrator_arguments()
+        echo = subprocess.run([sys.executable, "-c", "import json,sys;print(json.dumps(sys.argv[1:]))", *arguments], capture_output=True, text=True, timeout=30)
+        self.assertEqual((echo.returncode, json.loads(echo.stdout)), (0, arguments))
 
 
 PROOF_URL = os.environ.get("RELEASE_GUARDS_TEST_DATABASE_URL", "")
