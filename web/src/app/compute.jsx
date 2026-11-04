@@ -142,7 +142,7 @@ function PlansCard({ plans, catalog, runners, onStart }) {
   return (
     <section className="ob-card" aria-labelledby="plans-h">
       <div className="row-between"><h2 id="plans-h">Approved plans for your runner</h2><Tile icon="target" tone="violet" /></div>
-      <p className="ob-muted">Each was approved with compute set to your runner. Training runs in the sandbox with no network; about 10% of the examples are held out to compare the base and the tuned model.</p>
+      <p className="ob-muted">Each was approved with compute set to your runner. Training runs in the sandbox with no network; about one distinct example in ten is held out to compare the base and the tuned model, with identical examples kept on one side.</p>
       {runners.length > 1 && (
         <div className="ob-field" style={{ maxWidth: 320 }}>
           <label htmlFor="plan-runner">Runner</label>
@@ -358,7 +358,7 @@ function JobDetailBody({ workspaceId, jobId, manager, onChange, onOpen }) {
           <span><strong>Tuned:</strong> {txt(s.tuned)}</span>
         </div>
       ))}
-      {manager && job.kind === 'train' && job.status === 'succeeded' && <button type="button" className="btn-app" onClick={exportRun} disabled={pending} style={{ alignSelf: 'flex-start' }}>Export to Ollama on this runner</button>}
+      {manager && job.kind === 'train' && job.status === 'succeeded' && hash(adapter.sha256) !== '—' && <button type="button" className="btn-app" onClick={exportRun} disabled={pending} style={{ alignSelf: 'flex-start' }}>Export to Ollama on this runner</button>}
       {job.kind === 'export' && job.status === 'succeeded' && (
         <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Export">
           <div className="dev-fact"><dt>In Ollama as</dt><dd><code>{txt(result.ollamaModel, 120)}</code></dd></div>
