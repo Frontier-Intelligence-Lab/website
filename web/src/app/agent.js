@@ -448,6 +448,8 @@ export const ERROR_TEXT = {
   ledger_busy: 'A run is executing in this browser, maybe in another tab. Stop it or let it finish, then delete history.',
   ledger_clearing: 'History is being deleted in another tab. Try again in a moment.',
   superseded: 'This run was stopped, finished or deleted in another tab, so nothing more was recorded here.',
+  not_draft: 'This task is no longer a draft: it was approved, started, stopped or finished in another tab of this browser. The screen now shows its current state; nothing was changed.',
+  stale: 'This draft changed in another tab of this browser since it was shown here. The screen was refreshed; review it again before approving or declining.',
   not_found: 'This run is no longer in this browser’s history.',
   no_tools: 'This model does not support structured tool calls, so it cannot run the agent. Choose another installed model, or use ordinary chat on Run on this device.',
   limits: 'The model used all its turns without finishing a draft.',
