@@ -1058,6 +1058,67 @@ withStore('jobs: a lease that expires while waiting for the row lock is refused,
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM job_events WHERE job_id = $1', [job.id])).rows[0].n, 0, 'nor add events');
 });
 
+// Exact-head review of 2afe7bd: the input release is decided under the job row lock, so it is ordered against a cancel
+// and a revoke, and it never takes the runner row (revoke locks the runner, then its jobs), so it cannot deadlock.
+withStore('jobs: an input release waiting for the job row is refused once a cancel or the lease expiry commits, and does not deadlock with a revoke', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'e'.repeat(64), keyPrefix: 'vrk_eeeeee' });
+  const mk = (key) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: key, createdBy: owner.id });
+  const released = async (jobId) => (await pool.query("SELECT count(*)::int AS n FROM audit_events WHERE action = 'job.inputs_released' AND target_id = $1", [jobId])).rows[0].n;
+  const release = (jobId, h) => store.releaseJobInputs({ runnerId: runner.id, jobId, leaseHash: h.repeat(64), versions: 1 }).then(() => 'released', (err) => err.code);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // A cancel holds the job row (the same statement cancelJob runs) while the release starts and waits behind it.
+  const first = await mk('release-key-01');
+  await store.leaseJob({ runnerId: runner.id, leaseHash: '1'.repeat(64) });
+  assert.equal(await release(first.id, '1'), 'released', 'allowed while held and not cancelled');
+  const canceller = await pool.connect();
+  try {
+    await canceller.query('BEGIN');
+    await canceller.query("UPDATE jobs SET status = 'cancel_requested', cancelled_by = $2, updated_at = clock_timestamp() WHERE id = $1", [first.id, owner.id]);
+    const waiting = release(first.id, '1');
+    await sleep(300);
+    await canceller.query('COMMIT');
+    assert.equal(await waiting, 'invalid_state', 'the cancel committed first');
+  } finally { canceller.release(); }
+  assert.equal(await released(first.id), 1, 'the refused release is not on record');
+  await store.finishJob({ runnerId: runner.id, jobId: first.id, leaseHash: '1'.repeat(64), outcome: 'failed', failure: 'cancelled' });
+
+  // The lease runs out while the release waits for the row: refused, and the job goes back to the queue.
+  const second = await mk('release-key-02');
+  await store.leaseJob({ runnerId: runner.id, leaseHash: '2'.repeat(64), leaseMs: 500 });
+  const blocker = await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT id FROM jobs WHERE id = $1 FOR UPDATE', [second.id]);
+    const waiting = release(second.id, '2');
+    await sleep(900);
+    await blocker.query('COMMIT');
+    assert.equal(await waiting, 'lease_lost', 'the lease ran out while the release waited');
+  } finally { blocker.release(); }
+  assert.equal((await store.getJob({ workspaceId: ws.id, jobId: second.id })).status, 'queued');
+  assert.equal(await released(second.id), 0);
+
+  // A revoke in progress holds the runner row (its first statement) and has not reached the job rows yet. The release
+  // must not wait for the runner row: locking it after the job row would deadlock once the revoke reaches the jobs.
+  // A release committed before the revoke's job update is a grant made before the revoke; the next one is refused.
+  assert.equal((await store.leaseJob({ runnerId: runner.id, leaseHash: '3'.repeat(64) }))?.id, second.id);
+  const revoker = await pool.connect();
+  try {
+    await revoker.query('BEGIN');
+    await revoker.query("UPDATE runners SET status = 'revoked', revoked_at = clock_timestamp() WHERE id = $1", [runner.id]);
+    const outcome = await Promise.race([release(second.id, '3'), new Promise((resolve) => setTimeout(resolve, 2000, 'blocked').unref())]);
+    assert.equal(outcome, 'released', 'decided on the job row alone, without waiting for the runner row');
+    await revoker.query(`UPDATE jobs SET status = 'failed', failure = 'runner_revoked', lease_hash = NULL, lease_expires_at = NULL,
+      finished_at = clock_timestamp(), updated_at = clock_timestamp() WHERE runner_id = $1 AND status IN ('leased', 'running', 'cancel_requested')`, [runner.id]);
+    await revoker.query('COMMIT');
+  } finally { revoker.release(); }
+  assert.equal(await release(second.id, '3'), 'lease_lost', 'after the revoke');
+  const after = await store.getJob({ workspaceId: ws.id, jobId: second.id });
+  assert.deepEqual([after.status, after.failure, await released(second.id)], ['failed', 'runner_revoked', 1]);
+});
+
 withStore('jobs: a job is deleted only with its workspace, never one by one', async (store, pool) => {
   const owner = await user(store);
   const ws = await workspace(store, owner.id);
@@ -1194,4 +1255,52 @@ withStore('capital: references are settled on the locked row: a cited record can
   // Same for a dataset version that is not frozen in this workspace.
   await pool.query('UPDATE capital_cases SET draft = $2::jsonb WHERE id = $1', [kase.id, JSON.stringify(capitalDraft({ datasetVersions: [{ projectId: kase.id, version: 1 }] }))]);
   await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash: await capitalHash(store, mine) }), { code: 'missing_reference' });
+});
+
+withStore('evaluation: direct SQL cannot change frozen cases, versions, imports or reports, and deleting the workspace fails closed', async (store, pool) => {
+  const owner = await user(store, 'eval-sql@example.test');
+  const ws = await workspace(store, owner.id, { slug: 'eval-sql', name: 'Eval SQL' });
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Support', task: 'Answer policy questions.', modalities: ['Text'], startingPoint: 'model' });
+  await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: { measure: 'exact', target: 'the cited policy' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'] } } });
+  const review = await store.submitForReview({ workspaceId: ws.id, projectId: project.id, submittedBy: owner.id });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+  const dataset = await store.createDatasetVersion({ workspaceId: ws.id, projectId: project.id, createdBy: owner.id });
+  const set = await store.createEvalSet({ workspaceId: ws.id, projectId: project.id, createdBy: owner.id, name: 'SQL', purpose: 'development' });
+  const source = { projectId: project.id, versionId: dataset.id, fileId: null };
+  const saved = await store.saveEvalCase({ workspaceId: ws.id, projectId: project.id, setId: set.id, expectedRevision: set.revision, input: { id: 'a', input: 'Question a', expectedAnswer: '30 days', sources: [source] } });
+  const detail = await store.getEvalSet({ workspaceId: ws.id, projectId: project.id, setId: set.id });
+  const frozen = await store.freezeEvalSet({ workspaceId: ws.id, projectId: project.id, setId: set.id, expectedRevision: detail.set.revision, actorId: owner.id });
+  const jsonl = '{"id":"a","status":"answered","output":"30 days"}\n';
+  const baseline = await store.importEvalPredictions({ workspaceId: ws.id, projectId: project.id, versionId: frozen.id, role: 'baseline', label: 'old', claimedSystem: {}, claimedScorer: null, filename: 'a.jsonl', jsonl, importedBy: owner.id });
+  const candidate = await store.importEvalPredictions({ workspaceId: ws.id, projectId: project.id, versionId: frozen.id, role: 'candidate', label: 'new', claimedSystem: {}, claimedScorer: null, filename: 'b.jsonl', jsonl, importedBy: owner.id });
+  const comparison = await store.createEvalComparison({ workspaceId: ws.id, projectId: project.id, setId: set.id, versionId: frozen.id, baselineBatchId: baseline.batch.id, candidateBatchId: candidate.batch.id, createdBy: owner.id });
+  const preview = await store.readEvalComparison({ workspaceId: ws.id, comparisonId: comparison.id });
+  const report = await store.approveEvalReport({ workspaceId: ws.id, comparisonId: comparison.id, expectedRevision: comparison.revision, contentHash: preview.contentHash, approvedBy: owner.id });
+  const predictionId = (await pool.query('SELECT id FROM eval_predictions WHERE batch_id = $1', [baseline.batch.id])).rows[0].id;
+  const refused = [
+    ['UPDATE eval_cases SET input = $2 WHERE id = $1', [saved.id, 'Changed by SQL']],
+    ['DELETE FROM eval_cases WHERE id = $1', [saved.id]],
+    ['UPDATE eval_sets SET acceptance = $2::jsonb WHERE id = $1', [set.id, JSON.stringify({ version: 1 })]],
+    ['UPDATE eval_set_versions SET content_hash = $2 WHERE id = $1', [frozen.id, 'a'.repeat(64)]],
+    ['DELETE FROM eval_set_versions WHERE id = $1', [frozen.id]],
+    ['UPDATE eval_batches SET label = $2 WHERE id = $1', [baseline.batch.id, 'renamed']],
+    ['DELETE FROM eval_batches WHERE id = $1', [baseline.batch.id]],
+    ['UPDATE eval_predictions SET output = $2 WHERE id = $1', [predictionId, 'rewritten']],
+    ['DELETE FROM eval_predictions WHERE id = $1', [predictionId]],
+    ['UPDATE eval_reports SET decision = $2 WHERE id = $1', [report.id, 'pass']],
+    ['DELETE FROM eval_reports WHERE id = $1', [report.id]],
+  ];
+  for (const [sql, params] of refused) {
+    await assert.rejects(pool.query(sql, params), (err) => /eval_frozen/.test(err.message), sql);
+  }
+  await assert.rejects(pool.query('DELETE FROM workspaces WHERE id = $1', [ws.id]), (err) => /eval_frozen/.test(err.message));
+  const reopened = await store.reopenEvalSet({ workspaceId: ws.id, projectId: project.id, setId: set.id, actorId: owner.id });
+  await pool.query('UPDATE eval_cases SET input = $2 WHERE set_id = $1', [set.id, 'Edited after reopen']);
+  const kept = await pool.query('SELECT manifest, content_hash FROM eval_set_versions WHERE id = $1', [frozen.id]);
+  assert.equal(kept.rows[0].manifest.cases[0].input, 'Question a');
+  assert.equal(kept.rows[0].content_hash, frozen.contentHash);
+  const frozenReport = await pool.query('SELECT snapshot FROM eval_reports WHERE id = $1', [report.id]);
+  assert.equal(frozenReport.rows[0].snapshot.cases[0].input, 'Question a');
+  assert.equal(reopened.revision, detail.set.revision + 1);
+  await assert.rejects(pool.query('DELETE FROM eval_reports WHERE id = $1', [report.id]), (err) => /eval_frozen/.test(err.message));
 });

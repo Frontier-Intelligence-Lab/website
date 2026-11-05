@@ -783,4 +783,208 @@ export function runStoreContract(test, makeStore, label) {
     assert.deepEqual(page.map((e) => e.seq), [0, 1, 2, 3]);
     assert.deepEqual((await store.listJobEvents({ workspaceId: ws.id, jobId: job.id, afterId: page.at(-1).id, limit: 4 })).map((e) => e.seq), [4, 5, 6]);
   });
+
+  // Regression for the exact-head review of 2afe7bd: handing a runner its inputs is one decision, made on the lease,
+  // the job and the runner as they are at that moment, and recorded only when it is allowed.
+  withStore('jobs review: an input release is bound to the current lease, job state and runner, and records only what it allows', async (store) => {
+    const owner = await store.createUser({ email: 'i@acme.com', name: 'I', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'I', slug: 'i-jobs', ownerId: owner.id });
+    const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'a'.repeat(64), keyPrefix: 'vrk_abcdef' });
+    const mk = (key) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: key, createdBy: owner.id });
+    const released = async () => (await store.listAudit(ws.id)).filter((a) => a.action === 'job.inputs_released');
+    const job = await mk('key-inputs-0001');
+    const who = { runnerId: runner.id, jobId: job.id, leaseHash: 'b'.repeat(64) };
+    await assert.rejects(store.releaseJobInputs(who), { code: 'lease_lost' }, 'not before it holds the job');
+    await store.leaseJob({ runnerId: runner.id, leaseHash: 'b'.repeat(64) });
+    await assert.rejects(store.releaseJobInputs({ ...who, leaseHash: 'c'.repeat(64) }), { code: 'lease_lost' }, 'not with another lease');
+    await assert.rejects(store.releaseJobInputs({ ...who, runnerId: ws.id }), { code: 'not_found' }, 'not for another runner');
+    assert.equal((await released()).length, 0, 'a refused release records nothing');
+    assert.equal((await store.releaseJobInputs({ ...who, versions: 2, files: 3 })).status, 'running', 'allowed while held, and the lease is extended');
+    const [record] = await released();
+    assert.deepEqual([record.actorId, record.targetType, record.targetId, record.metadata], [owner.id, 'job', job.id, { runnerId: runner.id, versions: 2, files: 3 }], 'the record carries the counts of the payload the caller prepared');
+
+    // Once cancel is stored there is no release, though the runner still holds the job and can report.
+    await store.cancelJob({ workspaceId: ws.id, jobId: job.id, actorId: owner.id });
+    await assert.rejects(store.releaseJobInputs(who), { code: 'invalid_state' });
+    assert.equal((await store.touchJob(who)).status, 'cancel_requested');
+    assert.equal((await store.finishJob({ ...who, outcome: 'failed', failure: 'cancelled' })).status, 'cancelled');
+
+    // A lease that ran out is refused and the job goes back to the queue; a job a revoke has failed is refused too.
+    const lost = await mk('key-inputs-0002');
+    const lostBy = (h) => ({ runnerId: runner.id, jobId: lost.id, leaseHash: h.repeat(64) });
+    await store.leaseJob({ runnerId: runner.id, leaseHash: 'd'.repeat(64), leaseMs: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await assert.rejects(store.releaseJobInputs(lostBy('d')), { code: 'lease_lost' });
+    assert.equal((await store.getJob({ workspaceId: ws.id, jobId: lost.id })).status, 'queued');
+    await store.leaseJob({ runnerId: runner.id, leaseHash: 'e'.repeat(64) });
+    await store.revokeRunner({ workspaceId: ws.id, runnerId: runner.id, actorId: owner.id });
+    await assert.rejects(store.releaseJobInputs(lostBy('e')), { code: 'lease_lost' });
+    assert.deepEqual((await released()).map((a) => a.targetId), [job.id], 'only the one allowed release is on record');
+  });
+
+  async function evalReady(store, slug) {
+    const owner = await store.createUser({ email: `${slug}@eval.test`, name: 'Owner', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: slug, slug, ownerId: owner.id });
+    const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Support', task: 'Answer policy questions.', modalities: ['Text'], startingPoint: 'model' });
+    await store.updateProject({ workspaceId: ws.id, projectId: project.id, patch: { success: { measure: 'exact', target: 'the cited policy' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'] } } });
+    const review = await store.submitForReview({ workspaceId: ws.id, projectId: project.id, submittedBy: owner.id });
+    await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+    const version = await store.createDatasetVersion({ workspaceId: ws.id, projectId: project.id, createdBy: owner.id });
+    return { owner, ws, project, version };
+  }
+  const sourceOf = ({ project, version }) => ({ projectId: project.id, versionId: version.id, fileId: null });
+  const evalCase = (ctx, id, extra = {}) => ({ id, input: `Question ${id}`, expectedAnswer: '30 days', reviewCriteria: 'Name the window.', category: 'returns', severity: 'major', sources: [sourceOf(ctx)], ...extra });
+
+  withStore('evaluation imports are atomic and stay inside the workspace', async (store) => {
+    const ctx = await evalReady(store, 'eval-import');
+    const other = await store.createWorkspace({ kind: 'organization', name: 'Other', slug: 'eval-other', ownerId: ctx.owner.id });
+    const set = await store.createEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, createdBy: ctx.owner.id, name: 'Weekday', purpose: 'development' });
+    const good = `${JSON.stringify(evalCase(ctx, 'a'))}\n`;
+    const imported = await store.importEvalCases({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: 1, jsonl: good });
+    assert.equal(imported.cases.length, 1);
+    const before = (await store.getEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id })).cases.length;
+    await assert.rejects(store.importEvalCases({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: imported.revision, jsonl: `${good}${JSON.stringify(evalCase(ctx, 'b'))}\n` }), { code: 'invalid_import' });
+    await assert.rejects(store.importEvalCases({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: imported.revision, jsonl: '{not json\n' }), { code: 'invalid_import' });
+    assert.equal((await store.getEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id })).cases.length, before);
+    assert.equal(await store.getEvalSet({ workspaceId: other.id, projectId: ctx.project.id, setId: set.id }), null);
+    await assert.rejects(store.saveEvalCase({ workspaceId: other.id, projectId: ctx.project.id, setId: set.id, expectedRevision: imported.revision, input: evalCase(ctx, 'c') }), { code: 'not_found' });
+  });
+
+  withStore('a refused evaluation-set update leaves the draft and its revision unchanged', async (store) => {
+    const ctx = await evalReady(store, 'eval-update');
+    const where = { workspaceId: ctx.ws.id, projectId: ctx.project.id };
+    const set = await store.createEvalSet({ ...where, createdBy: ctx.owner.id, name: 'Reviewed original name', purpose: 'development' });
+    const before = (await store.getEvalSet({ ...where, setId: set.id })).set;
+    const rule = { ...before.acceptance, minPassRate: 0.75 };
+    for (const patch of [
+      { name: 'Mutated although rejected', purpose: 'invalid' },
+      { name: 'Mutated although rejected', purpose: 'final_assessment', acceptance: { ...rule, scoreBasis: 'guess' } },
+      { name: 'Mutated although rejected', purpose: 'final_assessment', acceptance: { ...rule, minCoverage: 1.00001 } },
+      { name: 'Mutated although rejected', purpose: 'final_assessment', acceptance: rule, rubricVersion: 'Rubric V2!' },
+    ]) {
+      await assert.rejects(store.updateEvalSet({ ...where, setId: set.id, expectedRevision: 1, patch }), { code: 'invalid_import' }, JSON.stringify(patch));
+      assert.deepEqual((await store.getEvalSet({ ...where, setId: set.id })).set, before, `unchanged after ${JSON.stringify(patch)}`);
+    }
+    const updated = await store.updateEvalSet({ ...where, setId: set.id, expectedRevision: 1, patch: { name: 'Renamed after review', purpose: 'final_assessment', acceptance: rule, rubricVersion: 'rubric-v2' } });
+    assert.deepEqual([updated.revision, updated.name, updated.purpose, updated.acceptance.minPassRate, updated.rubricVersion], [2, 'Renamed after review', 'final_assessment', 0.75, 'rubric-v2']);
+    await assert.rejects(store.updateEvalSet({ ...where, setId: set.id, expectedRevision: 1, patch: { name: 'Stale' } }), { code: 'stale_revision' });
+  });
+
+  withStore('a conflict does not hide duplicates, and an acknowledgement is tied to the facts that were reviewed', async (store) => {
+    const ctx = await evalReady(store, 'eval-conflict');
+    const where = { workspaceId: ctx.ws.id, projectId: ctx.project.id };
+    const second = await store.createProject({ workspaceId: ctx.ws.id, createdBy: ctx.owner.id, name: 'Second', task: 'Answer policy questions.', modalities: ['Text'], startingPoint: 'model' });
+    await store.updateProject({ workspaceId: ctx.ws.id, projectId: second.id, patch: { success: { measure: 'exact', target: 'the cited policy' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'] } } });
+    const secondReview = await store.submitForReview({ workspaceId: ctx.ws.id, projectId: second.id, submittedBy: ctx.owner.id });
+    await store.decideReview({ reviewId: secondReview.id, reviewerId: ctx.owner.id, decision: 'approved', checks: {} });
+    const secondVersion = await store.createDatasetVersion({ workspaceId: ctx.ws.id, projectId: second.id, createdBy: ctx.owner.id });
+
+    const set = await store.createEvalSet({ ...where, createdBy: ctx.owner.id, name: 'Returns', purpose: 'development' });
+    const state = () => store.getEvalSet({ ...where, setId: set.id });
+    const rows = Array.from({ length: 10 }, (_, i) => JSON.stringify(evalCase(ctx, `c${i}`, { input: 'Is it returnable?', expectedAnswer: i < 9 ? 'yes' : 'no', reviewCriteria: null }))).join('\n');
+    await store.importEvalCases({ ...where, setId: set.id, expectedRevision: 1, jsonl: rows });
+    let detail = await state();
+    const conflict = detail.issues.find((issue) => issue.group === 'conflict');
+    const duplicate = detail.issues.find((issue) => issue.group === 'duplicate');
+    assert.deepEqual([duplicate.caseKeys.length, duplicate.acknowledgeable, conflict.caseKeys.length], [9, false, 10]);
+    await assert.rejects(store.setEvalIssueNote({ ...where, setId: set.id, expectedRevision: detail.set.revision, key: duplicate.key, note: 'Fine.', createdBy: ctx.owner.id }), { code: 'invalid_state' });
+    await store.setEvalIssueNote({ ...where, setId: set.id, expectedRevision: detail.set.revision, key: conflict.key, note: 'Reviewed.', createdBy: ctx.owner.id });
+    detail = await state();
+    assert.deepEqual(detail.issues.filter((issue) => issue.open).map((issue) => issue.group), ['duplicate']);
+    await assert.rejects(store.freezeEvalSet({ ...where, setId: set.id, expectedRevision: detail.set.revision, actorId: ctx.owner.id }), (err) => err.code === 'issues_open' && err.open === 1);
+    assert.equal((await state()).set.status, 'draft');
+    for (const row of detail.cases.filter((item) => !['c0', 'c9'].includes(item.caseKey))) {
+      await store.deleteEvalCase({ ...where, setId: set.id, caseId: row.id, expectedRevision: (await state()).set.revision });
+    }
+    const openConflict = async (label) => {
+      const current = await state();
+      assert.deepEqual(current.issues.filter((issue) => issue.open).map((issue) => [issue.group, issue.note]), [['conflict', null]], label);
+      await assert.rejects(store.freezeEvalSet({ ...where, setId: set.id, expectedRevision: current.set.revision, actorId: ctx.owner.id }), { code: 'issues_open' }, label);
+      await store.setEvalIssueNote({ ...where, setId: set.id, expectedRevision: current.set.revision, key: current.issues.find((issue) => issue.group === 'conflict').key, note: `Reviewed after ${label}.`, createdBy: ctx.owner.id });
+      assert.equal((await state()).issues.filter((issue) => issue.open).length, 0, label);
+    };
+    const edit = async (caseKey, patch) => {
+      const current = await state();
+      const row = current.cases.find((item) => item.caseKey === caseKey);
+      await store.saveEvalCase({ ...where, setId: set.id, expectedRevision: current.set.revision, caseId: row.id, input: { ...row, id: caseKey, sources: row.sourceRefs, ...patch } });
+    };
+    await openConflict('the membership change');
+    await edit('c9', { expectedAnswer: 'changed answer never reviewed' });
+    await openConflict('the answer edit');
+    await edit('c9', { sources: [{ projectId: second.id, versionId: secondVersion.id, fileId: null }] });
+    await openConflict('the source edit');
+    await edit('c0', { reviewCriteria: 'Name the window.' });
+    await openConflict('the criteria edit');
+    await store.saveEvalCase({ ...where, setId: set.id, expectedRevision: (await state()).set.revision, input: evalCase(ctx, 'c10', { input: 'Is it returnable?', expectedAnswer: 'sometimes' }) });
+    await openConflict('the new member');
+    await edit('c0', { category: 'other' });
+    const final = await state();
+    assert.equal(final.issues.filter((issue) => issue.open).length, 0, 'a label that is not a fact about the answer keeps the acknowledgement');
+    assert.ok(final.notes.length >= 6, 'earlier notes stay on record');
+    const frozen = await store.freezeEvalSet({ ...where, setId: set.id, expectedRevision: final.set.revision, actorId: ctx.owner.id });
+    assert.deepEqual([frozen.qc.open, frozen.qc.issues.length, frozen.cases.length], [0, 1, 3]);
+  });
+
+  withStore('a frozen evaluation version, its imports and its report stay fixed', async (store) => {
+    const ctx = await evalReady(store, 'eval-freeze');
+    const set = await store.createEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, createdBy: ctx.owner.id, name: 'Policy', purpose: 'final_assessment' });
+    const saved = await store.saveEvalCase({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: set.revision, input: evalCase(ctx, 'returns', { severity: 'critical', expectedAnswer: '30 days' }) });
+    const detail = await store.getEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id });
+    assert.equal(detail.issues.filter((issue) => issue.open).length, 0);
+    const frozen = await store.freezeEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: detail.set.revision, actorId: ctx.owner.id });
+    const again = await store.freezeEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: detail.set.revision, actorId: ctx.owner.id });
+    assert.equal(again.id, frozen.id);
+    await assert.rejects(store.saveEvalCase({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: detail.set.revision, caseId: saved.id, input: evalCase(ctx, 'returns', { input: 'Changed' }) }), { code: 'invalid_state' });
+    const jsonl = '{"id":"returns","status":"answered","output":"30 days"}\n';
+    const baseline = await store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen.id, role: 'baseline', label: 'old', claimedSystem: { identity: 'claimed-old', configuration: null }, claimedScorer: null, filename: 'a.jsonl', jsonl, importedBy: ctx.owner.id });
+    const replay = await store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen.id, role: 'baseline', label: 'old', claimedSystem: {}, claimedScorer: null, filename: 'a.jsonl', jsonl, importedBy: ctx.owner.id });
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.batch.id, baseline.batch.id);
+    await assert.rejects(store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen.id, role: 'baseline', label: 'old', claimedSystem: {}, claimedScorer: null, filename: 'a.jsonl', jsonl: '{"id":"returns","status":"answered","output":"different"}\n', importedBy: ctx.owner.id }), { code: 'invalid_state' });
+    await assert.rejects(store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen.id, role: 'candidate', label: 'new', claimedSystem: {}, claimedScorer: null, filename: 'b.jsonl', jsonl: '{"id":"missing","status":"answered","output":"x"}\n', importedBy: ctx.owner.id }), { code: 'invalid_import' });
+    assert.equal((await store.listEvalBatches({ workspaceId: ctx.ws.id, versionId: frozen.id })).filter((batch) => batch.role === 'candidate').length, 0);
+    const candidate = await store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen.id, role: 'candidate', label: 'new', claimedSystem: { identity: 'claimed-new' }, claimedScorer: 'customer-scorer', filename: 'b.jsonl', jsonl: '{"id":"returns","status":"error","error":"timeout"}\n', importedBy: ctx.owner.id });
+    const comparison = await store.createEvalComparison({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, versionId: frozen.id, baselineBatchId: baseline.batch.id, candidateBatchId: candidate.batch.id, createdBy: ctx.owner.id });
+    const read = await store.readEvalComparison({ workspaceId: ctx.ws.id, comparisonId: comparison.id });
+    assert.equal(read.built.counts.eligible, 1);
+    assert.equal(read.built.counts.candidate.failed, 1);
+    assert.equal(read.built.counts.candidate.missing, 0);
+    assert.equal(read.built.decision.result, 'insufficient_evidence');
+    const judged = await store.recordEvalJudgment({ workspaceId: ctx.ws.id, comparisonId: comparison.id, expectedRevision: comparison.revision, caseKey: 'returns', reviewerId: ctx.owner.id, patch: { baselineDecision: 'pass', candidateDecision: 'fail', adjudicationBaseline: null, adjudicationCandidate: 'human', note: 'The run timed out, so this is a failure to answer.' } });
+    const preview = await store.readEvalComparison({ workspaceId: ctx.ws.id, comparisonId: comparison.id });
+    assert.equal(preview.built.decision.result, 'fail');
+    assert.equal(preview.built.criticalFailures[0].outcome, 'fail');
+    const report = await store.approveEvalReport({ workspaceId: ctx.ws.id, comparisonId: comparison.id, expectedRevision: judged.comparison.revision, contentHash: preview.contentHash, approvedBy: ctx.owner.id });
+    const same = await store.approveEvalReport({ workspaceId: ctx.ws.id, comparisonId: comparison.id, expectedRevision: judged.comparison.revision, contentHash: preview.contentHash, approvedBy: ctx.owner.id });
+    assert.equal(same.id, report.id);
+    await assert.rejects(store.approveEvalReport({ workspaceId: ctx.ws.id, comparisonId: comparison.id, expectedRevision: judged.comparison.revision, contentHash: 'a'.repeat(64), approvedBy: ctx.owner.id }), { code: 'stale_revision' });
+    await assert.rejects(store.approveEvalReport({ workspaceId: ctx.ws.id, comparisonId: comparison.id, expectedRevision: 1, contentHash: preview.contentHash, approvedBy: ctx.owner.id }), { code: 'stale_revision' });
+    assert.equal(snapshotHash(report.snapshot), report.contentHash);
+    const reopened = await store.reopenEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, actorId: ctx.owner.id });
+    assert.equal(reopened.revision, detail.set.revision + 1);
+    await store.saveEvalCase({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: reopened.revision, caseId: saved.id, input: evalCase(ctx, 'returns', { input: 'Edited after reopen', severity: 'critical' }) });
+    const kept = await store.getEvalVersion({ workspaceId: ctx.ws.id, versionId: frozen.id });
+    assert.equal(kept.cases[0].input, 'Question returns');
+    assert.equal(kept.contentHash, frozen.contentHash);
+    assert.equal((await store.getEvalReport({ workspaceId: ctx.ws.id, reportId: report.id })).snapshot.cases[0].input, 'Question returns');
+  });
+
+  withStore('parallel freezes, imports and approvals do not duplicate evaluation rows', async (store) => {
+    const ctx = await evalReady(store, 'eval-race');
+    const set = await store.createEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, createdBy: ctx.owner.id, name: 'Race', purpose: 'development' });
+    await store.saveEvalCase({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: 1, input: evalCase(ctx, 'a', { severity: null }) });
+    const detail = await store.getEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id });
+    const frozen = await Promise.all([1, 2].map(() => store.freezeEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, expectedRevision: detail.set.revision, actorId: ctx.owner.id })));
+    assert.equal(frozen[0].id, frozen[1].id);
+    assert.equal((await store.getEvalSet({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id })).versions.length, 1);
+    const jsonl = '{"id":"a","status":"answered","output":"30 days"}\n';
+    const imports = await Promise.all([1, 2].map(() => store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen[0].id, role: 'baseline', label: 'same', claimedSystem: {}, claimedScorer: null, filename: 'a.jsonl', jsonl, importedBy: ctx.owner.id })));
+    assert.equal(new Set(imports.map((item) => item.batch.id)).size, 1);
+    const candidate = await store.importEvalPredictions({ workspaceId: ctx.ws.id, projectId: ctx.project.id, versionId: frozen[0].id, role: 'candidate', label: 'other', claimedSystem: {}, claimedScorer: null, filename: 'b.jsonl', jsonl, importedBy: ctx.owner.id });
+    const comparison = await store.createEvalComparison({ workspaceId: ctx.ws.id, projectId: ctx.project.id, setId: set.id, versionId: frozen[0].id, baselineBatchId: imports[0].batch.id, candidateBatchId: candidate.batch.id, createdBy: ctx.owner.id });
+    const preview = await store.readEvalComparison({ workspaceId: ctx.ws.id, comparisonId: comparison.id });
+    const reports = await Promise.all([1, 2].map(() => store.approveEvalReport({ workspaceId: ctx.ws.id, comparisonId: comparison.id, expectedRevision: comparison.revision, contentHash: preview.contentHash, approvedBy: ctx.owner.id })));
+    assert.equal(reports[0].id, reports[1].id);
+    assert.equal((await store.listEvalReports({ workspaceId: ctx.ws.id, comparisonId: comparison.id })).length, 1);
+  });
 }

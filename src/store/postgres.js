@@ -5,6 +5,7 @@ import { boxNotStoredForm, frozenBoxViolations } from '../lib/box-sql.js';
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
 import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
+import { evalPostgresMethods } from './eval-postgres.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
@@ -43,6 +44,10 @@ function databaseError(error) {
       // migrations/013_capital.sql: a revision is submitted once; a credit record is corrected once.
       capital_submissions_case_id_revision_key: 'invalid_state',
       credit_records_supersedes_key: 'invalid_state',
+      // migrations/015_evaluation.sql. A repeated case id is a bad import; a repeated batch label or report revision is a state conflict.
+      eval_cases_set_id_case_key_key: 'invalid_import',
+      eval_batches_version_id_role_label_key: 'invalid_state',
+      eval_reports_comparison_id_revision_key: 'invalid_state',
     }[error.constraint];
     if (code) return new StoreError(code);
   }
@@ -55,6 +60,8 @@ function databaseError(error) {
   // Raised by migrations/014_jobs.sql: a job's inputs and finished jobs never change; events are append-only.
   if (error.code === 'P0001' && ['job_frozen', 'job_event_frozen'].includes(error.message)) return new StoreError('invalid_state');
   if (error.code === 'P0001' && ['submission_frozen', 'credit_record_frozen', 'review_mark_frozen'].includes(error.message)) return new StoreError('invalid_state');
+  // Raised by migrations/015_evaluation.sql when a frozen evaluation row is rewritten or deleted.
+  if (error.code === 'P0001' && error.message === 'eval_frozen') return new StoreError('invalid_state', 'This evaluation record is frozen. Start a new version instead of changing the approved one.');
   // PostgreSQL details can contain complete rows, including hashes or private data.
   const safe = new Error('Postgres operation failed');
   if (typeof error.code === 'string') safe.code = error.code;
@@ -271,7 +278,7 @@ export function createPostgresStore(options) {
     [workspaceId, actorId, action, targetType, targetId, JSON.stringify(metadata)], client);
   };
 
-  return {
+  const store = {
     kind: 'postgres',
 
     async createUser({ email, name, passwordHash }) {
@@ -1015,6 +1022,21 @@ export function createPostgresStore(options) {
     async touchJob({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS }) {
       return transaction(async (client) => jobRow(await extendLease(client, await lockHeldJob(client, { runnerId, jobId, leaseHash }), leaseMs)));
     },
+    async releaseJobInputs({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS, versions = 0, files = 0 }) {
+      return transaction(async (client) => {
+        // Under the job row lock, which cancelJob takes and which revokeRunner's job update waits for: the lease is
+        // decided after the wait (lockHeldJob), and a committed revoke has already failed the job, so lease_lost.
+        const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
+        if (j.status === 'cancel_requested') throw new StoreError('invalid_state');
+        // Read, not locked: revokeRunner locks the runner row and then the job rows, so taking the runner row here,
+        // after the job row, could deadlock with it. The job row above already orders this release against a revoke.
+        const runner = (await query('SELECT created_by, status FROM runners WHERE id = $1', [runnerId], client)).rows[0];
+        if (runner.status !== 'active') throw new StoreError('lease_lost');
+        const row = await extendLease(client, j, leaseMs);
+        await addAudit(client, { workspaceId: j.workspace_id, actorId: runner.created_by, action: 'job.inputs_released', targetType: 'job', targetId: jobId, metadata: { runnerId, versions, files } });
+        return jobRow(row);
+      });
+    },
     async appendJobEvents({ runnerId, jobId, leaseHash, events, leaseMs = LEASE_MS }) {
       return transaction(async (client) => {
         const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
@@ -1263,4 +1285,5 @@ export function createPostgresStore(options) {
     },
     async close() { await pool.end(); },
   };
+  return Object.assign(store, evalPostgresMethods({ query, transaction, isId, iso, addAudit }));
 }
