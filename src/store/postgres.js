@@ -963,9 +963,10 @@ export function createPostgresStore(options) {
         return jobRow(row);
       });
     },
-    async listJobs({ workspaceId, limit = 50 }) {
+    // settleLeases: false is a pure read of the last recorded state; the default settles expired leases first.
+    async listJobs({ workspaceId, limit = 50, settleLeases = true }) {
       if (!isId(workspaceId)) return [];
-      await expireLeases('workspace', workspaceId);
+      if (settleLeases) await expireLeases('workspace', workspaceId);
       return (await query('SELECT * FROM jobs WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2', [workspaceId, limit])).rows.map(jobRow);
     },
     async getJob({ workspaceId, jobId }) {

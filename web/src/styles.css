@@ -425,6 +425,7 @@ a { color: inherit; }
 .stats { margin: 0; display: grid; gap: 14px 8px; }
 .stats--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); padding-top: 14px; border-top: 1px solid var(--divider); }
 .stats--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.stats--auto { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); padding-top: 10px; border-top: 1px solid var(--divider); }
 .stats dt { font-size: 12px; }
 .stats dd { margin: 0; font-size: 16px; font-weight: 600; }
 .share { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border-radius: 8px; background: var(--surface-2); font-size: 13px; }

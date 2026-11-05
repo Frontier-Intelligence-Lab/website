@@ -22,6 +22,7 @@ import { registerDeviceRoutes } from './devices.js';
 import { registerCapitalRoutes } from './capital.js';
 import { registerEvalRoutes } from './eval.js';
 import { registerJobRoutes } from './jobs.js';
+import { UNAVAILABLE, buildDemoOverview } from './lib/demo-overview.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -218,6 +219,16 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
     await request.session.destroy();
     if (reviewer) await signins.record({ event: 'signout', username: reviewer.username });
     return { ok: true };
+  });
+
+  // The reviewer overview: actual records of the one workspace named by DEMO_WORKSPACE_ID, read-only. The reviewer
+  // account is re-checked like everywhere else (a disabled one is signed out), nothing in the request selects a
+  // workspace, and session.account is never read or written here.
+  app.get('/api/demo/overview', async (request, reply) => {
+    privateHeaders(reply);
+    if (!(await reviewerOf(request))) return problem(reply, 401, 'Sign in first.');
+    const result = await buildDemoOverview({ store: accountStore, workspaceId: config.demoWorkspaceId });
+    return result.code ? problem(reply, 503, UNAVAILABLE[result.code], { code: result.code }) : result.overview;
   });
 
   // Sign-in history for admin accounts only.

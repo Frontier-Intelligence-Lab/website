@@ -21,7 +21,7 @@ Site and onboarding app for Valcairn by Frontier Intelligence Labs: homepage, co
 | Capital (`/w/:slug/capital`): cost plan in US cents, outside credit records, company financing request, evidence package, Valcairn internal review | Implemented for organizations and tested against the memory and Postgres stores. Owners, admins and finance members plan; owners and admins send one exact revision to internal review; staff request changes or mark evidence reviewed. Exports an audited JSON package. Not yet deployed. |
 | Lenders, credit decisions, funding, reservations and reconciliation against a real meter, private finance-document upload | **Planned.** Labelled planned in Capital; no provider is connected and nothing moves money. |
 | Provider onboarding, training, evaluation, deployment | **Planned.** Shown as planned in the app; nothing executes. |
-| `/demo/review` workspace dashboard | Implemented with clearly labelled **sample data** for invited reviewers. Data, labeling, training, licensing and financing panels are a design demonstration, not a working platform. |
+| `/demo/review` reviewer overview | Implemented. Read-only actual records of the one synthetic workspace named by `DEMO_WORKSPACE_ID` (projects, staff review counts, dataset versions, linked machines and latest jobs with runner-reported numbers, approved evaluation reports, capital case status, recent actions) through `GET /api/demo/overview`. Unconfigured means an honest empty state; no sample figures are shown. Hosted scheduling, deployment and financing have no records and are not displayed as if they did. |
 | Light / dark mode | Follows the system setting; a toggle stores the visitor's choice in `localStorage`. |
 | Deployment | Nothing deploys from this repository yet. frontierintelligencelab.com still runs an earlier server-rendered build as a Docker container; this React version needs a new release (see [Deployment](#deployment)). |
 
@@ -34,12 +34,12 @@ flowchart LR
     B[Browser: React app] -- "GET /, /contact, /demo, /demo/review" --> F[Fastify]
     B -- "GET /assets/* (public bundle)" --> F
     B -- "GET /private/* (dashboard chunk, session required)" --> F
-    B -- "JSON /api/config, /api/contact, /api/login, /api/logout, /api/session" --> F
+    B -- "JSON /api/config, /api/contact, /api/login, /api/logout, /api/session, /api/demo/overview" --> F
     F -- SMTP --> M[(Contact mailbox)]
 ```
 
 - Every page URL returns the same `dist/index.html`; React Router renders the page in the browser.
-- Reviewer-only code (the dashboard and its sample data) is built into `dist/private/`. The server returns those files only to signed-in reviewers, so dashboard content is never in the public bundle.
+- Reviewer-only code (the overview dashboard) is built into `dist/private/`. The server returns those files only to signed-in reviewers, so dashboard code is never in the public bundle, and the records it shows come only from `GET /api/demo/overview`, which also needs the reviewer session.
 - Signed-out requests to `/demo/review` are redirected to `/demo` by the server before any page loads.
 
 ## Run locally
@@ -65,7 +65,7 @@ npm start          # http://localhost:3000
 ## Verification
 
 ```powershell
-npm run check      # vite build, syntax check, then node --test (25 tests)
+npm run check      # vite build, syntax check, then node --test
 ```
 
 Server tests use a tiny fixture build in `tests/fixtures/dist`, so `npm test` alone does not need `vite build`.
@@ -84,6 +84,7 @@ See `.env.example`. Key values:
 | `REVIEWERS_FILE` or `REVIEWERS_JSON` | Reviewer accounts. Unset means sign-in is disabled. |
 | `MODEL_CATALOG_FILE` | JSON array of the open-weight models offered on the Models pages (see [Model catalog](#model-catalog)). Unset means an empty catalog: nothing to pull and no new enhance plans, while recorded pulls and runs stay readable. An unreadable or invalid file stops startup with the reason. |
 | `SIGNIN_LOG_FILE` | Where the sign-in log is appended (JSON Lines). Unset keeps only the latest 200 events in memory, lost on restart. |
+| `DEMO_WORKSPACE_ID` | The id (UUID) of the synthetic workspace that `/demo/review` shows to invited reviewers, as printed by `scripts/seed-demo.js`. The workspace must carry `profile.synthetic = true`; anything else is refused with a clear unavailable state. Unset means the overview says it is not configured. A value that is not a UUID stops startup. |
 | `LOCAL_MODEL_CATALOG_FILE` | JSON catalog of models offered for download on Run on this device, validated at startup. Example: `docs/local-models.example.json`. Unset means no downloads are offered; installed models still work. |
 | `LOCAL_RUNTIME_ORIGINS` | Loopback origins of the visitor's own model runtime, added to the CSP `connect-src`. Default `http://127.0.0.1:11434,http://localhost:11434`. Non-loopback values are refused at startup. |
 | `LOCAL_MEMORY_ORIGINS` | Loopback origins of a Provena memory gateway in local-store mode on the visitor's computer, added to the CSP `connect-src`. Default `http://127.0.0.1:8787,http://localhost:8787`. Non-loopback values are refused; empty turns the Memory page off. |
@@ -134,6 +135,7 @@ Give each invited person their own account: a shared login only shows that *some
 | `POST /api/login` | same origin, 10 per 15 min | `{username, password}` → `200 {reviewer}`, `401`, `503`. |
 | `POST /api/logout` | same origin | Ends the session. |
 | `/api/workspaces/:id/runners`, `/api/workspaces/:id/jobs`, `/api/runner/*` | session (people) or runner key (runners) | Runners and the job queue; full reference in [docs/RUNNERS.md](docs/RUNNERS.md). |
+| `GET /api/demo/overview` | reviewer account (re-checked each request; disabled accounts get `401`) | Read-only projection of the one workspace named by `DEMO_WORKSPACE_ID`, which must be `profile.synthetic = true`: `{ workspace, projects, compute, evaluation, capital, activity }` with ids, names, statuses, counts, runner-reported finite numbers and timestamps only. `503 { code }` when unconfigured, missing, not synthetic or without a store; nothing in the request can choose another workspace. |
 | `GET /api/admin/signins` | admin account | Latest 200 sign-in events, newest first: `{at, event, username}` where `event` is `signin`, `signout` or `failed`. |
 | `GET /api/workspaces/:id/capital`, `POST …/capital/cases`, `GET\|POST …/capital/cases/:caseId`, `POST …/submit`, `POST …/withdraw`, `POST …/evidence`, `POST …/evidence/:evidenceId/delete`, `GET …/export`, `POST …/capital/credits` | owner, admin or finance member of an organization (sending and withdrawing: owner or admin) | Capital: cases with a revisioned draft (`expectedRevision` on every save; `409 stale_revision` when someone saved first), sending with `expectedRevision`, `contentHash` (returned by the case GET only, never by a save: the hash of exactly what will be frozen, including evidence and credit records; `409 content_changed` if any of it changed since) and `sendToReview: true`, frozen submissions, append-only credit records, evidence references (`409 evidence_in_use` when a cost item cites the record) and the audited JSON evidence package (the sent revision as frozen, staff marks apart; or the draft, labelled). Members and viewers get `403`; non-members `404`. |
 | `GET /api/staff/capital`, `GET /api/staff/capital/:caseId`, `POST …/decision`, `POST …/evidence/:evidenceId/review` | `STAFF_EMAILS` account, not a member of that workspace for decisions | Internal review of sent revisions only, read from the frozen snapshot (never a live draft, title, evidence or credit record). Every action names the `submissionId` the reviewer saw; `409 stale_submission` if the customer withdrew or sent a newer revision since. Decisions are `changes_requested` (with notes) or `evidence_reviewed`; marks are append-only per submission and frozen evidence id. No approval, offer or funding exists. Opening a case is recorded in the customer's audit log. |
@@ -179,7 +181,7 @@ This is a long-running Node server (sessions, SMTP, rate limits), not a static o
 
 ## Repository map
 
-- `web/` React app: `src/router.jsx` routes and loaders, `src/site/` public pages, `src/private/` reviewer-only dashboard and sample data, `src/app/` signed-in workspace pages and their loopback clients (`runtime.js` Ollama, `memory.js` Provena gateway, `agent.js` and `agent-ledger.js` the bounded research agent and its IndexedDB ledger), `src/theme.jsx` light/dark toggle, `src/styles.css` theme tokens and styles, `src/assets/` self-hosted Inter and hero artwork.
+- `web/` React app: `src/router.jsx` routes and loaders, `src/site/` public pages, `src/private/` reviewer-only overview dashboard and its refresh state, `src/app/` signed-in workspace pages and their loopback clients (`runtime.js` Ollama, `memory.js` Provena gateway, `agent.js` and `agent-ledger.js` the bounded research agent and its IndexedDB ledger), `src/theme.jsx` light/dark toggle, `src/styles.css` theme tokens and styles, `src/assets/` self-hosted Inter and hero artwork.
 - `src/` Fastify server: `app.js` routes, API and static serving; `config.js` environment parsing; `accounts.js`, `datasets.js`, `workspace-data.js`, `models.js`, `devices.js`, `capital.js` the JSON API by area; `lib/` contact validation and delivery, password hashing, reviewer lookup, origin check, and the validation shared with the browser (`onboarding.js`, `devices.js`, `capital.js`); `store/` the memory and Postgres stores.
 - `tests/` server tests (`node --test`) and the fixture build.
 - `vite.config.js` build config, including the `/private/` chunk rule.

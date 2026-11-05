@@ -634,9 +634,10 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'job.created', targetType: 'job', targetId: job.id, metadata: { kind, runnerId }, createdAt: at });
       return publicJob(job);
     },
-    async listJobs({ workspaceId, limit = 50 }) {
+    // settleLeases: false is a pure read of the last recorded state; the default settles expired leases first.
+    async listJobs({ workspaceId, limit = 50, settleLeases = true }) {
       const mine = jobs.filter((j) => j.workspaceId === workspaceId);
-      mine.forEach(expireLease);
+      if (settleLeases) mine.forEach(expireLease);
       return mine.slice(-limit).reverse().map(publicJob);
     },
     async getJob({ workspaceId, jobId }) {

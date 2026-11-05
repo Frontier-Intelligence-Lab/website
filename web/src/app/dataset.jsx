@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, redirect, useLoaderData, useNavigate, useParams, useRevalidator } from 'react-router';
 import { api, uploadFile } from '../api.js';
 import { Icon, Tile, requireWorkspace } from './ui.jsx';
-import { WorkspaceShell, plural, roleName } from './shell.jsx';
+import { CAPITAL_ROLES, WorkspaceShell, plural, roleName } from './shell.jsx';
 import { BoxedImage, KINDS, KIND_LABEL, KIND_ONE, TIMED, Preview, detectKind, fmtBytes, fmtTime, formatName } from './preview.jsx';
 
 const STATUS = { draft: 'Working set · editable', changes_requested: 'Changes requested · editable', in_review: 'In review · locked', approved: 'Approved · locked', versioned: 'Version approved · locked' };
@@ -979,10 +979,15 @@ export function DatasetVersions() {
           </section>
           <section className="ob-card">
             <h2>Next steps for a version</h2>
+            {/* Pages that exist today. A plan on Models names the version it trains on (the link carries no version:
+                the plan picks it), Compute runs and exports it on a linked machine, Capital plans the costs. Nothing
+                here starts a job; hosted deployment and funding stay planned. */}
             <div className="ob-links" style={{ borderTop: 0 }}>
-              <a aria-disabled="true"><span>Train a model on it</span><span className="ob-badge">Planned</span></a>
-              <a aria-disabled="true"><span>Deploy a trained model</span><span className="ob-badge">Planned</span></a>
-              <a aria-disabled="true" style={{ borderBottom: 0 }}><span>Use it to raise financing</span><span className="ob-badge">Planned</span></a>
+              <Link to={`/w/${d.entry.slug}/models`}><span>Plan training on Models</span><span className="ob-muted">{d.writer ? 'A plan names the version; an owner or admin approves it' : 'See plans and the model catalog'}</span></Link>
+              <Link to={`/w/${d.entry.slug}/compute`}><span>Run and export on Compute</span><span className="ob-muted">{manager ? 'Link a machine, then queue training and export' : 'See linked machines and jobs'}</span></Link>
+              {d.entry.kind === 'organization' && CAPITAL_ROLES.includes(d.role) && <Link to={`/w/${d.entry.slug}/capital`}><span>Plan costs and evidence on Capital</span><span className="ob-muted">Valcairn internal review only</span></Link>}
+              <a aria-disabled="true"><span>Deploy a trained model to hosted servers</span><span className="ob-badge">Planned</span></a>
+              <a aria-disabled="true" style={{ borderBottom: 0 }}><span>Funding from a lender or provider</span><span className="ob-badge">Planned</span></a>
             </div>
           </section>
         </aside>

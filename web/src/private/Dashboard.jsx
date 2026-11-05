@@ -1,26 +1,22 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useReducer, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { api } from '../api.js';
 import { ThemeToggle } from '../theme.jsx';
-import { ATTENTION, CAMPAIGNS, FINANCING, KPIS, LIFECYCLE, NAV, PROJECTS, RUNS } from './sampleData.js';
+import { costTotalLines, createOverviewLoader, formatCents, initialOverviewState, reduceOverview } from './overview-state.js';
 
+/**
+ * The reviewer overview: actual records of one pinned synthetic workspace, read from GET /api/demo/overview.
+ * Nothing on this page is sample data. Every section shows what the server recorded, or says plainly that there is
+ * nothing, that the overview is not configured, or that the latest refresh failed.
+ */
 const ICONS = {
   home: <path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" />,
   grid: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></>,
-  book: <path d="M4 19V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2 2 2 0 0 0 2 2h13" />,
-  upload: <><path d="M12 15V4" /><path d="m7 9 5-5 5 5" /><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4" /></>,
-  tag: <><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z" /><circle cx="7.5" cy="7.5" r="1.5" /></>,
-  layers: <><path d="m12 3 9 5-9 5-9-5z" /><path d="m3 13 9 5 9-5" /></>,
-  store: <><path d="M3 9h18l-1.5-5h-15z" /><path d="M5 9v11h14V9" /><path d="M10 20v-6h4v6" /></>,
   chip: <><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4" /></>,
   chart: <path d="M4 20V11M10 20V5M16 20v-6M2 20h20" />,
-  server: <><rect x="3" y="4" width="18" height="7" rx="1.5" /><rect x="3" y="13" width="18" height="7" rx="1.5" /><path d="M7 7.5h.01M7 16.5h.01" /></>,
   bank: <><path d="M3 10 12 4l9 6" /><path d="M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 21h18" /></>,
-  shield: <><path d="M12 3 4 6v6c0 4.5 3.4 8.2 8 9 4.6-.8 8-4.5 8-9V6z" /><path d="m9 12 2 2 4-4" /></>,
-  shieldAlert: <><path d="M12 3 4 6v6c0 4.5 3.4 8.2 8 9 4.6-.8 8-4.5 8-9V6z" /><path d="M12 8v4M12 16h.01" /></>,
   clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
-  search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
-  people: <><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0" /><path d="M17 8h5M19.5 5.5v5" /></>,
+  shield: <><path d="M12 3 4 6v6c0 4.5 3.4 8.2 8 9 4.6-.8 8-4.5 8-9V6z" /><path d="m9 12 2 2 4-4" /></>,
   arrow: <path d="M5 12h14M13 6l6 6-6 6" />,
 };
 
@@ -32,188 +28,239 @@ function Icon({ name, size = 18 }) {
   );
 }
 
-const initials = (name) => name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+const SECTIONS = [
+  { id: 'overview', label: 'Overview', icon: 'home' },
+  { id: 'projects', label: 'Projects', icon: 'grid' },
+  { id: 'compute', label: 'Compute', icon: 'chip' },
+  { id: 'evaluation', label: 'Evaluation', icon: 'chart' },
+  { id: 'capital', label: 'Capital', icon: 'bank' },
+  { id: 'activity', label: 'Activity', icon: 'clock' },
+];
 
-function Sidebar() {
+const PROJECT_STATUS = { draft: 'Draft', in_review: 'In review', changes_requested: 'Changes requested', approved: 'Approved', versioned: 'Dataset version approved' };
+const JOB_KIND = { probe: 'Sandbox check', train: 'Training', evaluate: 'Evaluation', export: 'Export' };
+const JOB_STATUS = { queued: 'Queued', leased: 'Leased', running: 'Running', cancel_requested: 'Cancel requested', succeeded: 'Succeeded', failed: 'Failed', cancelled: 'Cancelled' };
+const JOB_TONE = { succeeded: 'info', failed: 'warn', cancelled: 'warn' };
+const DECISION = { pass: 'Pass', fail: 'Fail', insufficient_evidence: 'Insufficient evidence' };
+const DECISION_TONE = { pass: 'info', fail: 'warn', insufficient_evidence: 'plain' };
+const CASE_STATUS = { draft: 'Draft', submitted: 'With internal review', changes_requested: 'Changes requested', evidence_reviewed: 'Evidence reviewed' };
+const METRIC_LABELS = {
+  hostGpus: 'GPUs on host', trainExamples: 'Training examples', heldOutExamples: 'Held-out examples', steps: 'Steps', epochs: 'Epochs',
+  baseHeldOutLoss: 'Base held-out loss', tunedHeldOutLoss: 'Tuned held-out loss', trainSeconds: 'Training seconds', peakGpuMemoryMb: 'Peak GPU memory (MB)',
+  baseF1: 'Base token F1', tunedF1: 'Tuned token F1', baseExact: 'Base exact match', tunedExact: 'Tuned exact match', heldOutScored: 'Held-out answers scored',
+  ggufSizeBytes: 'GGUF size (bytes)', loadTestConversations: 'Load-test conversations', loadTestSeconds: 'Load-test seconds', tunedTokensPerSec: 'Tuned tokens/s', baseTokensPerSec: 'Base tokens/s',
+};
+const UNAVAILABLE_HELP = {
+  demo_unconfigured: 'The server has no DEMO_WORKSPACE_ID, so no workspace is pinned for this view. No sample data is shown in its place.',
+  demo_workspace_missing: 'The pinned workspace id does not match any workspace on this server.',
+  demo_workspace_not_synthetic: 'The pinned workspace is not marked as a synthetic demo, so this view refuses to show it.',
+  store_unavailable: 'This server has no database, so there are no records to show.',
+};
+
+const initials = (name) => String(name ?? '').trim().split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('') || '?';
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const formatTime = (iso) => (iso ? new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—');
+const formatNumber = (value) => (Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 4 }));
+const formatPercent = (fraction) => `${(fraction * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+const humanize = (value) => String(value ?? '').replaceAll(/[._]/g, ' ');
+const roleName = (role) => role[0].toUpperCase() + role.slice(1);
+
+function Sidebar({ admin }) {
   return (
     <aside className="dash-side">
       <a className="dash-brand" href="#overview">
         <span className="dash-mark" aria-hidden="true" />
         <span><strong>Valcairn</strong><small>by Frontier Intelligence Labs</small></span>
       </a>
-      <nav aria-label="Workspace" className="dash-nav">
-        {NAV.map((group) => (
-          <div key={group.label ?? 'main'} className="dash-nav-group">
-            {group.label && <span className="dash-nav-label">{group.label}</span>}
-            {group.items.map((item) => (
-              <a key={item.label} href={item.href} aria-current={item.current ? 'page' : undefined}>
-                <Icon name={item.icon} />{item.label}
-              </a>
-            ))}
-          </div>
-        ))}
+      <nav aria-label="Overview sections" className="dash-nav">
+        <div className="dash-nav-group">
+          {SECTIONS.map((s, i) => <a key={s.id} href={`#${s.id}`} aria-current={i === 0 ? 'page' : undefined}><Icon name={s.icon} />{s.label}</a>)}
+          {admin && <a href="#access-log"><Icon name="shield" />Sign-in log</a>}
+        </div>
       </nav>
     </aside>
   );
 }
 
-function Lifecycle({ step, total = LIFECYCLE.length }) {
-  return (
-    <div className="lifecycle">
-      <div className="lifecycle-track" aria-hidden="true">
-        {LIFECYCLE.map((stage, i) => (
-          <span key={stage} className={i < step - 1 || step > total ? 'is-done' : i === step - 1 ? 'is-current' : ''} />
-        ))}
-      </div>
-      <span className="subtle">{step > total ? `Deployed · ${total} of ${total}` : `${LIFECYCLE[step - 1]} · step ${step} of ${total}`}</span>
-    </div>
-  );
+function Empty({ children }) {
+  return <p className="card-foot subtle">{children}</p>;
 }
 
-function Projects({ query }) {
-  const q = query.trim().toLowerCase();
-  const rows = PROJECTS.filter((p) => !q || `${p.name} ${p.data}`.toLowerCase().includes(q));
+function Projects({ projects }) {
+  if (projects.available === false) return <section id="projects" className="card" aria-labelledby="projects-title"><div className="card-head"><h2 id="projects-title">Projects</h2></div><Empty>This server's store does not expose project records.</Empty></section>;
   return (
     <section id="projects" className="card card--table" aria-labelledby="projects-title">
       <div className="card-head">
         <h2 id="projects-title">Projects</h2>
-        <span className="subtle">{rows.length} of {PROJECTS.length}</span>
+        <span className="subtle">{plural(projects.length, 'project')} recorded</span>
       </div>
-      <div className="table-scroll">
-        <table>
-          <thead>
-            <tr><th scope="col">Project</th><th scope="col">Lifecycle</th><th scope="col">Now</th><th scope="col" className="num">Updated</th></tr>
-          </thead>
-          <tbody>
-            {rows.map((p) => (
-              <tr key={p.name}>
-                <td><div className="cell-stack"><strong>{p.name}</strong><span className="subtle">{p.data}</span></div></td>
-                <td><Lifecycle step={p.step} /></td>
-                <td className={`tone-${p.tone ?? 'plain'}`}>{p.now}</td>
-                <td className="num subtle">{p.updated}</td>
-              </tr>
-            ))}
-            {rows.length === 0 && <tr><td colSpan={4} className="subtle">No projects match “{query}”.</td></tr>}
-          </tbody>
-        </table>
-      </div>
-      <p className="card-foot subtle">Lifecycle: {LIFECYCLE.join(' → ')}</p>
-    </section>
-  );
-}
-
-function Attention() {
-  return (
-    <section id="attention" className="card" aria-labelledby="attention-title">
-      <div className="card-head">
-        <h2 id="attention-title">Needs you</h2>
-        <span className="count">{ATTENTION.length}</span>
-      </div>
-      <ul className="attention">
-        {ATTENTION.map((item) => (
-          <li key={item.text}>
-            <span className={`tone-${item.tone}`}><Icon name={item.icon} /></span>
-            <div className="cell-stack">
-              <span className={`eyebrow tone-${item.tone}`}>{item.kind}</span>
-              <span>{item.text}</span>
-            </div>
-            <a className="btn-small" href={item.href}>{item.action}</a>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function Stat({ label, value }) {
-  return <div className="cell-stack"><dt className="subtle">{label}</dt><dd>{value}</dd></div>;
-}
-
-function Supply() {
-  return (
-    <section id="collection" className="card card--pad" aria-labelledby="supply-title">
-      <div className="card-head"><h2 id="supply-title">Collection &amp; labeling</h2></div>
-      {CAMPAIGNS.map((c) => (
-        <div key={c.name} className="progress-row">
-          <div className="row-between"><span className="strong">{c.name}</span><span className="subtle">{c.pct}%</span></div>
-          <div className="bar" role="progressbar" aria-label={c.name} aria-valuenow={c.pct} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${c.pct}%` }} /></div>
-          <span className="subtle">{c.note}</span>
+      {projects.length === 0 ? <Empty>No projects have been created in this workspace yet.</Empty> : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr><th scope="col">Project</th><th scope="col">Status</th><th scope="col">Dataset versions</th><th scope="col">Staff reviews</th><th scope="col">Evaluation sets</th><th scope="col" className="num">Updated</th></tr>
+            </thead>
+            <tbody>
+              {projects.map((p) => {
+                const latest = p.versions.at(-1);
+                return (
+                  <tr key={p.id}>
+                    <td><div className="cell-stack"><strong>{p.name}</strong><span className="subtle">{p.modalities.join(', ') || 'No inputs chosen'}</span></div></td>
+                    <td>{PROJECT_STATUS[p.status] ?? humanize(p.status)}</td>
+                    <td>{latest ? `v${latest.number}${latest.files == null ? '' : ` · ${plural(latest.files, 'file')}`}${p.versions.length > 1 ? ` · ${p.versions.length} versions` : ''}` : <span className="subtle">None approved</span>}</td>
+                    <td>{p.reviews.approved + p.reviews.changes_requested + p.reviews.pending + p.reviews.withdrawn === 0 ? <span className="subtle">None</span> : `${p.reviews.approved} approved · ${p.reviews.changes_requested} changes requested${p.reviews.pending ? ` · ${p.reviews.pending} pending` : ''}`}</td>
+                    <td>{p.evaluationSets.length === 0 ? <span className="subtle">None</span> : p.evaluationSets.map((s) => `${s.name} (${s.status}${s.caseCount == null ? '' : `, ${plural(s.caseCount, 'case')}`})`).join('; ')}</td>
+                    <td className="num subtle">{formatTime(p.updatedAt)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
+      )}
+      <p className="card-foot subtle">Statuses and counts are the workspace's stored records. A dataset version freezes exactly the files and rights record a staff review approved.</p>
+    </section>
+  );
+}
+
+function Metrics({ metrics }) {
+  const entries = Object.entries(metrics?.values ?? {});
+  if (entries.length === 0) return null;
+  return (
+    <dl className="stats stats--auto" aria-label="Runner-reported metrics">
+      {entries.map(([key, value]) => (
+        <div key={key} className="cell-stack"><dt className="subtle">{METRIC_LABELS[key] ?? humanize(key)}</dt><dd>{formatNumber(value)}</dd></div>
       ))}
-      <dl className="stats stats--3">
-        <Stat label="Label queue" value="2,310" />
-        <Stat label="Agreement" value="94.1%" />
-        <Stat label="Rejected" value="3.2%" />
-      </dl>
-    </section>
+    </dl>
   );
 }
 
-function Models() {
+function Compute({ compute }) {
+  if (compute.available === false) return <section id="compute" className="card card--pad" aria-labelledby="compute-title"><div className="card-head"><h2 id="compute-title">Compute</h2></div><Empty>This server's store does not expose runners or jobs.</Empty></section>;
+  const { runners, jobs } = compute;
   return (
-    <section id="training" className="card card--pad" aria-labelledby="models-title">
-      <div className="card-head"><h2 id="models-title">Training &amp; evaluation</h2></div>
-      <ul className="runs">
-        {RUNS.map((r) => (
-          <li key={r.name}>
-            <div className="cell-stack"><span className="strong">{r.name}</span><span className="subtle">{r.note}</span></div>
-            <span className={`pill pill--${r.tone}`}>{r.status}</span>
-          </li>
-        ))}
-      </ul>
-      <div className="row-between card-rule"><span className="subtle">Deployments you control</span><span className="strong">1 edge · 1 on-prem</span></div>
-    </section>
-  );
-}
-
-function Market() {
-  return (
-    <section id="listings" className="card card--pad" aria-labelledby="market-title">
-      <div className="card-head"><h2 id="market-title">Licensing &amp; sales</h2></div>
-      <dl className="stats stats--2">
-        <Stat label="Live listings" value="4" />
-        <Stat label="Active licenses" value="11" />
-      </dl>
-      <div className="share">
-        <span className="eyebrow subtle">Contributor share, Q4</span>
-        <div className="bar bar--thick" role="progressbar" aria-label="Contributor share paid" aria-valuenow={63} aria-valuemin={0} aria-valuemax={100}><span style={{ width: '63%' }} /></div>
-        <div className="row-between">
-          <span><strong>$21,260</strong> <span className="subtle">paid</span></span>
-          <span><strong>$12,480</strong> <span className="subtle">accrued, unpaid</span></span>
-        </div>
-      </div>
-      <p className="body-2"><strong>Latest:</strong> Factory floor audio v2 licensed to [Buyer] for evaluation only, 12 months.</p>
-    </section>
-  );
-}
-
-function Financing() {
-  return (
-    <section id="financing" className="card card--fin" aria-labelledby="fin-title">
-      <div className="fin-copy">
-        <span className="eyebrow subtle">Financing</span>
-        <h2 id="fin-title">{FINANCING.title}</h2>
-        <p className="body-2">{FINANCING.summary}</p>
-      </div>
-      <div className="fin-status">
-        <ol className="fin-steps">
-          {FINANCING.steps.map((s, i) => (
-            <li key={s} className={i < FINANCING.current ? 'is-done' : i === FINANCING.current ? 'is-current' : ''} aria-current={i === FINANCING.current ? 'step' : undefined}>
-              <span aria-hidden="true" />{s}
+    <section id="compute" className="card card--pad" aria-labelledby="compute-title">
+      <div className="card-head"><h2 id="compute-title">Compute</h2><span className="subtle">{plural(runners.length, 'linked machine')}</span></div>
+      {runners.length === 0 ? <p className="subtle">No machine has been linked to this workspace.</p> : (
+        <ul className="runs">
+          {runners.map((r) => (
+            <li key={r.id}>
+              <div className="cell-stack"><span className="strong">{r.label}</span><span className="subtle">{r.lastSeenAt ? `Last heard from ${formatTime(r.lastSeenAt)}` : 'Never heard from'}{r.reportedGpus == null ? '' : ` · ${plural(r.reportedGpus, 'GPU')} reported`}</span></div>
+              <span className={`pill pill--${r.status === 'active' ? 'plain' : 'warn'}`}>{r.status === 'active' ? 'Linked' : 'Revoked'}</span>
             </li>
           ))}
-        </ol>
-        <div className="row-between row-wrap">
-          <span className="subtle">Reviewed by capital partners. Nothing is funded until an agreement is recorded.</span>
-          <a className="btn-solid-app" href="#financing">Open data room <Icon name="arrow" size={16} /></a>
+        </ul>
+      )}
+      <div className="row-between card-rule"><span className="strong">Jobs</span><span className="subtle">Latest {jobs.limit} · state as last recorded</span></div>
+      {jobs.items.length === 0 ? <p className="subtle">No jobs have been queued.</p> : (
+        <ul className="runs">
+          {jobs.items.map((j) => (
+            <li key={j.id} style={{ flexWrap: 'wrap' }}>
+              <div className="cell-stack" style={{ flex: '1 1 240px' }}>
+                <span className="strong">{JOB_KIND[j.kind] ?? humanize(j.kind)}</span>
+                <span className="subtle">Attempt {j.attempt} of {j.maxAttempts} · queued {formatTime(j.createdAt)}{j.finishedAt ? ` · ended ${formatTime(j.finishedAt)}` : ''}{j.failure ? ` · ${humanize(j.failure)}` : ''}</span>
+              </div>
+              <span className={`pill pill--${JOB_TONE[j.status] ?? 'plain'}`}>{JOB_STATUS[j.status] ?? humanize(j.status)}</span>
+              <div style={{ flexBasis: '100%' }}><Metrics metrics={j.metrics} /></div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="subtle">Metrics are the numbers the runner reported for that job. They describe a run on the customer's own machine, not a certified result.</p>
+    </section>
+  );
+}
+
+function Evaluation({ evaluation, projects }) {
+  if (evaluation.available === false) return <section id="evaluation" className="card card--pad" aria-labelledby="eval-title"><div className="card-head"><h2 id="eval-title">Evaluation</h2></div><Empty>This server's store does not expose evaluation reports.</Empty></section>;
+  const setNames = new Map((Array.isArray(projects) ? projects : []).flatMap((p) => p.evaluationSets.map((s) => [s.id, p.name])));
+  return (
+    <section id="evaluation" className="card card--pad" aria-labelledby="eval-title">
+      <div className="card-head"><h2 id="eval-title">Evaluation</h2><span className="subtle">{plural(evaluation.reports.length, 'approved report')}</span></div>
+      {evaluation.reports.length === 0 ? <p className="subtle">No evaluation report has been approved. Draft sets, if any, are listed under Projects.</p> : (
+        <ul className="runs">
+          {evaluation.reports.map((r) => (
+            <li key={r.id}>
+              <div className="cell-stack">
+                <span className="strong">{r.setName ?? 'Evaluation set'}{r.setVersion == null ? '' : ` v${r.setVersion}`}{setNames.has(r.setId) ? ` · ${setNames.get(r.setId)}` : ''}</span>
+                <span className="subtle">
+                  {r.counts.eligible == null ? '' : `${r.counts.passes ?? '?'} of ${r.counts.eligible} eligible cases passed`}
+                  {r.passRate == null ? '' : ` (${formatPercent(r.passRate)})`}
+                  {r.counts.reviewed == null ? '' : ` · ${plural(r.counts.reviewed, 'review decision')}`}
+                  {` · approved ${formatTime(r.approvedAt)}`}
+                </span>
+              </div>
+              <span className={`pill pill--${DECISION_TONE[r.decision] ?? 'plain'}`}>{DECISION[r.decision] ?? humanize(r.decision)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="subtle">A report is approved by an owner or admin from a frozen snapshot. The answers it scores were imported by the customer, so it does not prove which model produced them.</p>
+    </section>
+  );
+}
+
+function Capital({ capital }) {
+  const head = <div className="card-head"><h2 id="capital-title">Capital</h2>{capital.available && <span className="subtle">{plural(capital.cases.length, 'case')}</span>}</div>;
+  if (!capital.available) {
+    return <section id="capital" className="card card--pad" aria-labelledby="capital-title">{head}<p className="subtle">{capital.reason === 'organization_only' ? 'Capital applies to organization workspaces only.' : "This server's store does not expose capital cases."}</p></section>;
+  }
+  return (
+    <section id="capital" className="card card--pad" aria-labelledby="capital-title">
+      {head}
+      {capital.cases.length === 0 ? <p className="subtle">No financing case has been drafted.</p> : (
+        <ul className="runs">
+          {capital.cases.map((c) => (
+            <li key={c.id}>
+              <div className="cell-stack">
+                <span className="strong">Case · revision {c.revision}{c.submittedRevision ? ` · revision ${c.submittedRevision} sent` : ''}</span>
+                <span className="subtle">
+                  {c.requestedAmountCents == null ? 'No amount requested yet' : `Requested ${formatCents(c.requestedAmountCents)}`}
+                  {c.costItems == null ? '' : ` · ${plural(c.costItems, 'cost item')}`}
+                  {` · updated ${formatTime(c.updatedAt)}`}
+                </span>
+                {costTotalLines(c.totals).length > 0 && (
+                  <ul className="subtle" aria-label="Planned cost totals by basis and period" style={{ margin: 0, paddingLeft: 18 }}>
+                    {costTotalLines(c.totals).map((line) => <li key={`${line.basis}-${line.period}`}>{line.label}</li>)}
+                  </ul>
+                )}
+              </div>
+              <span className="pill pill--plain">{CASE_STATUS[c.status] ?? humanize(c.status)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="subtle">Planning totals as the customer entered them, kept apart by basis and period: one-time, monthly and annual amounts are not added together. Statuses end at Valcairn's internal review: no lender, offer, funding or provider result exists.</p>
+    </section>
+  );
+}
+
+function Activity({ activity }) {
+  if (activity.available === false) return <section id="activity" className="card" aria-labelledby="activity-title"><div className="card-head"><h2 id="activity-title">Recent activity</h2></div><Empty>This server's store does not expose the audit log.</Empty></section>;
+  return (
+    <section id="activity" className="card card--table" aria-labelledby="activity-title">
+      <div className="card-head"><h2 id="activity-title">Recent activity</h2><span className="subtle">Latest {activity.limit} recorded actions</span></div>
+      {activity.items.length === 0 ? <Empty>Nothing has been recorded in this workspace yet.</Empty> : (
+        <div className="table-scroll">
+          <table className="table-compact">
+            <thead><tr><th scope="col">When</th><th scope="col">Action</th><th scope="col">On</th></tr></thead>
+            <tbody>
+              {activity.items.map((a, i) => (
+                <tr key={`${a.at}-${a.action}-${i}`}>
+                  <td className="subtle">{formatTime(a.at)}</td>
+                  <td>{humanize(a.action)}</td>
+                  <td className="subtle">{humanize(a.targetType) || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      </div>
+      )}
     </section>
   );
 }
 
 const EVENT_LABELS = { signin: 'Signed in', signout: 'Signed out', failed: 'Failed attempt' };
-const formatTime = (iso) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
 // Admin-only: who has signed in. The server refuses this data to non-admin accounts.
 function AccessLog() {
@@ -256,10 +303,54 @@ function AccessLog() {
   );
 }
 
+/**
+ * Whether this browser also holds a normal workspace account that is a member of the pinned workspace. The reviewer
+ * login never is one. GET /api/account only ever describes the caller's own session, so nothing about other
+ * accounts is read here.
+ */
+function useOwnMembership(workspaceId) {
+  const [entry, setEntry] = useState(null);
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let live = true;
+    api.account()
+      .then((account) => live && setEntry(account.workspaces?.find((w) => w.id === workspaceId) ?? null))
+      .catch(() => live && setEntry(null));
+    return () => { live = false; };
+  }, [workspaceId]);
+  return entry;
+}
+
+function WorkingAppAccess({ workspaceId }) {
+  const entry = useOwnMembership(workspaceId);
+  if (entry) {
+    return <Link className="btn-solid-app" to={`/w/${entry.slug}`}>Open this workspace as {roleName(entry.role)} <Icon name="arrow" size={16} /></Link>;
+  }
+  return (
+    <p className="subtle" style={{ flex: '1 1 320px', maxWidth: 420 }}>
+      This view is read-only. The working app needs a separate workspace account that is a member of this workspace; the reviewer login does not open it. Someone with owner credentials can use <Link to="/signin">workspace sign-in</Link>.
+    </p>
+  );
+}
+
 export default function Dashboard({ reviewer }) {
   const navigate = useNavigate();
-  const [query, setQuery] = useState('');
   const [signOutFailed, setSignOutFailed] = useState(false);
+  const [state, dispatch] = useReducer(reduceOverview, initialOverviewState);
+  const busy = state.status === 'loading' || state.status === 'refreshing';
+
+  // One loader per mount: only the newest request's response is applied, and nothing after unmount (see
+  // createOverviewLoader). StrictMode's rehearsal mount gets its own loader, which is stopped before the real one starts.
+  const loader = useRef(null);
+  useEffect(() => {
+    const current = createOverviewLoader({ fetch: api.demoOverview, apply: dispatch });
+    loader.current = current;
+    current.load();
+    return () => { current.stop(); if (loader.current === current) loader.current = null; };
+  }, []);
+  const load = () => loader.current?.load();
+  // A 401 here means the reviewer account was disabled or the session ended: back to the sign-in page.
+  useEffect(() => { if (state.status === 'signed_out') navigate('/demo'); }, [state.status, navigate]);
 
   // Only leave the dashboard once the server has ended the session.
   async function signOut() {
@@ -268,22 +359,22 @@ export default function Dashboard({ reviewer }) {
     setSignOutFailed(true);
   }
 
+  const overview = state.overview;
   return (
     <div className="dash">
-      <title>Sample overview — Valcairn reviewer demo</title>
-      <Sidebar />
+      <title>Live overview — Valcairn reviewer demo</title>
+      <Sidebar admin={reviewer.role === 'admin'} />
       <div className="dash-body">
         <header className="dash-top">
           <div className="row-wrap gap-10">
-            <span className="org">Acme Robotics</span>
-            <span className="chip">Sample data</span>
+            <span className="org">{overview ? overview.workspace.name : 'Reviewer demo'}</span>
+            <span className="chip">{overview ? 'Synthetic workspace · actual records' : 'Reviewer view'}</span>
           </div>
           <div className="dash-tools">
-            <label className="search">
-              <Icon name="search" size={16} />
-              <span className="visually-hidden">Search projects</span>
-              <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search projects…" />
-            </label>
+            <span className="subtle" role="status" style={{ flex: '1 1 auto' }}>
+              {busy ? (state.overview ? 'Refreshing…' : 'Loading the live overview…') : state.fetchedAt ? `Fetched ${formatTime(state.fetchedAt)}` : ''}
+            </span>
+            <button type="button" className="btn-small" onClick={load} disabled={busy} aria-busy={busy || undefined}>Refresh</button>
             <ThemeToggle />
             <span className="avatar" title={reviewer.username} aria-hidden="true">{initials(reviewer.name)}</span>
             <span className="visually-hidden">Signed in as {reviewer.name}</span>
@@ -293,38 +384,44 @@ export default function Dashboard({ reviewer }) {
         </header>
 
         <main id="overview" className="dash-main">
-          {/* This page is a static illustration for invited reviewers. The product itself runs in the working app, behind
-              workspace accounts that are separate from reviewer logins; the link below only navigates there. */}
           <section className="dash-heading row-between row-wrap">
             <div className="cell-stack" style={{ flex: '1 1 460px' }}>
-              <h1>Sample overview</h1>
-              <p className="subtle">The overview cards show sample data for invited reviewers. Real projects, data, models, memory, agents and capital run in the working app, which needs a workspace account: sign in with yours, or accept a workspace invitation. The reviewer demo login does not open it.</p>
+              <h1>Live overview</h1>
+              <p className="subtle">What the server has recorded for one synthetic demo workspace. Its inputs are generated samples; the projects, reviews, dataset versions, jobs, evaluation reports and capital cases below are the stored records themselves, not illustrations, and a seeded fixture shows up as exactly what the seed recorded. Refresh to see new actions. Hosted GPU scheduling, charges, cloud deployment and financing are planned and have no records to show.</p>
             </div>
-            <Link className="btn-solid-app" to="/start">Open working app <Icon name="arrow" size={16} /></Link>
+            {overview && <WorkingAppAccess workspaceId={overview.workspace.id} />}
           </section>
 
-          <section aria-label="Key figures" className="kpis">
-            {KPIS.map((k) => (
-              <div key={k.label} className="kpi">
-                <span className="subtle">{k.label}</span>
-                <span className="kpi-value">{k.value}</span>
-                <span className={k.tone ? `tone-${k.tone}` : 'subtle'}>{k.note}</span>
+          {state.status === 'stale' && (
+            <p className="ob-alert" role="alert">The latest refresh failed ({state.problem.message}). Showing the records fetched {formatTime(state.fetchedAt)}; they may be out of date.</p>
+          )}
+          {state.status === 'loading' && <p className="subtle" role="status">Loading the live overview…</p>}
+          {state.status === 'error' && (
+            <section className="card card--pad" aria-labelledby="error-title">
+              <h2 id="error-title">The overview could not be loaded</h2>
+              <p className="tone-warn" role="alert">{state.problem.message}</p>
+              <div><button type="button" className="btn-small" onClick={load}>Try again</button></div>
+            </section>
+          )}
+          {state.status === 'unavailable' && (
+            <section className="card card--pad" aria-labelledby="unavailable-title">
+              <h2 id="unavailable-title">No live records are available</h2>
+              <p className="body-2" role="status">{UNAVAILABLE_HELP[state.problem.code] ?? state.problem.message}</p>
+              <p className="subtle">This page never shows sample figures in place of records. Ask the Valcairn team to pin the synthetic demo workspace, then refresh.</p>
+            </section>
+          )}
+
+          {overview && (
+            <>
+              <Projects projects={overview.projects} />
+              <div className="dash-grid">
+                <Compute compute={overview.compute} />
+                <Evaluation evaluation={overview.evaluation} projects={overview.projects} />
+                <Capital capital={overview.capital} />
               </div>
-            ))}
-          </section>
-
-          <div className="dash-split">
-            <Projects query={query} />
-            <Attention />
-          </div>
-
-          <div className="dash-grid">
-            <Supply />
-            <Models />
-            <Market />
-          </div>
-
-          <Financing />
+              <Activity activity={overview.activity} />
+            </>
+          )}
 
           {reviewer.role === 'admin' && <AccessLog />}
         </main>
