@@ -85,7 +85,7 @@ export function ModelCatalog() {
       <div className="ob-intro" style={{ gap: 8 }}>
         <span className="ob-eyebrow">Models · {entry.name}</span>
         <h1 className="ob-h1">Model catalog</h1>
-        <p className="ob-lede">Open-weight models you can request for this workspace and plan to enhance on your approved datasets. A pull is a recorded request and a run is an approved plan: copying weights and training are planned, and any weights you receive stay under each model's own license.</p>
+        <p className="ob-lede">Open-weight models you can request for this workspace and plan to enhance on your approved datasets. A pull is a recorded request and a run is an approved plan. Copying weights into workspace storage, hosted GPU scheduling and charges are planned; a plan's fine-tuning and export run only as jobs on a runner linked to the workspace. Any weights you receive stay under each model's own license.</p>
         <div className="ob-chips" style={{ gap: 6 }}>
           <span className="ob-badge">{plural(catalog.length, 'model')}</span>
           {pulls.length > 0 && <span className="ob-badge tile--blue">{plural(pulls.length, 'pull request')}</span>}
@@ -302,7 +302,7 @@ export function MyModels() {
         <div className="ob-intro" style={{ gap: 8 }}>
           <span className="ob-eyebrow">Models · {entry.name}</span>
           <h1 className="ob-h1">My models</h1>
-          <p className="ob-lede">Every model in this workspace: the bases you requested and the enhancement plans drafted or approved on them. No weights have been copied and nothing has been trained yet; both are planned.</p>
+          <p className="ob-lede">Every model in this workspace: the bases you requested and the enhancement plans drafted or approved on them. No weights are copied into workspace storage (that is planned), and a plan is trained only when a runner linked to the workspace takes its job.</p>
         </div>
         <div>
           <Link className="btn-ghost" to={`/w/${entry.slug}/models`}>Model catalog</Link>
@@ -367,7 +367,7 @@ export function EnhanceRuns() {
         <div className="ob-intro" style={{ gap: 8 }}>
           <span className="ob-eyebrow">Models · {entry.name}</span>
           <h1 className="ob-h1">Enhance runs</h1>
-          <p className="ob-lede">Plan post-training of a requested model on your approved data: fine-tune, preference tuning and reinforcement learning, in order. Approving a plan records it; running it on GPUs is planned.</p>
+          <p className="ob-lede">Plan post-training of a requested model on your approved data: fine-tune, preference tuning and reinforcement learning, in order. Approving a plan records it; a runner linked to the workspace runs the fine-tuning step as a job, while the other steps and hosted GPUs are planned.</p>
         </div>
         {writer && pulls.length > 0 && <Link className="btn-app" to={`/w/${entry.slug}/models/runs/new`}>New enhance run</Link>}
       </div>
@@ -499,7 +499,7 @@ function RunPlan({ account, entry, role, options, run }) {
         <div className="ob-intro" style={{ gap: 8 }}>
           <Link className="ob-eyebrow" to={`/w/${entry.slug}/models/runs`}>Models · Enhance runs</Link>
           <h1 className="ob-h1">{run ? run.name : 'New enhance run'}</h1>
-          <p className="ob-lede">Plan post-training of {model?.name ?? 'a requested model'} on your approved data, one step after another. Approval records the plan and its cap; training is planned.</p>
+          <p className="ob-lede">Plan post-training of {model?.name ?? 'a requested model'} on your approved data, one step after another. Approval records the plan and its cap (recorded, not enforced); the fine-tuning step runs only when a runner linked to the workspace takes the job.</p>
           <div className="ob-chips" style={{ gap: 6 }}><span className="ob-badge">{run ? `Draft · saved ${date(run.updatedAt)}` : 'Not saved yet'}</span>{!writer && <span className="ob-badge">Read only</span>}</div>
         </div>
         <Link className="btn-ghost" to={`/w/${entry.slug}/models/runs`}>Back to runs</Link>
@@ -621,7 +621,7 @@ function RequestedRun({ account, entry, role, options, run }) {
           <div className="ob-chips" style={{ gap: 6 }}><span className="ob-badge tile--orange">Requested · waiting for Valcairn</span><span className="ob-badge">Plan frozen</span></div>
         </div>
       </div>
-      <p className="ob-alert ob-alert--info" role="note">This is an approved plan, not a running job. Nothing has been trained: GPU quotes, booking, training, checkpoints and charges are planned.</p>
+      <p className="ob-alert ob-alert--info" role="note">This is an approved plan, not a running job. A runner linked to the workspace can take its fine-tuning and export jobs; hosted GPU quotes, booking, metering and charges are planned, and only the fine-tuning step runs today.</p>
 
       <section className="ob-card mdl-progress">
         {run.steps.map((s, i) => {

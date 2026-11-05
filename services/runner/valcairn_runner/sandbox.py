@@ -27,6 +27,7 @@ class Step:
     image: str
     command: list[str]
     gpus: bool = False
+    entrypoint: str | None = None  # "" clears the image's own entrypoint
     network: str = "none"  # only the fetch step uses "bridge"
     inputs: dict[str, str] = field(default_factory=dict)  # host path -> container path, mounted read-only
     output: str | None = None  # host directory mounted at /out
@@ -41,6 +42,8 @@ def docker_args(step: Step, name: str) -> list[str]:
             "--tmpfs", f"/tmp:rw,noexec,nosuid,size={step.limits.tmpfs_mb}m", "--shm-size", step.limits.shm, "--user", "65534:65534"]
     if step.limits.exec_cache_mb:
         args += ["--tmpfs", f"/cache:rw,exec,nosuid,size={step.limits.exec_cache_mb}m,mode=1777"]
+    if step.entrypoint is not None:
+        args += ["--entrypoint", step.entrypoint]
     if step.gpus:
         args += ["--gpus", "all"]
     for host, inside in step.inputs.items():

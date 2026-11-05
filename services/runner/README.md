@@ -7,7 +7,8 @@ The Valcairn Runner runs Valcairn jobs on your own machine: a workstation, a GPU
 | `probe`: start a sandbox with no network, read the GPUs from inside it, check Ollama | Implemented and run against a real RTX 5090 with Docker Desktop and Ollama 0.40.13. |
 | `train`: LoRA fine-tuning of an approved plan's base model on its frozen dataset versions, with held-out loss of the base and the tuned model | Implemented (runner 0.2). Author-reported run on a real RTX 5090, before the lineage and split repairs of runner 0.4: on a synthetic 252-example support set with Qwen3-0.6B, held-out loss fell from 4.4707 on the base model to 0.0785 after 58 steps (38 s). Not independently reproduced. |
 | Held-out answers (part of `train`): base and tuned each answer the held-out examples; token F1 and exact match against the reference | Implemented. Same author-reported run: token F1 21.7% → 99.1%, exact match 0% → 83% on 24 held-out examples. These show adaptation to a narrow, templated synthetic task; token F1 is not the customer's acceptance rule. |
-| `evaluate`, `export` | **Planned**, as separate increments. A job of these kinds ends as `unsupported` until its handler lands. |
+| `export`: merge the adapter, convert base and tuned to GGUF (Q8_0), load both into Ollama on this machine, load-test them on held-out conversations, write a manifest, checksums and a model card | Implemented (runner 0.3; lineage checks, provisional names and local-only Ollama in 0.4). Same author-reported run: a 639 MB GGUF, loaded natively into Ollama 0.40.13, 468 tok/s tuned against 453 tok/s base. |
+| `evaluate` (re-evaluating a finished run later) | **Planned**. Ends as `unsupported`. |
 
 ## Requirements
 
@@ -15,7 +16,7 @@ The Valcairn Runner runs Valcairn jobs on your own machine: a workstation, a GPU
 - Docker (Docker Desktop on Windows and macOS). For GPU jobs, add the NVIDIA driver and GPU support in Docker: Docker Desktop on WSL 2, or the NVIDIA Container Toolkit on Linux.
 - Optional: Ollama on this machine (`http://127.0.0.1:11434` by default).
 
-## Build the training image (once per runner release, for `train`)
+## Build the training image (once per runner release, for `train` and `export`)
 
 ```bash
 docker build -t valcairn-train:0.4.0 images/train
@@ -24,6 +25,18 @@ docker build -t valcairn-train:0.4.0 images/train
 The image pins PyTorch 2.15 (CUDA 13.4), transformers 5.22.1, peft 0.21.2, trl 1.17.1, accelerate 1.15.0, datasets 5.1.0 and huggingface_hub 2.4.0. It needs an NVIDIA driver that supports CUDA 13.4.
 
 The tag follows the runner release because the image ships the runner's shared example rules (`images/train/examples.py`); an older image would apply older rules to the same job. The runner uses `valcairn-train:0.4.0` unless `VALCAIRN_TRAIN_IMAGE` says otherwise and never falls back to another tag: when the image is missing, Docker cannot start the step (`Unable to find image … locally`, exit code 125), the job fails, and the runner's own log shows why. An earlier `valcairn-train:0.1` is left alone; remove it by hand with `docker image rm` once you no longer need it. A tag is a mutable local name, not an immutable identity. To pin the exact build, set `VALCAIRN_TRAIN_IMAGE` to its image ID (the `sha256:…` value from `docker image inspect -f '{{.Id}}' valcairn-train:0.4.0`, which `docker run` accepts); the training manifest records the configured image reference as it is, so it then names that exact build. The converter image is already pinned by digest (`VALCAIRN_CONVERT_IMAGE`).
+
+## Export to Ollama
+
+An export job names a finished training run on the same runner. Valcairn freezes the adapter's SHA-256 and the training manifest's SHA-256 into the job. Before anything else the runner checks that the training manifest is that one and of a shape it can read, and that the adapter (weights, config, tokenizer), the split, the dataset files and the cached base model (source, revision and every file) all still match it. Any difference stops the export with `model_unavailable`, and a folder it would hash or mount that is a link rather than a real folder in the runner home stops it before anything runs. It then:
+
+1. Merges the adapter into the base model in the training image, with no network. The base model's tokenizer files are copied unchanged.
+2. converts the tuned model and the base model to GGUF q8_0. The base GGUF is made once per runner for the same base files, converter and quantization, and its SHA-256 is checked on every reuse; an altered one stops the export. This uses llama.cpp's published image, pinned by digest (`VALCAIRN_CONVERT_IMAGE`), with no network.
+3. loads both into the Ollama on this machine with `ollama create`: the tuned model under a provisional name, `valcairn-p-<job>-a<attempt>`, and the base model as `valcairn-base-<GGUF hash>`. `OLLAMA_HOST_URL` must be plain `http` on this machine (127.0.0.1, localhost or ::1); the CLI is given that address explicitly, so an inherited `OLLAMA_HOST` cannot send the weights elsewhere. If every training example used the same system prompt, it becomes the tuned model's default.
+4. load-tests both on up to three held-out conversations (greedy decoding), using Ollama's own token counters for speed. A reply of another shape, or a counter that is not a small non-negative integer, fails the export rather than being guessed at. Only then is the tuned model copied to its final name, `valcairn-<job>-a<attempt>`, and the provisional one removed. Nothing is created over an existing name, provisional or final, so a retry never replaces an earlier result or a model made by hand. Ollama has no create-only-if-absent, so this is a check followed by a create; a model made by hand under exactly this job's provisional name in that moment would be replaced, which takes a deliberate collision with the job's UUID and attempt.
+5. Writes `manifest.json` (base, adapter and GGUF hashes, quantization, Ollama names), `MODEL_CARD.md` and the base model's `LICENSE` next to the GGUF.
+
+Earlier exports stay in Ollama under their own names, so rolling back means using the previous name; `ollama rm <name>` removes one. Cancellation and lost authority are checked before each conversion, model creation and load test, and again while Ollama is answering a load-test request: the runner waits in short slices for every packet of the reply (status line, headers and body alike, since a reply arrives in whatever packets TCP delivers), and on a cancel it shuts the connection down (the daemon sees its client go) and drops an answer that arrives afterwards. The whole request is bounded by a deadline and the reply by a size limit. Ollama stops a generation whose client has gone; that is Ollama's behaviour and was not verified here (the tests use a synthetic loopback server, never a model). A running `ollama create` client is killed and waited for up to 10 seconds; whether the daemon then drops the create is not verified either, so the provisional name counts as this attempt's and is removed. The cancel flag is looked at again after the final name's existence check and right before the copy, so a cancel known by then means the final name is never created; a cancel seen after the copy was dispatched still ends the attempt before any artifact is written, and the copied model is removed best effort (the copy itself cannot be undone atomically). A failed or cancelled export removes its provisional model, a final model it had copied, and its working files, and nothing else.
 
 ## Link and run
 
