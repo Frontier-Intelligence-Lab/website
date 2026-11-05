@@ -21,14 +21,16 @@ def _turn(m) -> bool:
 
 
 def normalise(row):
-    """A chat whose last assistant answer follows a non-empty user turn, or a prompt/completion pair with a non-empty
-    prompt. Anything else (other JSON values, other shapes, an answer with no question before it) is None."""
+    """A chat that ends with the assistant answer that is scored, after a non-empty user turn, or a prompt/completion
+    pair with a non-empty prompt. Anything else (other JSON values, other shapes, an answer with no question before
+    it, a chat whose last turn is not the assistant's) is None: a trailing unanswered turn would be trained on but
+    never scored, and would give one scored answer several split identities."""
     if not isinstance(row, dict):
         return None
     messages = row.get("messages")
     if isinstance(messages, list) and messages and all(_turn(m) for m in messages):
-        last = max((i for i, m in enumerate(messages) if m["role"] == "assistant"), default=-1)
-        if last > 0 and any(m["role"] == "user" and m["content"].strip() for m in messages[:last]):
+        last = len(messages) - 1
+        if last > 0 and messages[last]["role"] == "assistant" and any(m["role"] == "user" and m["content"].strip() for m in messages[:last]):
             return {"messages": messages}
         return None
     prompt, completion = row.get("prompt"), row.get("completion")

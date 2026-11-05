@@ -14,6 +14,11 @@ RUN pip install --no-cache-dir --break-system-packages \
       huggingface_hub==2.4.0 \
       safetensors==0.8.0
 
+# The base image ships spin, a developer tool for building scientific Python libraries. Nothing here uses it and
+# its click bound contradicts huggingface_hub's, so drop it; then an inconsistent dependency graph fails the build.
+RUN pip uninstall -y --break-system-packages spin \
+ && pip check
+
 # /cache is a scratch tmpfs the runner mounts with exec allowed: Triton compiles GPU kernels there and loads them.
 ENV HOME=/cache \
     TRITON_CACHE_DIR=/cache/triton \

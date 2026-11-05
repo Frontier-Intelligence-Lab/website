@@ -3,10 +3,14 @@ import { StoreError } from './errors.js';
 import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf, labelSetConflict } from '../lib/dataset.js';
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
+import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
+import { evalMemoryMethods } from './eval-memory.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
 const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
+const HELD = ['leased', 'running', 'cancel_requested'];
+const FINISHED = ['succeeded', 'failed', 'cancelled'];
 
 /**
  * In-process store for development and tests. Same contract as the Postgres store
@@ -39,6 +43,28 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   const creditRecords = [];
   const capitalEvidence = [];
   const capitalReviewMarks = [];
+  const runners = [];
+  const jobs = [];
+  const jobEvents = [];
+  const publicRunner = ({ keyHash, ...r }) => copy(r);
+  const publicJob = ({ leaseHash, ...j }) => copy(j);
+  const publicEvent = ({ workspaceId, ...e }) => copy(e);
+  const endJob = (j, fields) => Object.assign(j, { leaseHash: null, leaseExpiresAt: null, finishedAt: stamp(), updatedAt: stamp() }, fields);
+  // A lease that ran out without word from the runner: retried while attempts remain, honoured if cancel was asked.
+  const expireLease = (j) => {
+    if (!HELD.includes(j.status) || new Date(j.leaseExpiresAt) > now()) return;
+    if (j.status === 'cancel_requested') endJob(j, { status: 'cancelled' });
+    else if (j.attempt < j.maxAttempts) Object.assign(j, { status: 'queued', leaseHash: null, leaseExpiresAt: null, updatedAt: stamp() });
+    else endJob(j, { status: 'failed', failure: 'lease_expired' });
+  };
+  const heldJob = ({ runnerId, jobId, leaseHash }) => {
+    const j = jobs.find((x) => x.id === jobId && x.runnerId === runnerId);
+    if (!j) throw new StoreError('not_found');
+    expireLease(j);
+    if (!HELD.includes(j.status) || j.leaseHash !== leaseHash) throw new StoreError('lease_lost');
+    return j;
+  };
+  const extend = (j, leaseMs) => Object.assign(j, { status: j.status === 'leased' ? 'running' : j.status, leaseExpiresAt: new Date(now().getTime() + leaseMs).toISOString(), updatedAt: stamp() });
   const pickRun = ({ name, baseModelId, datasets, steps, compute, spendCapUsd }) => ({ name, baseModelId, datasets: structuredClone(datasets), steps: [...steps], compute, spendCapUsd });
   const pickCredit = ({ provider, status, amountCents, expiresOn, restrictions, reference }) => ({ provider, status, amountCents, expiresOn, restrictions, reference });
   const pickEvidence = ({ kind, title, source, reference, verification }) => ({ kind, title, source, reference: structuredClone(reference), verification });
@@ -79,7 +105,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     return project;
   };
 
-  return {
+  const store = {
     kind: 'memory',
 
     async createUser({ email, name, passwordHash }) {
@@ -553,6 +579,140 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       return executionRuns.filter((r) => r.deviceId === deviceId).slice(-limit).reverse().map(copy);
     },
 
+    // Runners and jobs (migrations/014_jobs.sql): a durable queue leased to one runner at a time.
+    async createRunner({ workspaceId, createdBy, label, keyHash, keyPrefix }) {
+      if (!workspaces.has(workspaceId)) throw new StoreError('not_found');
+      const runner = { id: randomUUID(), workspaceId, createdBy, label, keyHash, keyPrefix, status: 'active', capabilities: {}, lastSeenAt: null, revokedAt: null, createdAt: stamp() };
+      runners.push(runner);
+      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'runner.linked', targetType: 'runner', targetId: runner.id, metadata: {}, createdAt: stamp() });
+      return publicRunner(runner);
+    },
+    async listRunners(workspaceId) {
+      return runners.filter((r) => r.workspaceId === workspaceId).map(publicRunner);
+    },
+    async getRunner({ workspaceId, runnerId }) {
+      const r = runners.find((x) => x.id === runnerId && x.workspaceId === workspaceId);
+      return r ? publicRunner(r) : null;
+    },
+    async findActiveRunnerByKeyHash(keyHash) {
+      const r = runners.find((x) => x.keyHash === keyHash && x.status === 'active');
+      return r ? publicRunner(r) : null;
+    },
+    async revokeRunner({ workspaceId, runnerId, actorId }) {
+      const r = runners.find((x) => x.id === runnerId && x.workspaceId === workspaceId);
+      if (!r) throw new StoreError('not_found');
+      if (r.status !== 'active') throw new StoreError('invalid_state');
+      Object.assign(r, { status: 'revoked', revokedAt: stamp() });
+      // Nothing more may run on it: waiting jobs are cancelled and held ones fail.
+      for (const j of jobs.filter((x) => x.runnerId === runnerId && !FINISHED.includes(x.status))) {
+        endJob(j, j.status === 'queued' ? { status: 'cancelled', cancelledBy: actorId } : { status: 'failed', failure: 'runner_revoked' });
+      }
+      audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'runner.revoked', targetType: 'runner', targetId: runnerId, metadata: {}, createdAt: stamp() });
+      return publicRunner(r);
+    },
+    async reportRunner({ runnerId, capabilities }) {
+      const r = runners.find((x) => x.id === runnerId && x.status === 'active');
+      if (!r) throw new StoreError('invalid_state');
+      Object.assign(r, { capabilities: copy(capabilities), lastSeenAt: stamp() });
+      return publicRunner(r);
+    },
+    async createJob({ workspaceId, runnerId, kind, enhanceRunId = null, spec, idempotencyKey, createdBy }) {
+      const existing = jobs.find((j) => j.workspaceId === workspaceId && j.idempotencyKey === idempotencyKey);
+      if (existing) {
+        // The same key must mean the same request: kind, runner, plan and every frozen input, including the
+        // training run and artifact an evaluation or export names.
+        if (existing.kind !== kind || existing.runnerId !== runnerId || existing.enhanceRunId !== enhanceRunId || stableJson(existing.spec) !== stableJson(spec)) throw new StoreError('invalid_state');
+        return publicJob(existing);
+      }
+      const runner = runners.find((x) => x.id === runnerId && x.workspaceId === workspaceId);
+      if (!runner) throw new StoreError('not_found');
+      if (runner.status !== 'active') throw new StoreError('invalid_state');
+      if (enhanceRunId != null && !enhanceRuns.some((r) => r.id === enhanceRunId && r.workspaceId === workspaceId)) throw new StoreError('not_found');
+      const at = stamp();
+      const job = { id: randomUUID(), workspaceId, runnerId, kind, enhanceRunId, spec: copy(spec), status: 'queued', attempt: 0, maxAttempts: MAX_ATTEMPTS, leaseHash: null, leaseExpiresAt: null, result: null, failure: null, idempotencyKey, createdBy, cancelledBy: null, createdAt: at, startedAt: null, finishedAt: null, updatedAt: at };
+      jobs.push(job);
+      audit.push({ id: audit.length + 1, workspaceId, actorId: createdBy, action: 'job.created', targetType: 'job', targetId: job.id, metadata: { kind, runnerId }, createdAt: at });
+      return publicJob(job);
+    },
+    async listJobs({ workspaceId, limit = 50 }) {
+      const mine = jobs.filter((j) => j.workspaceId === workspaceId);
+      mine.forEach(expireLease);
+      return mine.slice(-limit).reverse().map(publicJob);
+    },
+    async getJob({ workspaceId, jobId }) {
+      const j = jobs.find((x) => x.id === jobId && x.workspaceId === workspaceId);
+      if (!j) return null;
+      expireLease(j);
+      return publicJob(j);
+    },
+    async listJobEvents({ workspaceId, jobId, afterId = 0, limit = 500 }) {
+      if (!jobs.some((x) => x.id === jobId && x.workspaceId === workspaceId)) return [];
+      return jobEvents.filter((e) => e.jobId === jobId && e.id > afterId).slice(0, limit).map(publicEvent);
+    },
+    async cancelJob({ workspaceId, jobId, actorId }) {
+      const j = jobs.find((x) => x.id === jobId && x.workspaceId === workspaceId);
+      if (!j) throw new StoreError('not_found');
+      expireLease(j);
+      if (FINISHED.includes(j.status)) throw new StoreError('invalid_state');
+      if (j.status === 'queued') endJob(j, { status: 'cancelled', cancelledBy: actorId });
+      else if (j.status !== 'cancel_requested') Object.assign(j, { status: 'cancel_requested', cancelledBy: actorId, updatedAt: stamp() });
+      audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'job.cancel_requested', targetType: 'job', targetId: jobId, metadata: {}, createdAt: stamp() });
+      return publicJob(j);
+    },
+    async leaseJob({ runnerId, leaseHash, leaseMs = LEASE_MS }) {
+      const mine = jobs.filter((j) => j.runnerId === runnerId);
+      mine.forEach(expireLease);
+      // One job at a time per runner: it holds the GPU.
+      if (mine.some((j) => HELD.includes(j.status))) return null;
+      const next = mine.find((j) => j.status === 'queued');
+      if (!next) return null;
+      const at = now();
+      Object.assign(next, { status: 'leased', attempt: next.attempt + 1, leaseHash, leaseExpiresAt: new Date(at.getTime() + leaseMs).toISOString(), startedAt: next.startedAt ?? at.toISOString(), updatedAt: at.toISOString() });
+      return publicJob(next);
+    },
+    async getRunnerJob({ runnerId, jobId }) {
+      const j = jobs.find((x) => x.id === jobId && x.runnerId === runnerId);
+      if (!j) return null;
+      expireLease(j);
+      return publicJob(j);
+    },
+    async touchJob({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS }) {
+      const j = heldJob({ runnerId, jobId, leaseHash });
+      extend(j, leaseMs);
+      return publicJob(j);
+    },
+    async releaseJobInputs({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS, versions = 0, files = 0 }) {
+      // Checked and recorded without an await in between, so a cancel, a revoke or an expiry is either wholly before
+      // this release (refused here) or wholly after it (the payload the caller prepared is delivered and only expires).
+      const j = heldJob({ runnerId, jobId, leaseHash });
+      if (j.status === 'cancel_requested') throw new StoreError('invalid_state');
+      const runner = runners.find((x) => x.id === runnerId);
+      if (runner.status !== 'active') throw new StoreError('lease_lost');
+      extend(j, leaseMs);
+      audit.push({ id: audit.length + 1, workspaceId: j.workspaceId, actorId: runner.createdBy, action: 'job.inputs_released', targetType: 'job', targetId: jobId, metadata: { runnerId, versions, files }, createdAt: stamp() });
+      return publicJob(j);
+    },
+    async appendJobEvents({ runnerId, jobId, leaseHash, events, leaseMs = LEASE_MS }) {
+      const j = heldJob({ runnerId, jobId, leaseHash });
+      let added = 0;
+      for (const e of events) {
+        if (jobEvents.some((x) => x.jobId === jobId && x.attempt === j.attempt && x.seq === e.seq)) continue;
+        jobEvents.push({ id: jobEvents.length + 1, jobId, workspaceId: j.workspaceId, attempt: j.attempt, seq: e.seq, kind: e.kind, data: copy(e.data), createdAt: stamp() });
+        added += 1;
+      }
+      extend(j, leaseMs);
+      return { added, job: publicJob(j) };
+    },
+    async finishJob({ runnerId, jobId, leaseHash, outcome, result = null, failure = null, retryable = false }) {
+      const j = heldJob({ runnerId, jobId, leaseHash });
+      // Cancellation contract (docs/RUNNERS.md): once cancel is requested, the job ends cancelled, whatever the runner reports.
+      if (j.status === 'cancel_requested' || (outcome === 'failed' && failure === 'cancelled')) endJob(j, { status: 'cancelled' });
+      else if (outcome === 'succeeded') endJob(j, { status: 'succeeded', result: copy(result) });
+      else if (retryable && j.attempt < j.maxAttempts) Object.assign(j, { status: 'queued', leaseHash: null, leaseExpiresAt: null, updatedAt: stamp() });
+      else endJob(j, { status: 'failed', failure });
+      return publicJob(j);
+    },
+
     // Capital: cases with an editable, revisioned draft; frozen submitted revisions; append-only credit records; evidence references.
     async listCapitalCases(workspaceId) {
       return capitalCases.filter((c) => c.workspaceId === workspaceId).map(copy);
@@ -741,4 +901,5 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
 
     async close() {},
   };
+  return Object.assign(store, evalMemoryMethods({ stamp, copy, versions, projects, audit }));
 }
