@@ -1,5 +1,6 @@
 import { createBrowserRouter, redirect, useLoaderData } from 'react-router';
 import { api } from './api.js';
+import { forgetIfSignedOut } from './app/memory.js';
 import SiteLayout, { Loading, RouteError } from './site/SiteLayout.jsx';
 import Home from './site/Home.jsx';
 import Contact from './site/Contact.jsx';
@@ -9,7 +10,12 @@ import NotFound from './site/NotFound.jsx';
 // The dashboard chunk is built under /private/ and only loads after the session check passes.
 async function reviewLoader() {
   const { reviewer } = await api.session();
-  if (!reviewer) throw redirect('/demo');
+  if (!reviewer) {
+    // The reviewer session ended before the Dashboard could mount (disabled account, expiry): this tab's local-memory
+    // keys go with it, unless an ordinary account still holds them or that cannot be confirmed.
+    await forgetIfSignedOut({ reviewer, fetchAccount: api.account });
+    throw redirect('/demo');
+  }
   const { default: Dashboard } = await import('./private/Dashboard.jsx');
   return { reviewer, Dashboard };
 }
@@ -33,6 +39,8 @@ export const router = createBrowserRouter([
         loader: async () => {
           const [config, { reviewer }] = await Promise.all([api.config(), api.session()]);
           if (reviewer) throw redirect('/demo/review');
+          // Same confirmed-loss rule as the overview loader: a stale reviewer connection is not left behind here.
+          await forgetIfSignedOut({ reviewer, fetchAccount: api.account });
           return config;
         },
         Component: DemoLogin,

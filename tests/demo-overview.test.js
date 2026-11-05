@@ -8,7 +8,7 @@ import { emptyDraft } from '../src/lib/capital.js';
 import { loadConfig } from '../src/config.js';
 import { METRIC_PATHS, buildDemoOverview } from '../src/lib/demo-overview.js';
 import { totalsByBasis } from '../src/lib/capital.js';
-import { costTotalLines, createOverviewLoader, initialOverviewState, reduceOverview } from '../web/src/private/overview-state.js';
+import { costTotalLines, createOverviewLoader, initialOverviewState, reduceOverview, signOutReviewer } from '../web/src/private/overview-state.js';
 import { makeApp, json, postHeaders, sessionCookie } from './helpers.js';
 
 // Everything below is a labelled synthetic fixture. The texts in capitals are canaries: they must never reach a reviewer.
@@ -92,10 +92,16 @@ test('the overview needs a reviewer session and answers with private headers', a
   assert.equal(anonymous.headers['x-robots-tag'], 'noindex');
   assert.ok(!anonymous.body.includes(ws.id), 'nothing about the workspace is told to a signed-out caller');
 
-  const res = await overview(app, await login(app, 'ycinsider'));
+  // The operator overview is for the admin reviewer; a viewer without a configured organization of its own gets nothing.
+  const res = await overview(app, await login(app, 'admin'));
   assert.equal(res.statusCode, 200, res.body);
   assert.equal(res.headers['cache-control'], 'private, no-store');
   assert.equal(res.json().workspace.id, ws.id);
+  const viewer = await overview(app, await login(app, 'ycinsider'));
+  assert.equal(viewer.statusCode, 403);
+  assert.equal(viewer.json().code, 'demo_overview_unavailable');
+  assert.equal(viewer.headers['cache-control'], 'private, no-store');
+  assert.ok(!viewer.body.includes(ws.id) && !('projects' in viewer.json()), 'no operator record reaches an unmapped viewer');
   await app.close();
 });
 
@@ -107,7 +113,7 @@ test('an active reviewer reads a curated projection of the pinned workspace and 
   const other = await workspace(store, { name: 'OTHER SYNTHETIC WORKSPACE' });
   await populate(store, other.owner, other.ws, { projectName: 'OTHER PROJECT NAME' });
   const app = await makeApp({ store, env: { REVIEWERS_JSON: JSON.stringify(await reviewers()), DEMO_WORKSPACE_ID: ws.id } });
-  const cookies = await login(app, 'ycinsider');
+  const cookies = await login(app, 'admin');
 
   const res = await overview(app, cookies);
   assert.equal(res.statusCode, 200, res.body);
@@ -192,7 +198,7 @@ test('the reviewer read reports job state as last recorded and settles no leases
   await store.leaseJob({ runnerId: runner.id, leaseHash: hashSecret('lease') });
   clock.now = new Date('2026-11-04T10:10:00Z');
   const app = await makeApp({ store, env: { REVIEWERS_JSON: JSON.stringify(await reviewers()), DEMO_WORKSPACE_ID: ws.id } });
-  const cookies = await login(app, 'ycinsider');
+  const cookies = await login(app, 'admin');
 
   const first = (await overview(app, cookies)).json().compute.jobs.items[0];
   assert.equal(first.id, job.id);
@@ -209,11 +215,11 @@ test('a reviewer account disabled after sign-in is refused and signed out', asyn
   const store = { ...createMemoryStore(), kind: 'postgres' };
   const { ws } = await workspace(store);
   const app = await makeApp({ store, env: { DEMO_WORKSPACE_ID: ws.id } });
-  await store.upsertReviewer({ username: 'ycinsider', name: 'YC reviewer', role: 'viewer', passwordHash: await hashPassword(PASSWORD, { cost: 2 ** 12 }) });
-  const cookies = await login(app, 'ycinsider');
+  await store.upsertReviewer({ username: 'admin', name: 'Demo admin', role: 'admin', passwordHash: await hashPassword(PASSWORD, { cost: 2 ** 12 }) });
+  const cookies = await login(app, 'admin');
   assert.equal((await overview(app, cookies)).statusCode, 200);
 
-  await store.setReviewerEnabled({ username: 'ycinsider', enabled: false });
+  await store.setReviewerEnabled({ username: 'admin', enabled: false });
   const refused = await overview(app, cookies);
   assert.equal(refused.statusCode, 401);
   assert.ok(!refused.body.includes(ws.id));
@@ -241,7 +247,7 @@ test('unset, invalid, missing and non-synthetic configuration is unavailable, ne
   ];
   for (const [vars, appStore, code] of cases) {
     const app = await makeApp({ store: appStore, env: vars });
-    const res = await overview(app, await login(app, 'ycinsider'));
+    const res = await overview(app, await login(app, 'admin'));
     assert.equal(res.statusCode, 503, code);
     assert.equal(res.json().code, code);
     assert.equal(res.headers['cache-control'], 'private, no-store');
@@ -255,7 +261,7 @@ test('an empty synthetic workspace shows empty sections, and owner actions appea
   const store = createMemoryStore();
   const { owner, ws } = await workspace(store);
   const app = await makeApp({ store, env: { REVIEWERS_JSON: JSON.stringify(await reviewers()), DEMO_WORKSPACE_ID: ws.id } });
-  const cookies = await login(app, 'ycinsider');
+  const cookies = await login(app, 'admin');
 
   const empty = (await overview(app, cookies)).json();
   assert.deepEqual(empty.projects, []);
@@ -289,11 +295,13 @@ test('the admin sign-in log is unchanged and separate from the overview', async 
   const log = await app.inject({ method: 'GET', url: '/api/admin/signins', cookies: admin });
   assert.equal(log.statusCode, 200);
   assert.deepEqual(log.json().events.map((e) => `${e.event}:${e.username}`), ['signin:admin', 'signin:ycinsider']);
-  for (const cookies of [viewer, admin]) {
-    const res = await overview(app, cookies);
-    assert.equal(res.statusCode, 200);
-    assert.ok(!('events' in res.json()) && !res.body.includes('ycinsider'), 'the overview carries no sign-in data');
-  }
+  const res = await overview(app, admin);
+  assert.equal(res.statusCode, 200);
+  assert.ok(!('events' in res.json()) && !res.body.includes('ycinsider'), 'the overview carries no sign-in data');
+  const refused = await overview(app, viewer);
+  assert.equal(refused.statusCode, 403, 'an unmapped viewer has no overview, and still no log');
+  assert.equal(refused.json().code, 'demo_overview_unavailable');
+  assert.ok(!refused.body.includes(ws.id) && !refused.body.includes('events'));
   await app.close();
 });
 
@@ -428,4 +436,15 @@ test('capital planning totals stay separate by basis and period in the dashboard
   assert.ok(lines.every((l) => l.cents !== 42000) && !lines.some((l) => l.label.includes('$420.00')), 'unlike periods are never added into one figure');
   assert.deepEqual(costTotalLines(totalsByBasis([])), [], 'no cost items means no lines, not a zero line');
   assert.deepEqual(costTotalLines(undefined), []);
+});
+
+test('the overview forgets local-memory keys only after a confirmed sign-out, and keeps them when it fails', async () => {
+  const run = async (logout) => {
+    const steps = [];
+    const ok = await signOutReviewer({ logout, forget: () => steps.push('forget'), leave: () => steps.push('leave') });
+    return { ok, steps };
+  };
+  assert.deepEqual(await run(async () => ({ ok: true, status: 200, data: { ok: true } })), { ok: true, steps: ['forget', 'leave'] }, 'keys go first, then the page is left');
+  assert.deepEqual(await run(async () => ({ ok: false, status: 500, data: { error: 'Something went wrong on our side.' } })), { ok: false, steps: [] }, 'a refused sign-out leaves the keys and the page alone');
+  assert.deepEqual(await run(async () => { throw new Error('offline'); }), { ok: false, steps: [] }, 'an unreachable server is not a sign-out');
 });

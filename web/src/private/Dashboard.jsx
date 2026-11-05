@@ -2,7 +2,8 @@ import { useEffect, useReducer, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { api } from '../api.js';
 import { ThemeToggle } from '../theme.jsx';
-import { costTotalLines, createOverviewLoader, formatCents, initialOverviewState, reduceOverview } from './overview-state.js';
+import { forgetConnections } from '../app/memory.js';
+import { costTotalLines, createOverviewLoader, formatCents, initialOverviewState, reduceOverview, signOutReviewer } from './overview-state.js';
 
 /**
  * The reviewer overview: actual records of one pinned synthetic workspace, read from GET /api/demo/overview.
@@ -322,14 +323,25 @@ function useOwnMembership(workspaceId) {
 }
 
 function WorkingAppAccess({ workspaceId }) {
+  const navigate = useNavigate();
   const entry = useOwnMembership(workspaceId);
+  const [state, setState] = useState({ pending: false, message: null });
+  // A same-origin POST; the server derives the identity and names the destination, or says why it cannot.
+  async function enter() {
+    setState({ pending: true, message: null });
+    const res = await api.demoEnter().catch(() => null);
+    if (res?.ok && typeof res.data.to === 'string' && res.data.to.startsWith('/w/')) return navigate(res.data.to);
+    setState({ pending: false, message: res?.data?.error ?? 'Valcairn could not be reached. Try again.' });
+  }
   if (entry) {
     return <Link className="btn-solid-app" to={`/w/${entry.slug}`}>Open this workspace as {roleName(entry.role)} <Icon name="arrow" size={16} /></Link>;
   }
   return (
-    <p className="subtle" style={{ flex: '1 1 320px', maxWidth: 420 }}>
-      This view is read-only. The working app needs a separate workspace account that is a member of this workspace; the reviewer login does not open it. Someone with owner credentials can use <Link to="/signin">workspace sign-in</Link>.
-    </p>
+    <div className="cell-stack" style={{ flex: '1 1 320px', maxWidth: 460, gap: 8 }}>
+      <button type="button" className="btn-solid-app" onClick={enter} disabled={state.pending} aria-busy={state.pending || undefined}>{state.pending ? 'Opening…' : 'Open the workspace'} <Icon name="arrow" size={16} /></button>
+      {state.message && <p className="tone-warn" role="alert">{state.message}</p>}
+      <p className="subtle">Opens the real workspace as a dedicated demo identity, when the server has one configured for your reviewer account. It can plan, edit and evaluate inside this synthetic workspace only; linking machines, running jobs, team changes and funding records stay off.</p>
+    </div>
   );
 }
 
@@ -349,14 +361,17 @@ export default function Dashboard({ reviewer }) {
     return () => { current.stop(); if (loader.current === current) loader.current = null; };
   }, []);
   const load = () => loader.current?.load();
-  // A 401 here means the reviewer account was disabled or the session ended: back to the sign-in page.
-  useEffect(() => { if (state.status === 'signed_out') navigate('/demo'); }, [state.status, navigate]);
+  // A 401 here means the reviewer account was disabled or the session ended: this tab's local-memory keys go with
+  // the session (the memories stay in the store), then back to the sign-in page.
+  useEffect(() => {
+    if (state.status !== 'signed_out') return;
+    forgetConnections();
+    navigate('/demo');
+  }, [state.status, navigate]);
 
-  // Only leave the dashboard once the server has ended the session.
+  // Only leave the dashboard, and forget the local-memory keys, once the server has ended the session.
   async function signOut() {
-    const res = await api.logout().catch(() => null);
-    if (res?.ok) return navigate('/demo');
-    setSignOutFailed(true);
+    if (!(await signOutReviewer({ logout: api.logout, forget: forgetConnections, leave: () => navigate('/demo') }))) setSignOutFailed(true);
   }
 
   const overview = state.overview;
