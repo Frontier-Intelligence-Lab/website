@@ -16,7 +16,7 @@ Browser ── HTTPS ──► web (Node/Fastify) ── SQL ──► Postgres 
 | --- | --- | --- | --- |
 | `web` (repo root: `src/`, `web/`) | Node 24, Fastify 5, React 19 | Pages, sessions, accounts, workspaces, roles, onboarding API, review decisions | Request/response and database work. Shares one language with the UI, and is already tested. |
 | `services/ingest` | Rust (axum, tokio) | Receiving untrusted files: streaming to storage, size limits, SHA-256, type sniffing, signed receipts | Untrusted input at high volume. Memory safety, predictable latency and low memory per upload. |
-| `services/workers` (planned) | Python (uv) | Dataset validation, deduplication, evaluation runs, fine-tuning, distillation, quantization | Best ecosystem for ML: PyTorch, transformers, datasets, vLLM, ONNX. |
+| `services/workers` (planned) | Python (uv) | Dataset validation, deduplication, evaluation runs, fine-tuning, distillation, quantization | Best ecosystem for ML: PyTorch, transformers, datasets, vLLM, ONNX. Workers are not used yet. Scoring of customer-supplied answers lives in `web` (`src/lib/eval.js`, `migrations/015_evaluation.sql`). |
 | `services/control` (planned) | Go | Deployment controller, schedules, rollouts to customer clouds and edge | Strong infrastructure SDKs (Kubernetes, cloud APIs), simple concurrency, static binaries. |
 
 Workers that run on a customer's own machine (Valcairn Runners, `docs/RUNNERS.md`) do not connect to Postgres. They call `web` over HTTPS with a runner key and lease jobs from the same Postgres queue through it, so tenancy and roles are checked by `web` on every call and the machine needs no inbound port or database credentials.

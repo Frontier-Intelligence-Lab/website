@@ -198,7 +198,7 @@ No application license file is currently checked in. The bundled Inter font incl
 
 ## Database
 
-The optional Postgres store implements [the storage contract](docs/STORE_CONTRACT.md). With `DATABASE_URL` unset, development and tests use the existing in-memory store. Production without a database keeps the new account routes unavailable. Existing reviewer credentials and the sign-in JSONL log are separate and are not migrated by these scripts.
+The optional Postgres store implements [the storage contract](docs/STORE_CONTRACT.md). Evaluation of imported answers is described in [docs/EVALUATION.md](docs/EVALUATION.md). With `DATABASE_URL` unset, development and tests use the existing in-memory store. Production without a database keeps the new account routes unavailable. Existing reviewer credentials and the sign-in JSONL log are separate and are not migrated by these scripts.
 
 ### Local Postgres 17
 
