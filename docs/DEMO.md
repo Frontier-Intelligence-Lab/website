@@ -1,6 +1,6 @@
 # YC / Speedrun demo runbook
 
-A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace. Everything shown in part one executes. Part two trains, evaluates and exports a model on a GPU machine and needs the runner and its handlers (PRs 14 and 16); cloud deployment and financing are labelled as planned.
+A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace. Everything shown in part one executes. Part two trains, evaluates and exports a model on a GPU machine and needs the runner (merged) and its training and export handlers (PR 16); cloud deployment and financing are labelled as planned.
 
 ## Before the demo (once)
 
@@ -29,7 +29,7 @@ A repeatable 6–8 minute walkthrough on a clearly labelled synthetic workspace.
 
 ## Part two: train on your own machine, evaluate and run it locally (about 5 minutes)
 
-This part needs a machine with an NVIDIA GPU, Docker with GPU support, Ollama and Python 3.11, and the Valcairn Runner and its training and export handlers (`services/runner`, PRs 14 and 16). Until those are merged this branch only queues and records jobs. Training a small model on the 252 synthetic conversations takes about a minute on one recent GPU.
+This part needs a machine with an NVIDIA GPU, Docker with GPU support, Ollama and Python 3.11, and the Valcairn Runner and its training and export handlers (`services/runner`; the training and export handlers are PR 16). Until PR 16 is merged, training and export jobs end as `unsupported`. Training a small model on the 252 synthetic conversations takes about a minute on one recent GPU.
 
 ### Before the demo (once)
 
