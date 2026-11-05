@@ -4,6 +4,7 @@ import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf,
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
 import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
+import { evalMemoryMethods } from './eval-memory.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
@@ -104,7 +105,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
     return project;
   };
 
-  return {
+  const store = {
     kind: 'memory',
 
     async createUser({ email, name, passwordHash }) {
@@ -900,4 +901,5 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
 
     async close() {},
   };
+  return Object.assign(store, evalMemoryMethods({ stamp, copy, versions, projects, audit }));
 }
