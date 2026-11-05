@@ -4,6 +4,7 @@ import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf,
 import { boxNotStoredForm, frozenBoxViolations } from '../lib/box-sql.js';
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
+import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
 import { evalPostgresMethods } from './eval-postgres.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -11,6 +12,8 @@ const isId = (value) => typeof value === 'string' && UUID.test(value);
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
 const CONTENT_FIELDS = ['name', 'task', 'modalities', 'startingPoint', 'success', 'dataSource', 'model'];
+const HELD = ['leased', 'running', 'cancel_requested'];
+const FINISHED = ['succeeded', 'failed', 'cancelled'];
 const lower = (value) => String(value).toLowerCase();
 const iso = (value) => value == null ? null : new Date(value).toISOString();
 
@@ -54,6 +57,8 @@ function databaseError(error) {
   // Raised by migrations/011_models.sql once an enhance run is requested.
   if (error.code === 'P0001' && error.message === 'run_frozen') return new StoreError('invalid_state');
   // Raised by migrations/013_capital.sql: submitted revisions and credit records never change.
+  // Raised by migrations/014_jobs.sql: a job's inputs and finished jobs never change; events are append-only.
+  if (error.code === 'P0001' && ['job_frozen', 'job_event_frozen'].includes(error.message)) return new StoreError('invalid_state');
   if (error.code === 'P0001' && ['submission_frozen', 'credit_record_frozen', 'review_mark_frozen'].includes(error.message)) return new StoreError('invalid_state');
   // Raised by migrations/015_evaluation.sql when a frozen evaluation row is rewritten or deleted.
   if (error.code === 'P0001' && error.message === 'eval_frozen') return new StoreError('invalid_state', 'This evaluation record is frozen. Start a new version instead of changing the approved one.');
@@ -63,6 +68,17 @@ function databaseError(error) {
   return safe;
 }
 
+const runnerRow = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, createdBy: r.created_by, label: r.label, keyPrefix: r.key_prefix, status: r.status,
+  capabilities: r.capabilities, lastSeenAt: iso(r.last_seen_at), revokedAt: iso(r.revoked_at), createdAt: iso(r.created_at),
+});
+const jobRow = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, runnerId: r.runner_id, kind: r.kind, enhanceRunId: r.enhance_run_id, spec: r.spec,
+  status: r.status, attempt: r.attempt, maxAttempts: r.max_attempts, leaseExpiresAt: iso(r.lease_expires_at), result: r.result,
+  failure: r.failure, idempotencyKey: r.idempotency_key, createdBy: r.created_by, cancelledBy: r.cancelled_by,
+  createdAt: iso(r.created_at), startedAt: iso(r.started_at), finishedAt: iso(r.finished_at), updatedAt: iso(r.updated_at),
+});
+const eventRow = (r) => ({ id: Number(r.id), jobId: r.job_id, attempt: r.attempt, seq: r.seq, kind: r.kind, data: r.data, createdAt: iso(r.created_at) });
 const userRow = (r) => r ? {
   id: r.id, email: r.email, name: r.name,
   emailVerifiedAt: iso(r.email_verified_at), createdAt: iso(r.created_at),
@@ -229,6 +245,33 @@ export function createPostgresStore(options) {
   };
   const DEVICE_WITH_REPORT = `SELECT d.*, to_jsonb(r) AS report FROM devices d
     LEFT JOIN LATERAL (SELECT * FROM device_reports WHERE device_id = d.id ORDER BY created_at DESC, id DESC LIMIT 1) r ON true`;
+  // A lease that ran out without word from the runner: retried while attempts remain, honoured if cancel was asked.
+  // The CASEs read the row's values from before this UPDATE.
+  const LEASE_SCOPES = { id: 'id', workspace: 'workspace_id', runner: 'runner_id' };
+  const expireLeases = async (scope, value, client = pool) => {
+    const column = LEASE_SCOPES[scope];
+    if (!column) throw new Error('Unknown lease scope');
+    await query(`UPDATE jobs SET
+        status = CASE WHEN status = 'cancel_requested' THEN 'cancelled' WHEN attempt < max_attempts THEN 'queued' ELSE 'failed' END,
+        failure = CASE WHEN status <> 'cancel_requested' AND attempt >= max_attempts THEN 'lease_expired' ELSE failure END,
+        finished_at = CASE WHEN status = 'cancel_requested' OR attempt >= max_attempts THEN clock_timestamp() END,
+        lease_hash = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+      WHERE status IN ('leased', 'running', 'cancel_requested') AND lease_expires_at <= clock_timestamp() AND ${column} = $1`, [value], client);
+  };
+  const lockHeldJob = async (client, { runnerId, jobId, leaseHash }) => {
+    if (!isId(runnerId) || !isId(jobId)) throw new StoreError('not_found');
+    await expireLeases('id', jobId, client);
+    const j = (await query('SELECT * FROM jobs WHERE id = $1 AND runner_id = $2 FOR UPDATE', [jobId, runnerId], client)).rows[0];
+    if (!j) throw new StoreError('not_found');
+    if (!HELD.includes(j.status) || j.lease_hash !== leaseHash) throw new StoreError('lease_lost');
+    // The row lock may have taken a while: decide on the lease with the clock as it is now, after the wait.
+    const { expired } = (await query('SELECT lease_expires_at <= clock_timestamp() AS expired FROM jobs WHERE id = $1', [jobId], client)).rows[0];
+    if (expired) throw new StoreError('lease_lost');
+    return j;
+  };
+  const extendLease = async (client, j, leaseMs) => (await query(`UPDATE jobs SET status = CASE WHEN status = 'leased' THEN 'running' ELSE status END,
+    lease_expires_at = clock_timestamp() + make_interval(secs => $2::double precision / 1000), updated_at = clock_timestamp() WHERE id = $1 RETURNING *`,
+  [j.id, leaseMs], client)).rows[0];
   const addAudit = async (client, { workspaceId = null, actorId = null, action, targetType = null, targetId = null, metadata = {} }) => {
     await query(`INSERT INTO audit_events (workspace_id, actor_id, action, target_type, target_id, metadata)
       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
@@ -846,6 +889,175 @@ export function createPostgresStore(options) {
       if (![workspaceId, ownerId, deviceId].every(isId)) return [];
       return (await query(`SELECT * FROM execution_runs WHERE device_id = $1 AND workspace_id = $2 AND owner_id = $3
         ORDER BY created_at DESC, id DESC LIMIT $4`, [deviceId, workspaceId, ownerId, Math.min(Math.max(1, limit), 200)])).rows.map(execRow);
+    },
+
+    // Runners and jobs (migrations/014_jobs.sql). Leasing locks the runner row, so a runner holds one job at a time.
+    async createRunner({ workspaceId, createdBy, label, keyHash, keyPrefix }) {
+      if (!isId(workspaceId) || !isId(createdBy)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const row = (await query('INSERT INTO runners (workspace_id, created_by, label, key_hash, key_prefix) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+          [workspaceId, createdBy, label, keyHash, keyPrefix], client)).rows[0];
+        await addAudit(client, { workspaceId, actorId: createdBy, action: 'runner.linked', targetType: 'runner', targetId: row.id });
+        return runnerRow(row);
+      });
+    },
+    async listRunners(workspaceId) {
+      if (!isId(workspaceId)) return [];
+      return (await query('SELECT * FROM runners WHERE workspace_id = $1 ORDER BY created_at, id', [workspaceId])).rows.map(runnerRow);
+    },
+    async getRunner({ workspaceId, runnerId }) {
+      if (!isId(workspaceId) || !isId(runnerId)) return null;
+      const r = (await query('SELECT * FROM runners WHERE id = $1 AND workspace_id = $2', [runnerId, workspaceId])).rows[0];
+      return r ? runnerRow(r) : null;
+    },
+    async findActiveRunnerByKeyHash(keyHash) {
+      if (!/^[0-9a-f]{64}$/.test(keyHash ?? '')) return null;
+      const r = (await query("SELECT * FROM runners WHERE key_hash = $1 AND status = 'active'", [keyHash])).rows[0];
+      return r ? runnerRow(r) : null;
+    },
+    async revokeRunner({ workspaceId, runnerId, actorId }) {
+      if (![workspaceId, runnerId, actorId].every(isId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        const current = (await query('SELECT status FROM runners WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [runnerId, workspaceId], client)).rows[0];
+        if (!current) throw new StoreError('not_found');
+        if (current.status !== 'active') throw new StoreError('invalid_state');
+        const row = (await query("UPDATE runners SET status = 'revoked', revoked_at = clock_timestamp() WHERE id = $1 RETURNING *", [runnerId], client)).rows[0];
+        await query(`UPDATE jobs SET status = 'cancelled', cancelled_by = $2, finished_at = clock_timestamp(), updated_at = clock_timestamp()
+          WHERE runner_id = $1 AND status = 'queued'`, [runnerId, actorId], client);
+        await query(`UPDATE jobs SET status = 'failed', failure = 'runner_revoked', lease_hash = NULL, lease_expires_at = NULL,
+          finished_at = clock_timestamp(), updated_at = clock_timestamp() WHERE runner_id = $1 AND status IN ('leased', 'running', 'cancel_requested')`, [runnerId], client);
+        await addAudit(client, { workspaceId, actorId, action: 'runner.revoked', targetType: 'runner', targetId: runnerId });
+        return runnerRow(row);
+      });
+    },
+    async reportRunner({ runnerId, capabilities }) {
+      if (!isId(runnerId)) throw new StoreError('invalid_state');
+      const r = (await query("UPDATE runners SET capabilities = $2::jsonb, last_seen_at = clock_timestamp() WHERE id = $1 AND status = 'active' RETURNING *",
+        [runnerId, JSON.stringify(capabilities)])).rows[0];
+      if (!r) throw new StoreError('invalid_state');
+      return runnerRow(r);
+    },
+    async createJob({ workspaceId, runnerId, kind, enhanceRunId = null, spec, idempotencyKey, createdBy }) {
+      if (![workspaceId, runnerId, createdBy].every(isId) || (enhanceRunId != null && !isId(enhanceRunId))) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        // The same key must mean the same request, including every frozen input (training run, artifact, plan version).
+        const same = (row) => row.kind === kind && row.runner_id === runnerId && (row.enhance_run_id ?? null) === enhanceRunId && stableJson(row.spec) === stableJson(spec);
+        const prior = (await query('SELECT * FROM jobs WHERE workspace_id = $1 AND idempotency_key = $2', [workspaceId, idempotencyKey], client)).rows[0];
+        if (prior) {
+          if (!same(prior)) throw new StoreError('invalid_state');
+          return jobRow(prior);
+        }
+        const runner = (await query('SELECT status FROM runners WHERE id = $1 AND workspace_id = $2 FOR SHARE', [runnerId, workspaceId], client)).rows[0];
+        if (!runner) throw new StoreError('not_found');
+        if (runner.status !== 'active') throw new StoreError('invalid_state');
+        const row = (await query(`INSERT INTO jobs (workspace_id, runner_id, kind, enhance_run_id, spec, idempotency_key, created_by, max_attempts)
+          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8) ON CONFLICT (workspace_id, idempotency_key) DO NOTHING RETURNING *`,
+        [workspaceId, runnerId, kind, enhanceRunId, JSON.stringify(spec), idempotencyKey, createdBy, MAX_ATTEMPTS], client)).rows[0];
+        if (!row) {
+          // A concurrent request with the same key won the insert.
+          const raced = (await query('SELECT * FROM jobs WHERE workspace_id = $1 AND idempotency_key = $2', [workspaceId, idempotencyKey], client)).rows[0];
+          if (!same(raced)) throw new StoreError('invalid_state');
+          return jobRow(raced);
+        }
+        await addAudit(client, { workspaceId, actorId: createdBy, action: 'job.created', targetType: 'job', targetId: row.id, metadata: { kind, runnerId } });
+        return jobRow(row);
+      });
+    },
+    async listJobs({ workspaceId, limit = 50 }) {
+      if (!isId(workspaceId)) return [];
+      await expireLeases('workspace', workspaceId);
+      return (await query('SELECT * FROM jobs WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2', [workspaceId, limit])).rows.map(jobRow);
+    },
+    async getJob({ workspaceId, jobId }) {
+      if (!isId(workspaceId) || !isId(jobId)) return null;
+      await expireLeases('id', jobId);
+      const r = (await query('SELECT * FROM jobs WHERE id = $1 AND workspace_id = $2', [jobId, workspaceId])).rows[0];
+      return r ? jobRow(r) : null;
+    },
+    async listJobEvents({ workspaceId, jobId, afterId = 0, limit = 500 }) {
+      if (!isId(workspaceId) || !isId(jobId)) return [];
+      return (await query('SELECT * FROM job_events WHERE job_id = $1 AND workspace_id = $2 AND id > $3 ORDER BY id LIMIT $4',
+        [jobId, workspaceId, afterId, limit])).rows.map(eventRow);
+    },
+    async cancelJob({ workspaceId, jobId, actorId }) {
+      if (![workspaceId, jobId, actorId].every(isId)) throw new StoreError('not_found');
+      return transaction(async (client) => {
+        await expireLeases('id', jobId, client);
+        const j = (await query('SELECT * FROM jobs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [jobId, workspaceId], client)).rows[0];
+        if (!j) throw new StoreError('not_found');
+        if (FINISHED.includes(j.status)) throw new StoreError('invalid_state');
+        let row = j;
+        if (j.status === 'queued') {
+          row = (await query(`UPDATE jobs SET status = 'cancelled', cancelled_by = $2, finished_at = clock_timestamp(), updated_at = clock_timestamp()
+            WHERE id = $1 RETURNING *`, [jobId, actorId], client)).rows[0];
+        } else if (j.status !== 'cancel_requested') {
+          row = (await query("UPDATE jobs SET status = 'cancel_requested', cancelled_by = $2, updated_at = clock_timestamp() WHERE id = $1 RETURNING *", [jobId, actorId], client)).rows[0];
+        }
+        await addAudit(client, { workspaceId, actorId, action: 'job.cancel_requested', targetType: 'job', targetId: jobId });
+        return jobRow(row);
+      });
+    },
+    async leaseJob({ runnerId, leaseHash, leaseMs = LEASE_MS }) {
+      if (!isId(runnerId)) return null;
+      return transaction(async (client) => {
+        const runner = (await query("SELECT id FROM runners WHERE id = $1 AND status = 'active' FOR UPDATE", [runnerId], client)).rows[0];
+        if (!runner) throw new StoreError('invalid_state');
+        await expireLeases('runner', runnerId, client);
+        const held = (await query(`SELECT 1 FROM jobs WHERE runner_id = $1 AND status IN ('leased', 'running', 'cancel_requested')`, [runnerId], client)).rows[0];
+        if (held) return null;
+        const next = (await query("SELECT id FROM jobs WHERE runner_id = $1 AND status = 'queued' ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED", [runnerId], client)).rows[0];
+        if (!next) return null;
+        const row = (await query(`UPDATE jobs SET status = 'leased', attempt = attempt + 1, lease_hash = $2,
+          lease_expires_at = clock_timestamp() + make_interval(secs => $3::double precision / 1000), started_at = COALESCE(started_at, clock_timestamp()),
+          updated_at = clock_timestamp() WHERE id = $1 RETURNING *`, [next.id, leaseHash, leaseMs], client)).rows[0];
+        return jobRow(row);
+      });
+    },
+    async getRunnerJob({ runnerId, jobId }) {
+      if (!isId(runnerId) || !isId(jobId)) return null;
+      await expireLeases('id', jobId);
+      const r = (await query('SELECT * FROM jobs WHERE id = $1 AND runner_id = $2', [jobId, runnerId])).rows[0];
+      return r ? jobRow(r) : null;
+    },
+    async touchJob({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS }) {
+      return transaction(async (client) => jobRow(await extendLease(client, await lockHeldJob(client, { runnerId, jobId, leaseHash }), leaseMs)));
+    },
+    async releaseJobInputs({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS, versions = 0, files = 0 }) {
+      return transaction(async (client) => {
+        // Under the job row lock, which cancelJob takes and which revokeRunner's job update waits for: the lease is
+        // decided after the wait (lockHeldJob), and a committed revoke has already failed the job, so lease_lost.
+        const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
+        if (j.status === 'cancel_requested') throw new StoreError('invalid_state');
+        // Read, not locked: revokeRunner locks the runner row and then the job rows, so taking the runner row here,
+        // after the job row, could deadlock with it. The job row above already orders this release against a revoke.
+        const runner = (await query('SELECT created_by, status FROM runners WHERE id = $1', [runnerId], client)).rows[0];
+        if (runner.status !== 'active') throw new StoreError('lease_lost');
+        const row = await extendLease(client, j, leaseMs);
+        await addAudit(client, { workspaceId: j.workspace_id, actorId: runner.created_by, action: 'job.inputs_released', targetType: 'job', targetId: jobId, metadata: { runnerId, versions, files } });
+        return jobRow(row);
+      });
+    },
+    async appendJobEvents({ runnerId, jobId, leaseHash, events, leaseMs = LEASE_MS }) {
+      return transaction(async (client) => {
+        const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
+        const added = (await query(`INSERT INTO job_events (job_id, workspace_id, attempt, seq, kind, data)
+          SELECT $1, $2, $3, e.seq, e.kind, e.data FROM jsonb_to_recordset($4::jsonb) AS e(seq integer, kind text, data jsonb)
+          ON CONFLICT (job_id, attempt, seq) DO NOTHING`, [jobId, j.workspace_id, j.attempt, JSON.stringify(events)], client)).rowCount;
+        return { added, job: jobRow(await extendLease(client, j, leaseMs)) };
+      });
+    },
+    async finishJob({ runnerId, jobId, leaseHash, outcome, result = null, failure = null, retryable = false }) {
+      return transaction(async (client) => {
+        const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
+        const done = "lease_hash = NULL, lease_expires_at = NULL, finished_at = clock_timestamp(), updated_at = clock_timestamp()";
+        let row;
+        // Cancellation contract (docs/RUNNERS.md): once cancel is requested, the job ends cancelled, whatever the runner reports.
+        if (j.status === 'cancel_requested' || (outcome === 'failed' && failure === 'cancelled')) row = (await query(`UPDATE jobs SET status = 'cancelled', ${done} WHERE id = $1 RETURNING *`, [jobId], client)).rows[0];
+        else if (outcome === 'succeeded') row = (await query(`UPDATE jobs SET status = 'succeeded', result = $2::jsonb, ${done} WHERE id = $1 RETURNING *`, [jobId, JSON.stringify(result)], client)).rows[0];
+        else if (retryable && j.attempt < j.max_attempts) row = (await query("UPDATE jobs SET status = 'queued', lease_hash = NULL, lease_expires_at = NULL, updated_at = clock_timestamp() WHERE id = $1 RETURNING *", [jobId], client)).rows[0];
+        else row = (await query(`UPDATE jobs SET status = 'failed', failure = $2, ${done} WHERE id = $1 RETURNING *`, [jobId, failure], client)).rows[0];
+        return jobRow(row);
+      });
     },
 
     // Capital: cases with an editable, revisioned draft; frozen submitted revisions; append-only credit records; evidence references.

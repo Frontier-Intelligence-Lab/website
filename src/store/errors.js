@@ -7,4 +7,4 @@ export class StoreError extends Error {
   }
 }
 
-export const STORE_ERRORS = ['email_taken', 'slug_taken', 'personal_exists', 'not_found', 'already_decided', 'already_member', 'invite_expired', 'duplicate_upload', 'invalid_state', 'quota_exceeded', 'forbidden', 'issues_open', 'label_in_use', 'invalid_label', 'invalid_kind', 'stale_plan', 'stale_revision', 'evidence_in_use', 'missing_reference', 'invalid_import'];
+export const STORE_ERRORS = ['email_taken', 'slug_taken', 'personal_exists', 'not_found', 'already_decided', 'already_member', 'invite_expired', 'duplicate_upload', 'invalid_state', 'quota_exceeded', 'forbidden', 'issues_open', 'label_in_use', 'invalid_label', 'invalid_kind', 'stale_plan', 'stale_revision', 'evidence_in_use', 'missing_reference', 'invalid_import', 'lease_lost'];

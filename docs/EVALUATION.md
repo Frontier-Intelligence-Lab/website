@@ -49,7 +49,8 @@ Findings point at the case and a repair. Nothing is rewritten or deleted for you
 - The same normalized question and the same normalized expected answer (including both empty) is a blocking duplicate. Delete or edit one case.
 - A cited version that is missing, outside the workspace, not allowed for testing, or whose file id is not in that version is blocking.
 - A case with neither an expected answer nor review criteria is blocking.
-- The same normalized question with different expected answers is a suspected conflict. It stays blocking until a person writes a note. The note does not mean either answer was proven wrong.
+- The same normalized question with different expected answers is a suspected conflict. It stays blocking until a person writes a note. The note is bound to the cases it was written for: editing a member case’s expected answer, review criteria or source references, or adding or removing a member, reopens the conflict for a fresh note. Earlier notes stay on record. The note does not mean either answer was proven wrong.
+- A conflict does not hide duplicates. When a question has several expected answers, each group of cases that shares one of those answers is still reported as a duplicate and cannot be acknowledged.
 - Category and severity are counted. They are the customer’s labels.
 
 Semantic near-duplicates, automatic checks that a document is true, a guarantee that personal data is gone, and proof that the set covers future questions are planned. They are not offered as actions.
@@ -92,8 +93,8 @@ A person who is not a member of the workspace gets 404 on every evaluation route
 
 ## Database
 
-`migrations/015_evaluation.sql` creates the evaluation tables. It does not read or write the jobs tables. `014_jobs.sql` is reserved on another branch and is not part of this change. If both files exist, 014 sorts first and 015 still applies. Applying 015 on a database that does not have 014 is safe. Do not edit a migration that has already been applied.
+`migrations/015_evaluation.sql` creates the evaluation tables. It does not read or write the jobs tables. `014_jobs.sql` (Runners and jobs) is part of this source and independent of it: 014 sorts first, 015 still applies, and a database that has only one of the two applies the other later as a new file. Do not edit a migration that has already been applied.
 
 Frozen version rows, batches, predictions, and reports reject `UPDATE` and `DELETE` in Postgres, including direct SQL. Case rows and issue notes reject writes while the set is frozen, and accept them again after it is reopened. Deleting a workspace that still has a frozen evaluation version fails, because those child rows cannot be deleted. Tests clear tables with `TRUNCATE`, which does not run those delete triggers. Do not add a bypass so a workspace can be deleted through the frozen rows.
 
-No new environment variable is required. Apply 015 before serving a web build that shows Evaluate, and confirm the app role can `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the new tables. The triggers, not the grants, stop frozen writes.
+No new environment variable is required. Apply 015 before serving a web build that shows Evaluate. The application role gets exactly the least-privilege statements listed in `docs/RELEASE.md` (the release helper grants those and refuses anything broader; `eval_set_versions` needs `UPDATE` only for the row lock that imports and comparisons take). The triggers, not the grants, stop frozen writes.

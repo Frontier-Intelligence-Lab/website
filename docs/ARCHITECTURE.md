@@ -19,6 +19,8 @@ Browser ── HTTPS ──► web (Node/Fastify) ── SQL ──► Postgres 
 | `services/workers` (planned) | Python (uv) | Dataset validation, deduplication, evaluation runs, fine-tuning, distillation, quantization | Best ecosystem for ML: PyTorch, transformers, datasets, vLLM, ONNX. Workers are not used yet. Scoring of customer-supplied answers lives in `web` (`src/lib/eval.js`, `migrations/015_evaluation.sql`). |
 | `services/control` (planned) | Go | Deployment controller, schedules, rollouts to customer clouds and edge | Strong infrastructure SDKs (Kubernetes, cloud APIs), simple concurrency, static binaries. |
 
+Workers that run on a customer's own machine (Valcairn Runners, `docs/RUNNERS.md`) do not connect to Postgres. They call `web` over HTTPS with a runner key and lease jobs from the same Postgres queue through it, so tenancy and roles are checked by `web` on every call and the machine needs no inbound port or database credentials.
+
 ## Rules that hold across services
 
 - **Postgres is the source of truth.** Services coordinate through tables and a job queue (`FOR UPDATE SKIP LOCKED`), not through each other's memory. The `web` store contract is `docs/STORE_CONTRACT.md`.

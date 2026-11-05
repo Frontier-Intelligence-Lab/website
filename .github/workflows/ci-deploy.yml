@@ -1,0 +1,130 @@
+name: Valcairn CI and deploy
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  web-no-database:
+    name: Web / no database
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: env -u DATABASE_URL -u TEST_DATABASE_URL npm run check
+      - name: Release controller unit tests
+        run: |
+          test -f tests/test_deploy.py
+          python3 -m unittest discover -s tests -p 'test_deploy.py'
+      - name: Runner unit tests (standard library and injected fixtures; no Docker, GPU or model)
+        run: python3 -m unittest discover -s tests -v
+        working-directory: services/runner
+      - name: Build the production web and migration images
+        run: |
+          docker build --target migrate --tag "valcairn-migrate:ci-$GITHUB_SHA" .
+          docker build --tag "valcairn-site:ci-$GITHUB_SHA" .
+
+  web-postgres:
+    name: Web / PostgreSQL 17
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: valcairn_ci_test
+          POSTGRES_USER: postgres
+          # Only this disposable runner's loopback port is exposed; no production credentials.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - '127.0.0.1:5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U postgres -d valcairn_ci_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: env -u DATABASE_URL npm run check
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/valcairn_ci_test
+
+  ingest:
+    name: Ingest / Rust 1.99.1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain and clippy
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - run: cargo +1.99.1 clippy --locked --all-targets -- -D warnings
+        working-directory: services/ingest
+      - run: cargo +1.99.1 test --locked
+        working-directory: services/ingest
+      - name: Build the production ingest image
+        run: docker build --tag "valcairn-ingest:ci-$GITHUB_SHA" services/ingest
+
+  deploy:
+    name: Deploy production
+    needs: [web-no-database, web-postgres, ingest]
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/master' &&
+      github.repository == 'Frontier-Intelligence-Lab/website'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    concurrency:
+      group: valcairn-production
+      cancel-in-progress: false
+    steps:
+      - name: Request deployment of the checked master revision
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_KEY: ${{ secrets.VALCAIRN_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9.-]+$ ]]
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          test -n "$DEPLOY_KEY"
+          umask 077
+          secret_dir="$(mktemp -d "$RUNNER_TEMP/valcairn-deploy.XXXXXX")"
+          trap 'rm -rf -- "$secret_dir"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$secret_dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$secret_dir/known_hosts"
+          unset DEPLOY_KEY DEPLOY_KNOWN_HOSTS
+          ssh-keygen -y -f "$secret_dir/key" > /dev/null
+          ssh -T -i "$secret_dir/key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ForwardAgent=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$secret_dir/known_hosts" \
+            -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            -- "$DEPLOY_USER@$DEPLOY_HOST" "deploy $DEPLOY_SHA"

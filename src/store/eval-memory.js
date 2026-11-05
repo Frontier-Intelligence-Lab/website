@@ -111,25 +111,27 @@ export function evalMemoryMethods({ stamp, copy, versions, projects, audit }) {
         const set = setOf(workspaceId, projectId, setId);
         if (!set) throw new StoreError('not_found');
         requireDraft(set, expectedRevision);
+        // The whole prospective patch is checked first; a refused update leaves the draft and its revision untouched.
+        const next = {};
         if (patch.name != null) {
-          const name = typeof patch.name === 'string' ? patch.name.trim() : '';
-          if (!name || name.length > 120) throw new StoreError('invalid_import', 'Name the evaluation set in 120 characters or fewer.');
-          set.name = name;
+          next.name = typeof patch.name === 'string' ? patch.name.trim() : '';
+          if (!next.name || next.name.length > 120) throw new StoreError('invalid_import', 'Name the evaluation set in 120 characters or fewer.');
         }
         if (patch.purpose != null) {
           if (!['development', 'final_assessment'].includes(patch.purpose)) throw new StoreError('invalid_import', 'Choose development or final assessment.');
-          set.purpose = patch.purpose;
+          next.purpose = patch.purpose;
         }
         if (patch.acceptance != null) {
           const { rule, error } = validateAcceptance(patch.acceptance);
           if (error) throw new StoreError('invalid_import', error);
-          set.acceptance = rule;
+          next.acceptance = rule;
         }
         if (patch.rubricVersion != null) {
           const { rubric, error } = validateRubricVersion(patch.rubricVersion);
           if (error) throw new StoreError('invalid_import', error);
-          set.rubricVersion = rubric;
+          next.rubricVersion = rubric;
         }
+        Object.assign(set, next);
         bump(set);
         return publicSet(set);
       });

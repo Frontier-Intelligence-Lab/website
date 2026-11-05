@@ -1,8 +1,13 @@
 // Evaluation cases, quality checks, imported-prediction scoring and acceptance.
-// Pure functions: both stores and the routes use these, and the browser may import
-// the constants. Nothing here calls a model, a network or a database.
+// Server-side: both stores and the routes use these. Nothing here calls a model, a network or a
+// database. The constants the Evaluate page needs live in eval-shared.js, which has no imports and
+// is the only evaluation module the web bundle includes; this module uses node:crypto through
+// capital-hash.js for the finding identities an acknowledgement is bound to.
 
 import { StoreError } from '../store/errors.js';
+import { snapshotHash } from './capital-hash.js';
+
+export { PLANNED, SYNTHETIC_CASES, SYNTHETIC_PREDICTIONS } from './eval-shared.js';
 
 export const MAX_CASES = 200;
 export const MAX_IMPORT_BYTES = 256 * 1024;
@@ -33,14 +38,6 @@ export const LIMITATIONS = [
   'This report is not a certification and does not say the assistant is safe for production.',
 ];
 
-export const PLANNED = [
-  'Semantic near-duplicate detection',
-  'Automatic verification that a source document is true',
-  'A guarantee that personal data has been removed',
-  'Proof that the case set covers future questions',
-  'Calling a model endpoint, running an uploaded scorer, or starting a training job',
-];
-
 const CASE_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
 const ERROR_CODE = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const RUBRIC = /^[a-z0-9][a-z0-9._-]{0,39}$/;
@@ -49,12 +46,6 @@ const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, 
 
 const bad = (message, details) => Object.assign(new StoreError('invalid_import', message), details ? { details } : {});
 const byteLength = (value) => new TextEncoder().encode(value).length;
-// Stable short id for a finding that must fit an issue-note key. Not a security hash.
-const foldKey = (prefix, value) => {
-  let hash = 2166136261;
-  for (let i = 0; i < value.length; i += 1) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619);
-  return `${prefix}:${(hash >>> 0).toString(16)}`;
-};
 
 /** Documented normalization for duplicate detection and exact comparison. Not semantic equivalence. */
 export function normalizeText(value) {
@@ -77,13 +68,14 @@ export function tokenOverlap(a, b) {
   return shared / (left.size + right.size - shared);
 }
 
+// The documented rule, checked on the value as sent: a plain decimal from 0 to 1 with at most four
+// places. Nothing is rounded first. The shortest round-trip text is the same text the migration's
+// check sees in the stored JSON, so both sides accept exactly the same numbers.
 function unitInterval(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
-  const rounded = Math.round(value * 10000) / 10000;
-  if (rounded < 0 || rounded > 1) return null;
-  // JSON numbers must match the migration's plain decimal check (no exponent).
-  if (!/^(0|1|0?\.[0-9]{1,4}|1\.0{1,4})$/.test(String(rounded))) return null;
-  return rounded;
+  const text = String(value);
+  if (!/^(0|1|0?\.[0-9]{1,4}|1\.0{1,4})$/.test(text)) return null;
+  return Number(text);
 }
 
 export function defaultAcceptance() {
@@ -113,8 +105,8 @@ export function validateAcceptance(raw) {
     requireHumanWhenNoExpectedAnswer: body.requireHumanWhenNoExpectedAnswer !== false,
   };
   if (!rule.scoreBasis) return { error: 'Choose how a case is scored: human review, normalized exact match, or human review with exact match only where nobody has reviewed.' };
-  if (rule.minPassRate == null) return { error: 'Set the pass rate between 0 and 1. It is applied to every eligible case, not only the ones that returned an answer.' };
-  if (rule.minCoverage == null) return { error: 'Set the required coverage between 0 and 1. Missing and unreviewed cases stay in the denominator.' };
+  if (rule.minPassRate == null) return { error: 'Set the pass rate between 0 and 1 with at most four decimal places. It is applied to every eligible case, not only the ones that returned an answer.' };
+  if (rule.minCoverage == null) return { error: 'Set the required coverage between 0 and 1 with at most four decimal places. Missing and unreviewed cases stay in the denominator.' };
   return { rule };
 }
 
@@ -326,28 +318,52 @@ export function computeEvalIssues({ cases, notes = [], sources = [] }) {
   }
   for (const [norm, group] of groups) {
     if (group.length < 2) continue;
-    const answers = new Set(group.map((row) => (row.expectedAnswer == null ? '\u0000' : normalizeText(row.expectedAnswer))));
-    const caseKeys = group.map((row) => row.caseKey);
-    if (answers.size > 1) {
-      const key = foldKey('conflict', norm);
+    // Duplicates are found per expected answer, so a differing tenth case cannot hide nine copies behind a conflict.
+    const byAnswer = new Map();
+    for (const row of group) {
+      const answer = row.expectedAnswer == null ? null : normalizeText(row.expectedAnswer);
+      byAnswer.set(answer, [...(byAnswer.get(answer) ?? []), row]);
+    }
+    for (const [answer, copies] of byAnswer) {
+      if (copies.length < 2) continue;
+      const caseKeys = copies.map((row) => row.caseKey);
       add({
-        key, group: 'conflict', blocking: true, acknowledgeable: true, caseKeys,
-        title: 'Suspected conflict for human review',
-        detail: `${caseKeys.join(', ')} use the same normalized question and different expected answers. This is a review finding, not a proven factual error. Nothing was changed. Acknowledge it if both cases should stay, or edit one of them.`,
-        fix: { label: 'Review the cases', action: 'edit-case', caseKey: caseKeys[0] },
-      });
-    } else {
-      add({
-        key: foldKey('duplicate', norm), group: 'duplicate', blocking: true, acknowledgeable: false, caseKeys,
+        key: `duplicate:${snapshotHash({ question: norm, answer })}`, group: 'duplicate', blocking: true, acknowledgeable: false, caseKeys,
         title: 'Exact duplicate questions',
         detail: `${caseKeys.join(', ')} normalize to the same question and the same expected answer. Duplicates are not removed automatically. Edit or delete one before freezing.`,
         fix: { label: 'Edit a duplicate', action: 'edit-case', caseKey: caseKeys[0] },
       });
     }
+    if (byAnswer.size < 2) continue;
+    const caseKeys = group.map((row) => row.caseKey);
+    add({
+      key: conflictKey(norm, group), group: 'conflict', blocking: true, acknowledgeable: true, caseKeys,
+      title: 'Suspected conflict for human review',
+      detail: `${caseKeys.join(', ')} use the same normalized question and different expected answers. This is a review finding, not a proven factual error. Nothing was changed. Acknowledge it if these cases should stay, or edit one of them. Editing, adding or removing any of these cases reopens the finding for a fresh acknowledgement.`,
+      fix: { label: 'Review the cases', action: 'edit-case', caseKey: caseKeys[0] },
+    });
   }
 
   const withOpen = issues.map((issue) => ({ ...issue, open: issue.blocking && !(issue.acknowledgeable && noted.has(issue.key)) }));
   return withOpen;
+}
+
+/**
+ * The key an acknowledgement is stored under is the SHA-256 (capital-hash.js, canonical JSON) of the
+ * conflict a person actually reviewed: the normalized question and every member case with its exact
+ * expected answer, review criteria and source references, ordered by case key. Any change to those,
+ * or to the membership, is a different identity, so an earlier note stays on record but is never
+ * applied as consent to changed facts. Labels such as category and severity are not part of it.
+ * A short fold hash is not used here: distinct evidence must never share an identity.
+ */
+function conflictKey(norm, group) {
+  const members = group.map((row) => ({
+    caseKey: row.caseKey,
+    expectedAnswer: row.expectedAnswer ?? null,
+    reviewCriteria: row.reviewCriteria ?? null,
+    sourceRefs: (row.sourceRefs ?? []).map((ref) => ({ projectId: ref.projectId, versionId: ref.versionId, fileId: ref.fileId ?? null })),
+  })).sort((a, b) => (a.caseKey < b.caseKey ? -1 : a.caseKey > b.caseKey ? 1 : 0));
+  return `conflict:${snapshotHash({ question: norm, members })}`;
 }
 
 export function evalCounts(cases) {
@@ -696,16 +712,6 @@ export function mapBlindDecisions(blind, body) {
     adjudicationCandidate: adjudication(body.adjudicationCandidate, 'Candidate'),
   };
 }
-
-export const SYNTHETIC_CASES = `{"id":"case-returns-window","input":"How long does a customer have to return an unopened synthetic demo kettle?","expectedAnswer":"30 days from delivery","reviewCriteria":"Name the 30-day window and that it starts at delivery.","category":"returns","severity":"critical","sources":[{"projectId":"00000000-0000-4000-8000-000000000001","versionId":"00000000-0000-4000-8000-000000000002","fileId":"00000000-0000-4000-8000-000000000003"}]}
-{"id":"case-warranty-power","input":"The synthetic demo kettle will not power on. What should the agent do?","expectedAnswer":"Ask for the order number and offer a replacement. Do not promise a refund before the order is found.","reviewCriteria":null,"category":"warranty","severity":"major","sources":[{"projectId":"00000000-0000-4000-8000-000000000001","versionId":"00000000-0000-4000-8000-000000000002"}]}
-{"id":"case-store-hours","input":"What time does the synthetic demo shop close on Sunday?","expectedAnswer":null,"reviewCriteria":"The answer must match the Sunday hours in the cited policy, or say the policy does not state them.","category":"hours","severity":"minor","sources":[{"projectId":"00000000-0000-4000-8000-000000000001","versionId":"00000000-0000-4000-8000-000000000002","fileId":"00000000-0000-4000-8000-000000000003"}]}
-`;
-
-export const SYNTHETIC_PREDICTIONS = `{"id":"case-returns-window","status":"answered","output":"You can return an unopened kettle within 30 days of delivery."}
-{"id":"case-warranty-power","status":"answered","output":"I can refund you right now."}
-{"id":"case-store-hours","status":"error","error":"timeout"}
-`;
 
 /** Reject an adjudication that would hide a disagreement or invent an automatic pass. */
 export function checkAdjudication(auto, humanDecision, adjudication, label) {

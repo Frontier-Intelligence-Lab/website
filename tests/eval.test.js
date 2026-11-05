@@ -268,6 +268,102 @@ test('imports roll back, scores keep the denominator, and the export is the appr
   assert.equal((await owner.get(`${base}/reports/${approved.json().report.id}/export`)).json().snapshot.cases.find((row) => row.caseKey === 'returns').input, 'How long is the return window?');
 });
 
+test('a refused update leaves the draft and its revision unchanged', async () => {
+  const { owner, base } = await setup();
+  const created = await owner.post(base, { name: 'Reviewed original name', purpose: 'development' });
+  assert.equal(created.statusCode, 200, created.body);
+  const setPath = `${base}/${created.json().set.id}`;
+  const before = (await owner.get(setPath)).json().set;
+  assert.equal(before.revision, 1);
+  const rule = { ...before.acceptance, minPassRate: 0.75 };
+  const refusals = [
+    { name: 'Mutated although rejected', purpose: 'invalid' },
+    { name: 'Mutated although rejected', purpose: 'final_assessment', acceptance: { ...rule, scoreBasis: 'guess' } },
+    { name: 'Mutated although rejected', purpose: 'final_assessment', acceptance: { ...rule, minPassRate: 0.900049 } },
+    { name: 'Mutated although rejected', purpose: 'final_assessment', acceptance: rule, rubricVersion: 'Rubric V2!' },
+  ];
+  for (const patch of refusals) {
+    const res = await owner.post(setPath, { expectedRevision: 1, ...patch });
+    assert.equal(res.statusCode, 400, JSON.stringify(patch));
+    assert.equal(res.json().code, 'invalid_import');
+    assert.deepEqual((await owner.get(setPath)).json().set, before, `unchanged after ${JSON.stringify(patch)}`);
+  }
+  const applied = await owner.post(setPath, { expectedRevision: 1, name: 'Renamed after review', purpose: 'final_assessment', acceptance: rule, rubricVersion: 'rubric-v2' });
+  assert.equal(applied.statusCode, 200, applied.body);
+  const after = (await owner.get(setPath)).json().set;
+  assert.deepEqual([after.revision, after.name, after.purpose, after.acceptance.minPassRate, after.rubricVersion], [2, 'Renamed after review', 'final_assessment', 0.75, 'rubric-v2']);
+  assert.equal((await owner.post(setPath, { expectedRevision: 1, name: 'Stale' })).statusCode, 409);
+});
+
+test('a conflict does not hide duplicates, and an acknowledgement is tied to the facts that were reviewed', async () => {
+  const { store, owner, ws, project, version, base } = await setup();
+  const source = sourceOf(project, version);
+  // A second frozen version that allows testing, so a source reference can change to another valid source.
+  const second = (await owner.post(`/api/workspaces/${ws.id}/projects`, { name: 'Second policy', task: 'Answer the return policy.', modalities: ['Text'], startingPoint: 'model' })).json().project;
+  await store.updateProject({ workspaceId: ws.id, projectId: second.id, patch: { success: { measure: 'exact', target: 'the cited policy' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'] } } });
+  const secondReview = await store.submitForReview({ workspaceId: ws.id, projectId: second.id, submittedBy: owner.id });
+  await store.decideReview({ reviewId: secondReview.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+  const secondVersion = await store.createDatasetVersion({ workspaceId: ws.id, projectId: second.id, createdBy: owner.id });
+
+  const set = (await owner.post(base, { name: 'Returns', purpose: 'development' })).json().set;
+  const setPath = `${base}/${set.id}`;
+  const state = async () => (await owner.get(setPath)).json();
+  const question = 'Is the synthetic demo kettle returnable?';
+  const imported = await owner.post(`${setPath}/import`, { expectedRevision: set.revision, jsonl: Array.from({ length: 10 }, (_, i) => line({ id: `c${i}`, input: question, expectedAnswer: i < 9 ? 'yes' : 'no', sources: [source] })).join('\n') });
+  assert.equal(imported.statusCode, 200, imported.body);
+  let detail = await state();
+  const duplicate = detail.issues.find((issue) => issue.group === 'duplicate');
+  const conflict = detail.issues.find((issue) => issue.group === 'conflict');
+  assert.deepEqual([duplicate.caseKeys.length, duplicate.acknowledgeable, conflict.caseKeys.length, conflict.acknowledgeable], [9, false, 10, true]);
+  assert.equal((await owner.post(`${setPath}/issues/note`, { expectedRevision: detail.set.revision, key: duplicate.key, note: 'Fine.' })).statusCode, 409);
+  const ack = await owner.post(`${setPath}/issues/note`, { expectedRevision: detail.set.revision, key: conflict.key, note: 'Reviewed the yes/no answers.' });
+  assert.equal(ack.statusCode, 200, ack.body);
+  detail = await state();
+  assert.deepEqual(detail.issues.map((issue) => [issue.group, issue.open]).sort(), [['conflict', false], ['duplicate', true]]);
+  const refused = await owner.post(`${setPath}/freeze`, { expectedRevision: detail.set.revision });
+  assert.equal(refused.statusCode, 409, refused.body);
+  assert.deepEqual([refused.json().code, refused.json().open, (await state()).set.status], ['issues_open', 1, 'draft']);
+
+  // Removing the copies changes the conflict's membership: the earlier note stays on record but no longer applies.
+  for (const row of detail.cases.filter((item) => !['c0', 'c9'].includes(item.caseKey))) {
+    const removed = await owner.post(`${setPath}/cases/${row.id}/delete`, { expectedRevision: (await state()).set.revision });
+    assert.equal(removed.statusCode, 200, removed.body);
+  }
+  const expectOpenConflict = async (label) => {
+    const current = await state();
+    assert.deepEqual(current.issues.filter((issue) => issue.open).map((issue) => [issue.group, issue.note]), [['conflict', null]], label);
+    const blocked = await owner.post(`${setPath}/freeze`, { expectedRevision: current.set.revision });
+    assert.equal(blocked.statusCode, 409, `${label}: ${blocked.body}`);
+    assert.equal(blocked.json().code, 'issues_open', label);
+    const res = await owner.post(`${setPath}/issues/note`, { expectedRevision: current.set.revision, key: current.issues.find((issue) => issue.group === 'conflict').key, note: `Reviewed after ${label}.` });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((await state()).issues.filter((issue) => issue.open).length, 0, label);
+  };
+  const edit = async (caseKey, patch) => {
+    const current = await state();
+    const row = current.cases.find((item) => item.caseKey === caseKey);
+    const res = await owner.post(`${setPath}/cases`, { expectedRevision: current.set.revision, caseId: row.id, case: { ...row, id: caseKey, sources: row.sourceRefs, ...patch } });
+    assert.equal(res.statusCode, 200, res.body);
+  };
+  await expectOpenConflict('the membership change');
+  await edit('c9', { expectedAnswer: 'changed answer never reviewed' });
+  await expectOpenConflict('the answer edit');
+  await edit('c9', { sources: [{ projectId: second.id, versionId: secondVersion.id, fileId: null }] });
+  await expectOpenConflict('the source edit');
+  await edit('c0', { reviewCriteria: 'Name the window.' });
+  await expectOpenConflict('the criteria edit');
+  const added = await owner.post(`${setPath}/cases`, { expectedRevision: (await state()).set.revision, case: { id: 'c10', input: question, expectedAnswer: 'sometimes', sources: [source] } });
+  assert.equal(added.statusCode, 200, added.body);
+  await expectOpenConflict('the new member');
+  await edit('c0', { category: 'returns' });
+  const final = await state();
+  assert.equal(final.issues.filter((issue) => issue.open).length, 0, 'a label that is not a fact about the answer keeps the acknowledgement');
+  assert.ok(final.notes.length >= 6, 'earlier notes stay on record');
+  const frozen = await owner.post(`${setPath}/freeze`, { expectedRevision: final.set.revision });
+  assert.equal(frozen.statusCode, 200, frozen.body);
+  assert.deepEqual([frozen.json().version.qc.open, frozen.json().version.qc.issues.length, frozen.json().version.cases.length], [0, 1, 3]);
+});
+
 test('parallel freezes and identical imports do not create two copies', async () => {
   const { owner, project, version, base } = await setup();
   const source = sourceOf(project, version);

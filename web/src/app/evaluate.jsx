@@ -1,9 +1,9 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useLoaderData, useRevalidator, useSearchParams } from 'react-router';
 import { api } from '../api.js';
 import { requireWorkspace } from './ui.jsx';
 import { WorkspaceShell } from './shell.jsx';
-import { PLANNED, SYNTHETIC_CASES, SYNTHETIC_PREDICTIONS } from '../../../src/lib/eval.js';
+import { PLANNED, SYNTHETIC_CASES, SYNTHETIC_PREDICTIONS } from '../../../src/lib/eval-shared.js';
 
 const TABS = [['cases', 'Cases'], ['quality', 'Quality'], ['comparisons', 'Comparisons']];
 const PURPOSES = [['development', 'Development'], ['final_assessment', 'Final assessment']];
@@ -151,10 +151,10 @@ export function EvalHome() {
       {canWrite && (
         <form className="ob-card" onSubmit={create} aria-busy={pending}>
           <h2>New evaluation set</h2>
-          <div className="ob-field"><label htmlFor="eval-name">Name</label><input id="eval-name" value={name} maxLength={120} required onChange={(e) => setName(e.target.value)} /></div>
+          <div className="ob-field"><label htmlFor="eval-name">Name</label><input id="eval-name" value={name} maxLength={120} required disabled={pending} onChange={(e) => setName(e.target.value)} /></div>
           <div className="ob-field">
             <label htmlFor="eval-purpose">Purpose</label>
-            <select id="eval-purpose" value={purpose} onChange={(e) => setPurpose(e.target.value)}>
+            <select id="eval-purpose" value={purpose} disabled={pending} onChange={(e) => setPurpose(e.target.value)}>
               {PURPOSES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
             </select>
             <span className="ob-muted">This label does not make the set a secret holdout.</span>
@@ -203,6 +203,9 @@ export function EvalSet() {
   const draft = set.status === 'draft';
   const base = `/w/${entry.slug}/projects/${project.id}/evaluate/${set.id}`;
   const testingSources = sources.filter((source) => source.testing);
+  // A rule edit must wait while a save is pending or the loader is refreshing: the rule form is keyed by set.revision,
+  // so a newer revision remounts it and would discard anything typed in between.
+  const busy = pending || revalidator.state !== 'idle';
 
   async function act(fn, pendingLabel, doneLabel) {
     setPending(true); setError(null); setStatus(pendingLabel);
@@ -256,7 +259,7 @@ export function EvalSet() {
               <button className="btn-app" type="submit" disabled={pending || !jsonl.trim()}>{pending ? 'Saving…' : 'Import cases'}</button>
             </form>
           )}
-          <Acceptance key={set.revision} rule={set.acceptance} locked={!canWrite || !draft} pending={pending} onSave={(acceptance) => act(() => api.updateEvaluation(entry.id, project.id, set.id, { expectedRevision: set.revision, acceptance }), 'Saving the rule…', 'Rule saved.')} />
+          <Acceptance key={set.revision} rule={set.acceptance} locked={!canWrite || !draft} pending={pending} busy={busy} onSave={(acceptance) => act(() => api.updateEvaluation(entry.id, project.id, set.id, { expectedRevision: set.revision, acceptance }), 'Saving the rule…', 'Rule saved.')} />
           <div className="ob-row-actions">
             {canApprove && draft && <button type="button" className="btn-app" disabled={pending} onClick={() => act(() => api.freezeEvaluation(entry.id, project.id, set.id, set.revision), 'Freezing this revision…', 'Set frozen.')}>Freeze this revision</button>}
             {canWrite && !draft && <button type="button" className="btn-ghost" disabled={pending} onClick={() => act(() => api.reopenEvaluation(entry.id, project.id, set.id), 'Starting a new draft…', 'New draft started. The frozen version was not changed.')}>Start a new draft</button>}
@@ -330,6 +333,8 @@ function CaseForm({ entry, project, set, sources, pending, act }) {
   const [versionId, setVersionId] = useState(sources[0]?.versionId ?? '');
   const source = sources.find((item) => item.versionId === versionId);
   const [fileId, setFileId] = useState('');
+  // Every control is disabled while the save is pending: a success clears the submitted fields, so text typed during
+  // the wait would otherwise be lost. A refusal re-enables the form with its content intact.
   async function submit(event) {
     event.preventDefault();
     const saved = await act(() => api.saveEvalCase(entry.id, project.id, set.id, {
@@ -346,22 +351,22 @@ function CaseForm({ entry, project, set, sources, pending, act }) {
       <h2>Add a case</h2>
       {sources.length === 0 && <p className="ob-alert">No frozen dataset version in this workspace allows testing. You can save a case, and the quality check will keep it blocked until you cite one.</p>}
       <div className="eval-grid">
-        <div className="ob-field"><label htmlFor="case-id">Case id</label><input id="case-id" value={caseKey} required onChange={(e) => setCaseKey(e.target.value)} /></div>
-        <div className="ob-field"><label htmlFor="case-category">Category</label><input id="case-category" value={category} onChange={(e) => setCategory(e.target.value)} /></div>
+        <div className="ob-field"><label htmlFor="case-id">Case id</label><input id="case-id" value={caseKey} required disabled={pending} onChange={(e) => setCaseKey(e.target.value)} /></div>
+        <div className="ob-field"><label htmlFor="case-category">Category</label><input id="case-category" value={category} disabled={pending} onChange={(e) => setCategory(e.target.value)} /></div>
       </div>
-      <div className="ob-field"><label htmlFor="case-input">Question</label><textarea id="case-input" value={input} required rows={3} onChange={(e) => setInput(e.target.value)} /></div>
-      <div className="ob-field"><label htmlFor="case-expected">Expected answer</label><textarea id="case-expected" value={expectedAnswer} rows={2} onChange={(e) => setExpectedAnswer(e.target.value)} /></div>
-      <div className="ob-field"><label htmlFor="case-criteria">Review criteria</label><textarea id="case-criteria" value={reviewCriteria} rows={2} onChange={(e) => setReviewCriteria(e.target.value)} /></div>
+      <div className="ob-field"><label htmlFor="case-input">Question</label><textarea id="case-input" value={input} required rows={3} disabled={pending} onChange={(e) => setInput(e.target.value)} /></div>
+      <div className="ob-field"><label htmlFor="case-expected">Expected answer</label><textarea id="case-expected" value={expectedAnswer} rows={2} disabled={pending} onChange={(e) => setExpectedAnswer(e.target.value)} /></div>
+      <div className="ob-field"><label htmlFor="case-criteria">Review criteria</label><textarea id="case-criteria" value={reviewCriteria} rows={2} disabled={pending} onChange={(e) => setReviewCriteria(e.target.value)} /></div>
       <div className="eval-grid">
         <div className="ob-field">
           <label htmlFor="case-severity">Severity</label>
-          <select id="case-severity" value={severity} onChange={(e) => setSeverity(e.target.value)}>
+          <select id="case-severity" value={severity} disabled={pending} onChange={(e) => setSeverity(e.target.value)}>
             <option value="">Not set</option><option value="critical">Critical</option><option value="major">Major</option><option value="minor">Minor</option>
           </select>
         </div>
         <div className="ob-field">
           <label htmlFor="case-source">Frozen source</label>
-          <select id="case-source" value={versionId} onChange={(e) => { setVersionId(e.target.value); setFileId(''); }}>
+          <select id="case-source" value={versionId} disabled={pending} onChange={(e) => { setVersionId(e.target.value); setFileId(''); }}>
             <option value="">None</option>
             {sources.map((item) => <option key={item.versionId} value={item.versionId}>{item.projectName} version {item.number}</option>)}
           </select>
@@ -370,7 +375,7 @@ function CaseForm({ entry, project, set, sources, pending, act }) {
       {source?.files?.length > 0 && (
         <div className="ob-field">
           <label htmlFor="case-file">File in that version</label>
-          <select id="case-file" value={fileId} onChange={(e) => setFileId(e.target.value)}>
+          <select id="case-file" value={fileId} disabled={pending} onChange={(e) => setFileId(e.target.value)}>
             <option value="">Whole version</option>
             {source.files.map((file) => <option key={file.id} value={file.id}>{file.filename}</option>)}
           </select>
@@ -381,7 +386,7 @@ function CaseForm({ entry, project, set, sources, pending, act }) {
   );
 }
 
-function Acceptance({ rule, locked, pending, onSave }) {
+function Acceptance({ rule, locked, pending, busy, onSave }) {
   function submit(event) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -397,23 +402,27 @@ function Acceptance({ rule, locked, pending, onSave }) {
     });
   }
   return (
-    <form className="ob-card" onSubmit={submit}>
+    <form className="ob-card" onSubmit={submit} aria-busy={busy}>
       <h2>Acceptance rule</h2>
       <p className="ob-muted">This is the rule the report uses. The sentence on the project is not executed. Exact match is not semantic correctness.</p>
-      <div className="ob-field">
-        <label htmlFor="score-basis">How a case counts</label>
-        <select id="score-basis" name="scoreBasis" disabled={locked} defaultValue={rule.scoreBasis}>
-          {BASES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
-        </select>
-      </div>
-      <div className="eval-grid">
-        <div className="ob-field"><label htmlFor="min-pass">Minimum pass rate</label><input id="min-pass" name="minPassRate" disabled={locked} inputMode="decimal" defaultValue={rule.minPassRate} /></div>
-        <div className="ob-field"><label htmlFor="min-cover">Minimum coverage</label><input id="min-cover" name="minCoverage" disabled={locked} inputMode="decimal" defaultValue={rule.minCoverage} /></div>
-      </div>
-      {[['criticalMustPass', 'Critical cases must pass'], ['requireHumanOnCritical', 'A person must review critical cases'], ['requireHumanOnDisagreement', 'A disagreement stays unresolved until someone adjudicates it'], ['requireHumanWhenNoExpectedAnswer', 'A case with no expected answer needs a person']].map(([key, label]) => (
-        <label key={key} className="ob-option ob-option--row"><input type="checkbox" name={key} disabled={locked} defaultChecked={rule[key] === true} />{label}</label>
-      ))}
-      {!locked && <button className="btn-ghost" type="submit" disabled={pending}>{pending ? 'Saving…' : 'Save rule'}</button>}
+      {/* One fieldset disables every control while the rule is locked, a save is pending or the loader is refreshing.
+          `.ob fieldset` resets its box; the flex column keeps the card's spacing between the fields. */}
+      <fieldset disabled={locked || busy} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div className="ob-field">
+          <label htmlFor="score-basis">How a case counts</label>
+          <select id="score-basis" name="scoreBasis" defaultValue={rule.scoreBasis}>
+            {BASES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+          </select>
+        </div>
+        <div className="eval-grid">
+          <div className="ob-field"><label htmlFor="min-pass">Minimum pass rate</label><input id="min-pass" name="minPassRate" inputMode="decimal" defaultValue={rule.minPassRate} /></div>
+          <div className="ob-field"><label htmlFor="min-cover">Minimum coverage</label><input id="min-cover" name="minCoverage" inputMode="decimal" defaultValue={rule.minCoverage} /></div>
+        </div>
+        {[['criticalMustPass', 'Critical cases must pass'], ['requireHumanOnCritical', 'A person must review critical cases'], ['requireHumanOnDisagreement', 'A disagreement stays unresolved until someone adjudicates it'], ['requireHumanWhenNoExpectedAnswer', 'A case with no expected answer needs a person']].map(([key, label]) => (
+          <label key={key} className="ob-option ob-option--row"><input type="checkbox" name={key} defaultChecked={rule[key] === true} />{label}</label>
+        ))}
+        {!locked && <button className="btn-ghost" type="submit">{pending ? 'Saving…' : 'Save rule'}</button>}
+      </fieldset>
     </form>
   );
 }
@@ -506,18 +515,33 @@ export function EvalReview() {
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState(null);
-  const [notes, setNotes] = useState({});
-  const [sides, setSides] = useState({});
-  const [preview, setPreview] = useState(null);
+  // Unsaved choices, notes and the preview are bound to the comparison revision they were entered under (the revision
+  // shown in the heading). Every save, assignment change and approval names that same revision; nothing advances it
+  // behind the person's back, and a draft entered under another revision is never read, shown or submitted.
+  const key = `${comparison.id}:${comparison.revision}`;
+  const empty = () => ({ key, sides: {}, notes: {}, preview: null });
+  const [draft, setDraft] = useState(empty);
+  const { sides, notes, preview } = draft.key === key ? draft : empty();
+  const patch = (fields) => setDraft((current) => ({ ...(current.key === key ? current : empty()), ...fields }));
+  const setSides = (next) => patch({ sides: next });
+  const setNotes = (next) => patch({ notes: next });
+  const setPreview = (next) => patch({ preview: next });
+  // After this tab's own successful save the next loader revision carries the same assignment, so the draft carries over
+  // to exactly that revision. Any other observed revision (another tab, or a change whose reply never arrived) drops it.
+  const carryRef = useRef(null);
+  useEffect(() => {
+    if (draft.key === key) return;
+    const carried = carryRef.current === key;
+    carryRef.current = null;
+    const hadDraft = Object.keys(draft.sides).length > 0 || Object.keys(draft.notes).length > 0 || draft.preview != null;
+    setDraft(carried ? { ...draft, key } : empty());
+    if (!carried && hadDraft) setStatus(`This comparison moved to revision ${comparison.revision} after those choices were made, for example from another tab or a reply that did not arrive. Unsaved choices, notes and the preview were cleared. Review the current assignment before saving.`);
+  }, [key]);
   const hidden = review.hidden;
+  // Review controls wait while a save or an assignment change is pending or the loader is refreshing: left and right are
+  // view-bound, so a draft choice must not be entered or re-read in the gap before the refreshed assignment is shown.
+  const busy = pending || revalidator.state !== 'idle';
   const back = `/w/${entry.slug}/projects/${project.id}/evaluate/${comparison.setId}?tab=comparisons`;
-  const revisionRef = useRef({ id: comparison.id, revision: comparison.revision });
-  if (revisionRef.current.id !== comparison.id) revisionRef.current = { id: comparison.id, revision: comparison.revision };
-  else if (comparison.revision > revisionRef.current.revision) revisionRef.current.revision = comparison.revision;
-  const remember = (res) => {
-    const next = res?.data?.comparison?.revision;
-    if (Number.isInteger(next)) revisionRef.current.revision = next;
-  };
 
   function valuesFor(row) {
     return sides[row.caseKey] ?? { left: row.left.decision ?? '', right: row.right.decision ?? '', leftAdj: row.left.adjudication ?? '', rightAdj: row.right.adjudication ?? '' };
@@ -528,19 +552,28 @@ export function EvalReview() {
       ? { leftDecision: values.left || null, rightDecision: values.right || null, leftAdjudication: values.leftAdj || null, rightAdjudication: values.rightAdj || null }
       : { baselineDecision: values.left || null, candidateDecision: values.right || null, adjudicationBaseline: values.leftAdj || null, adjudicationCandidate: values.rightAdj || null };
     setPending(true); setError(null); setStatus('Saving the review…');
-    const res = await api.evalJudgment(entry.id, project.id, comparison.id, { expectedRevision: revisionRef.current.revision, caseKey: row.caseKey, note: notes[row.caseKey] ?? row.note ?? '', ...body }).catch(() => null);
+    const res = await api.evalJudgment(entry.id, project.id, comparison.id, { expectedRevision: comparison.revision, caseKey: row.caseKey, note: notes[row.caseKey] ?? row.note ?? '', ...body }).catch(() => null);
     if (!res?.ok) { setPending(false); setStatus(''); setError(failed(res)); return; }
-    remember(res);
+    // The saved judgment moves the comparison on without changing the assignment: the other unsaved choices carry over to
+    // exactly the revision the server reports, while a preview fetched before it is no longer the decision an approval
+    // would freeze, so it is dropped and must be opened again. The server stays authoritative.
+    const next = res.data?.comparison?.revision;
+    carryRef.current = Number.isInteger(next) ? `${comparison.id}:${next}` : null;
+    setPreview(null);
     setStatus('Review saved.');
     await revalidator.revalidate();
     setPending(false);
   }
   async function blind(body, label) {
     setPending(true); setError(null); setStatus(label);
-    const res = await api.evalBlind(entry.id, project.id, comparison.id, { expectedRevision: revisionRef.current.revision, ...body }).catch(() => null);
+    const res = await api.evalBlind(entry.id, project.id, comparison.id, { expectedRevision: comparison.revision, ...body }).catch(() => null);
     if (!res?.ok) { setPending(false); setStatus(''); setError(failed(res)); return; }
-    remember(res);
-    setStatus('Assignment saved.');
+    // The saved assignment changed, so unsaved left/right choices, view-bound notes and the preview would now describe
+    // different answers. They are dropped, never remapped or saved; a refused change above keeps them as they were.
+    const hadDraft = Object.keys(sides).length > 0 || Object.keys(notes).length > 0 || preview != null;
+    carryRef.current = null;
+    setDraft(empty());
+    setStatus(hadDraft ? 'Assignment saved. Unsaved choices, notes and the preview were cleared because left and right may now be different answers.' : 'Assignment saved.');
     await revalidator.revalidate();
     setPending(false);
   }
@@ -554,7 +587,7 @@ export function EvalReview() {
   async function approve() {
     if (!preview) return;
     setPending(true); setError(null); setStatus('Approving the report…');
-    const res = await api.approveEvalReport(entry.id, project.id, comparison.id, { expectedRevision: revisionRef.current.revision, contentHash: preview.contentHash }).catch(() => null);
+    const res = await api.approveEvalReport(entry.id, project.id, comparison.id, { expectedRevision: comparison.revision, contentHash: preview.contentHash }).catch(() => null);
     setPending(false);
     if (!res?.ok) { setStatus(''); setError(failed(res)); return; }
     setStatus('Report approved.');
@@ -574,8 +607,8 @@ export function EvalReview() {
       <Summary summary={summary} />
       {canWrite && (
         <div className="ob-row-actions">
-          <button type="button" className="btn-ghost" disabled={pending} onClick={() => blind({ hideIdentity: !hidden, swap: false }, 'Saving the review mode…')}>{hidden ? 'Show system names' : 'Hide system names'}</button>
-          <button type="button" className="btn-ghost" disabled={pending || !hidden} onClick={() => blind({ hideIdentity: true, randomize: true }, 'Randomizing left and right…')}>Randomize left and right</button>
+          <button type="button" className="btn-ghost" disabled={busy} onClick={() => blind({ hideIdentity: !hidden, swap: false }, 'Saving the review mode…')}>{hidden ? 'Show system names' : 'Hide system names'}</button>
+          <button type="button" className="btn-ghost" disabled={busy || !hidden} onClick={() => blind({ hideIdentity: true, randomize: true }, 'Randomizing left and right…')}>Randomize left and right</button>
         </div>
       )}
       {review.cases.map((row) => {
@@ -585,13 +618,15 @@ export function EvalReview() {
             <h2>{row.caseKey}{row.severity === 'critical' ? ' · critical' : ''}</h2>
             <p>{row.input}</p>
             <p className="ob-muted">Expected: {row.expectedAnswer ?? 'none'}. Criteria: {row.reviewCriteria ?? 'none'}. Category: {row.category ?? 'none'}.</p>
-            <div className="eval-grid">
-              <Side title={leftTitle} side={row.left} hidden={hidden} prefix={`${row.caseKey}-left`} values={{ decision: values.left, adjudication: values.leftAdj }} setValues={(next) => setSides({ ...sides, [row.caseKey]: { ...values, left: next.decision, leftAdj: next.adjudication } })} />
-              <Side title={rightTitle} side={row.right} hidden={hidden} prefix={`${row.caseKey}-right`} values={{ decision: values.right, adjudication: values.rightAdj }} setValues={(next) => setSides({ ...sides, [row.caseKey]: { ...values, right: next.decision, rightAdj: next.adjudication } })} />
-            </div>
-            <label htmlFor={`note-${row.caseKey}`}>Review note</label>
-            <textarea id={`note-${row.caseKey}`} value={notes[row.caseKey] ?? row.note ?? ''} onChange={(e) => setNotes({ ...notes, [row.caseKey]: e.target.value })} rows={2} />
-            {canWrite && <button type="button" className="btn-app" disabled={pending} onClick={() => save(row)}>{pending ? 'Saving…' : 'Save review'}</button>}
+            <fieldset disabled={busy} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div className="eval-grid">
+                <Side title={leftTitle} side={row.left} hidden={hidden} prefix={`${row.caseKey}-left`} values={{ decision: values.left, adjudication: values.leftAdj }} setValues={(next) => setSides({ ...sides, [row.caseKey]: { ...values, left: next.decision, leftAdj: next.adjudication } })} />
+                <Side title={rightTitle} side={row.right} hidden={hidden} prefix={`${row.caseKey}-right`} values={{ decision: values.right, adjudication: values.rightAdj }} setValues={(next) => setSides({ ...sides, [row.caseKey]: { ...values, right: next.decision, rightAdj: next.adjudication } })} />
+              </div>
+              <label htmlFor={`note-${row.caseKey}`}>Review note</label>
+              <textarea id={`note-${row.caseKey}`} value={notes[row.caseKey] ?? row.note ?? ''} onChange={(e) => setNotes({ ...notes, [row.caseKey]: e.target.value })} rows={2} />
+              {canWrite && <button type="button" className="btn-app" onClick={() => save(row)}>{pending ? 'Saving…' : 'Save review'}</button>}
+            </fieldset>
           </article>
         );
       })}
@@ -599,11 +634,11 @@ export function EvalReview() {
         <section className="ob-card">
           <h2>Approve the report</h2>
           <p>Open the preview to see the system names and the exact decision. Approving a fail or an insufficient-evidence result freezes that result. It is not a certification.</p>
-          <button type="button" className="btn-ghost" disabled={pending} onClick={reveal}>Preview the decision with system names</button>
+          <button type="button" className="btn-ghost" disabled={busy} onClick={reveal}>Preview the decision with system names</button>
           {preview && (
             <>
               <p>Decision: {preview.snapshot.decision.result}. Hash {preview.contentHash.slice(0, 12)}… Baseline {preview.baseline.label}. Candidate {preview.candidate.label}. Left is {preview.assignment.swap ? 'the candidate' : 'the baseline'}.</p>
-              <button type="button" className="btn-app" disabled={pending} onClick={approve}>{pending ? 'Approving…' : 'Approve this report'}</button>
+              <button type="button" className="btn-app" disabled={busy} onClick={approve}>{pending ? 'Approving…' : 'Approve this report'}</button>
             </>
           )}
         </section>
