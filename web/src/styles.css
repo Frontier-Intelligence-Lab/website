@@ -958,6 +958,8 @@ th:has(> .sr-only) { position: relative; }
 .agt-steps > li > div { gap: 4px; }
 .agt-steps code, .ob-card .agt-question code { overflow-wrap: anywhere; }
 
+/* Compute: the jobs table keeps when, what and status on phones. */
+@media (max-width: 600px) { .cmp-wide { display: none; } }
 /* Evaluation */
 .eval-stack { display: flex; flex-direction: column; gap: 16px; }
 .eval-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
