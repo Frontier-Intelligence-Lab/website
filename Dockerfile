@@ -4,7 +4,8 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY vite.config.js ./
 COPY web ./web
-COPY src/lib/onboarding.js src/lib/models.js src/lib/devices.js src/lib/capital.js ./src/lib/
+# Only the pure, browser-safe modules the web bundle imports: no config, secrets or runtime code.
+COPY src/lib/onboarding.js src/lib/models.js src/lib/devices.js src/lib/capital.js src/lib/eval-shared.js ./src/lib/
 RUN npm run build
 
 FROM node:24-alpine AS deps
