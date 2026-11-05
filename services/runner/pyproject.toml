@@ -1,0 +1,14 @@
+[project]
+name = "valcairn-runner"
+version = "0.1.0"
+description = "Runs Valcairn jobs on your own machine: sandboxed, GPU-aware, with native Ollama."
+requires-python = ">=3.11"
+# Standard library only: HTTP through urllib, the sandbox through the docker CLI, GPUs through nvidia-smi.
+dependencies = []
+
+[project.scripts]
+valcairn-runner = "valcairn_runner.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
