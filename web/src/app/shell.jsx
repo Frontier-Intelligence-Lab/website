@@ -79,6 +79,7 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
                   {label}{id === 'resolve' && openIssues > 0 && <span className="ob-badge tile--orange">{openIssues}</span>}
                 </Link>
               ))}
+              {project.startingPoint !== 'unsure' && <Link to={`${projectBase}/evaluate`} aria-current={current === 'evaluate' ? 'page' : undefined}>Evaluate</Link>}
             </div>
           )}
           <Link to={`/w/${entry.slug}/models`} title="Models"><Tile icon="layers" tone="blue" size="sm" /><span className="ob-side-label">Models</span></Link>

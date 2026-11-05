@@ -63,6 +63,7 @@ function accountRoutes() {
   const capital = () => import('./app/capital.jsx');
   const agents = () => import('./app/agents.jsx');
   const compute = () => import('./app/compute.jsx');
+  const evaluate = () => import('./app/evaluate.jsx');
   return [
     { path: '/signup', lazy: page(auth, 'SignUp', 'signUpLoader') },
     { path: '/signin', lazy: page(auth, 'SignIn', 'signInLoader') },
@@ -76,6 +77,10 @@ function accountRoutes() {
     { path: '/w/:slug/setup/team', lazy: page(org, 'OrgTeam', 'teamLoader') },
     { path: '/w/:slug/projects/new', lazy: page(project, 'ProjectGoal', 'goalLoader') },
     { path: '/w/:slug/projects/:projectId', lazy: page(project, 'ProjectHome', 'projectHomeLoader') },
+    { path: '/w/:slug/projects/:projectId/evaluate', lazy: page(evaluate, 'EvalHome', 'evalHomeLoader'), HydrateFallback: Loading, ErrorBoundary: RouteError },
+    { path: '/w/:slug/projects/:projectId/evaluate/:setId', lazy: page(evaluate, 'EvalSet', 'evalSetLoader'), HydrateFallback: Loading, ErrorBoundary: RouteError },
+    { path: '/w/:slug/projects/:projectId/evaluate/:setId/review/:comparisonId', lazy: page(evaluate, 'EvalReview', 'evalReviewLoader'), HydrateFallback: Loading, ErrorBoundary: RouteError },
+    { path: '/w/:slug/projects/:projectId/evaluate/:setId/reports/:reportId', lazy: page(evaluate, 'EvalReport', 'evalReportLoader'), HydrateFallback: Loading, ErrorBoundary: RouteError },
     { path: '/w/:slug/projects/:projectId/success', lazy: page(project, 'ProjectSuccess', 'successLoader') },
     { path: '/w/:slug/projects/:projectId/data', lazy: page(project, 'ProjectData', 'dataLoader') },
     { path: '/w/:slug/projects/:projectId/model', lazy: page(project, 'ProjectModel', 'modelLoader') },
