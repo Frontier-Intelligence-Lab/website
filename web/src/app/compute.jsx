@@ -1,17 +1,13 @@
 import { Component, useCallback, useEffect, useRef, useState } from 'react';
-import { useLoaderData } from 'react-router';
+import { useLoaderData, useSearchParams } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
-import { fix, hash, isNum, list, mb, obj, pct, txt } from './job-format.js';
+import { FINISHED, KIND, STATUS, TONE, fix, hash, isNum, list, mb, obj, pct, runnerOnline, runnerState, txt, when } from './job-format.js';
 import { attempt, createDetailLoader } from './job-detail.js';
+import { JOB_WINDOW, jobParam, jobSearch } from './plan-jobs.js';
 
 const MANAGERS = ['owner', 'admin'];
-const ONLINE_MS = 90_000;
-const FINISHED = ['succeeded', 'failed', 'cancelled'];
-const KIND = { probe: 'Sandbox check', train: 'Training', evaluate: 'Evaluation', export: 'Export' };
-const STATUS = { queued: 'Waiting for the runner', leased: 'Starting', running: 'Running', cancel_requested: 'Stopping', succeeded: 'Succeeded', failed: 'Failed', cancelled: 'Cancelled' };
-const TONE = { succeeded: 'tile--green', failed: 'tile--orange', running: 'tile--blue', leased: 'tile--blue', cancel_requested: 'tile--violet' };
 const FAILURE = {
   cancelled: 'Cancelled.', sandbox_unavailable: 'Docker is not running on the runner.', sandbox_error: 'The sandbox stopped with an error.',
   out_of_memory: 'The runner ran out of memory.', disk_full: 'The runner’s disk is full.', dataset_error: 'The dataset could not be read.',
@@ -19,9 +15,6 @@ const FAILURE = {
   timeout: 'The job ran past its time limit.', unsupported: 'This runner version cannot run this kind of job yet.',
   lease_expired: 'The runner stopped responding, three times.', runner_revoked: 'The runner was disconnected while it held the job.',
 };
-const when = (iso) => (iso ? new Date(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—');
-const online = (r) => r.status === 'active' && r.lastSeenAt && Date.now() - new Date(r.lastSeenAt).getTime() < ONLINE_MS;
-
 export async function computeLoader({ params }) {
   const { account, entry } = await requireWorkspace(params.slug);
   const [{ runners }, { jobs }, models] = await Promise.all([api.runners(entry.id), api.jobs(entry.id), api.models(entry.id)]);
@@ -31,10 +24,21 @@ export async function computeLoader({ params }) {
 }
 
 export function Compute() {
-  const { account, entry, runners: initialRunners, jobs: initialJobs, plans, catalog } = useLoaderData();
+  const data = useLoaderData();
+  // Keyed by workspace: moving to another workspace's Compute page (or back to it) remounts everything below, so no
+  // runner, job or open job detail of the previous workspace stays on screen or receives a late answer.
+  return <ComputeBody key={data.entry.id} {...data} />;
+}
+
+function ComputeBody({ account, entry, runners: initialRunners, jobs: initialJobs, plans, catalog }) {
   const [runners, setRunners] = useState(initialRunners);
   const [jobs, setJobs] = useState(initialJobs);
-  const [open, setOpen] = useState(null);
+  const [params, setParams] = useSearchParams();
+  // The open job detail is the `?job=` query: a link from a plan's page opens that one job (listed above or not),
+  // Back and Forward move between details, and closing clears it. The value only ever goes to this workspace's own
+  // job endpoint, which answers 404 for anything it does not hold; nothing else is opened in its place.
+  const { id: open, invalid } = jobParam(params);
+  const setOpen = (id) => setParams(jobSearch(id));
   const [notice, setNotice] = useState(null);
   const manager = MANAGERS.includes(entry.role);
 
@@ -79,7 +83,7 @@ export function Compute() {
       {manager ? <LinkCard workspaceId={entry.id} onLinked={refresh} /> : <p className="ob-muted">Owners and admins link runners and start jobs. You can see them here.</p>}
       {manager && plans.length > 0 && <PlansCard plans={plans} catalog={catalog} runners={active} onStart={(runner, plan) => queue(runner, { kind: 'train', enhanceRunId: plan.id }, `Training “${plan.name}”`)} />}
       <RunnersCard runners={runners} manager={manager} onProbe={queueProbe} workspaceId={entry.id} onChange={refresh} />
-      <JobsCard jobs={jobs} runners={runners} manager={manager} workspaceId={entry.id} open={open} setOpen={setOpen} onChange={refresh} hasRunner={active.length > 0} />
+      <JobsCard jobs={jobs} runners={runners} manager={manager} workspaceId={entry.id} open={open} invalid={invalid} setOpen={setOpen} onChange={refresh} hasRunner={active.length > 0} />
     </WorkspaceShell>
   );
 }
@@ -183,8 +187,9 @@ function LossChart({ points }) {
 function RunnersCard({ runners, manager, onProbe, workspaceId, onChange }) {
   return (
     <section className="ob-card" aria-labelledby="runners-h">
-      <div className="row-between"><h2 id="runners-h">Runners</h2><span className="ob-muted" style={{ fontSize: 12 }}>Reported by each runner</span></div>
-      {runners.length === 0 ? <p className="ob-muted">No runners yet. Link a machine above, then start the runner on it.</p> : runners.map((r) => <RunnerRow key={r.id} runner={r} manager={manager} onProbe={onProbe} workspaceId={workspaceId} onChange={onChange} />)}
+      <div className="row-between"><h2 id="runners-h">Runners</h2><span className="ob-muted" style={{ fontSize: 12 }}>Machine reports, sent between jobs</span></div>
+      {runners.length === 0 ? <p className="ob-muted">No runners yet. Link a machine above, then start the runner on it.</p> : <p className="ob-muted" style={{ fontSize: 12.5 }}>A runner reports its machine between jobs. While it runs a job, only that job’s events show it is alive, so an old report does not mean the machine is off.</p>}
+      {runners.map((r) => <RunnerRow key={r.id} runner={r} manager={manager} onProbe={onProbe} workspaceId={workspaceId} onChange={onChange} />)}
     </section>
   );
 }
@@ -194,7 +199,7 @@ function RunnerRow({ runner: r, manager, onProbe, workspaceId, onChange }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(null);
   const caps = r.capabilities ?? {};
-  const state = r.status === 'revoked' ? 'Disconnected' : online(r) ? 'Online' : r.lastSeenAt ? `Offline · last seen ${when(r.lastSeenAt)}` : 'Waiting for the runner to start';
+  const state = runnerState(r);
   // Disconnecting is an authority action: a failed request must not look like a disconnect. The confirmation stays
   // open with the reason, the list is refreshed either way so the row shows the runner's real state, and the
   // person decides whether to try again.
@@ -212,7 +217,7 @@ function RunnerRow({ runner: r, manager, onProbe, workspaceId, onChange }) {
       <div className="row-between" style={{ flexWrap: 'wrap', gap: 10 }}>
         <div className="cell-stack">
           <strong>{r.label}</strong>
-          <span className="ob-muted" style={{ fontSize: 13 }}><span className={`ob-badge ${online(r) ? 'tile--green' : ''}`}>{state}</span> · key <code>{r.keyPrefix}…</code></span>
+          <span className="ob-muted" style={{ fontSize: 13 }}><span className={`ob-badge ${runnerOnline(r) ? 'tile--green' : ''}`}>{state}</span> · key <code>{r.keyPrefix}…</code></span>
         </div>
         {manager && r.status === 'active' && (
           <div className="row-wrap gap-10">
@@ -241,11 +246,12 @@ function RunnerRow({ runner: r, manager, onProbe, workspaceId, onChange }) {
   );
 }
 
-function JobsCard({ jobs, runners, manager, workspaceId, open, setOpen, onChange, hasRunner }) {
+function JobsCard({ jobs, runners, manager, workspaceId, open, invalid, setOpen, onChange, hasRunner }) {
   const label = (id) => runners.find((r) => r.id === id)?.label ?? 'Runner';
+  const close = <button type="button" className="btn-text" onClick={() => setOpen(null)}>Close</button>;
   return (
     <section className="ob-card" aria-labelledby="jobs-h">
-      <div className="row-between"><h2 id="jobs-h">Jobs</h2><span className="ob-muted" style={{ fontSize: 12 }}>Latest 50</span></div>
+      <div className="row-between"><h2 id="jobs-h">Jobs</h2><span className="ob-muted" style={{ fontSize: 12 }}>Latest {JOB_WINDOW}</span></div>
       {jobs.length === 0 ? <p className="ob-muted">{hasRunner ? 'No jobs yet. Run a sandbox check on a runner to see one.' : 'Jobs appear here once a runner is linked.'}</p> : (
         <div className="ob-table-wrap">
           <table>
@@ -265,6 +271,8 @@ function JobsCard({ jobs, runners, manager, workspaceId, open, setOpen, onChange
           </table>
         </div>
       )}
+      {invalid && <p className="ob-alert" role="alert">The job named in this link is not a job id, so nothing was looked up. {close}</p>}
+      {open && !jobs.some((j) => j.id === open) && <p className="ob-muted" role="status">Opened from a link: this job is not among the latest {JOB_WINDOW} listed above. {close}</p>}
       {open && <JobDetail key={open} workspaceId={workspaceId} jobId={open} manager={manager} onChange={onChange} onOpen={setOpen} />}
     </section>
   );
@@ -368,7 +376,7 @@ function JobDetailBody({ workspaceId, jobId, manager, onChange, onOpen }) {
       {manager && job.kind === 'train' && job.status === 'succeeded' && hash(adapter.sha256) !== '—' && <button type="button" className="btn-app" onClick={exportRun} disabled={pending} style={{ alignSelf: 'flex-start' }}>Export to Ollama on this runner</button>}
       {job.kind === 'export' && job.status === 'succeeded' && (
         <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label="Export">
-          <div className="dev-fact"><dt>In Ollama as</dt><dd><code>{txt(result.ollamaModel, 120)}</code></dd></div>
+          <div className="dev-fact"><dt>Exported to Ollama as</dt><dd><code>{txt(result.ollamaModel, 120)}</code></dd></div>
           <div className="dev-fact"><dt>GGUF</dt><dd><code>{hash(gguf.sha256)}</code> · {txt(gguf.quantization, 20)} · {mb(gguf.sizeBytes)}</dd></div>
           <div className="dev-fact"><dt>Speed, tuned</dt><dd>{fix(obj(load.tuned).tokensPerSec, 1)} tok/s</dd></div>
           <div className="dev-fact"><dt>Speed, base</dt><dd>{isNum(obj(load.base).tokensPerSec) ? `${fix(load.base.tokensPerSec, 1)} tok/s (${txt(load.base.model, 120)})` : 'Not measured'}</dd></div>

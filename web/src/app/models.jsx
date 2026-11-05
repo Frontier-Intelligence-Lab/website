@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useLoaderData, useLocation, useNavigate, useParams, useRevalidator, useSearchParams } from 'react-router';
 import { api } from '../api.js';
 import { MAX_RUN_DATASETS } from '../../../src/lib/models.js';
 import { FieldError, Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
+import { JOB_WINDOW, computeJobPath, createJobsLoader, execution, exportSummary, jobRow, jobWindow, planJobs, planState, trainingSummary, weightsState } from './plan-jobs.js';
 
 // Memory bars show approximate weight sizes against one 80 GB H100; runtime and training need more than the weights.
 const GPU_GB = 80;
@@ -401,7 +402,7 @@ export function EnhanceRuns() {
 export function EnhanceRun() {
   const { account, entry, options, run } = useLoaderData();
   const role = entry.role;
-  if (run?.status === 'requested') return <RequestedRun account={account} entry={entry} role={role} options={options} run={run} />;
+  if (run?.status === 'requested') return <RequestedRun key={run.id} account={account} entry={entry} role={role} options={options} run={run} />;
   return <RunPlan key={run?.id ?? 'new'} account={account} entry={entry} role={role} options={options} run={run} />;
 }
 
@@ -590,7 +591,7 @@ function RunPlan({ account, entry, role, options, run }) {
               <span id="cap-help" className="ob-muted" style={{ fontSize: 12.5 }}>An approved planning limit. Enforcing it during a run (reservation, metering, stopping at the cap) is planned.</span>
             </div>
             <dl className="ds-dl">
-              <dt>Planned outputs</dt><dd>Weights after every step, saved to {entry.name} storage once runs exist</dd>
+              <dt>Outputs</dt><dd>A LoRA adapter on the runner that fine-tunes it, exportable to Ollama there. Copying weights into {entry.name} storage is planned.</dd>
               <dt>Planned training data</dt><dd>Only the dataset versions you choose above</dd>
             </dl>
             {status.error && <p className="ob-alert" role="alert">{status.error}</p>}
@@ -606,11 +607,50 @@ function RunPlan({ account, entry, role, options, run }) {
   );
 }
 
+// The only step a runner runs today (Compute: "Fine-tuning (LoRA)"), so a plan's training jobs are its runs. The other
+// steps are planned, and nothing stands in for them.
+const TRAINED_STEP = 'sft';
+
+// Reads the workspace's jobs for one plan and polls while one of its jobs can still change (plan-jobs.js). RequestedRun
+// is keyed by plan, so a plan never shows another plan's rows, and a late answer is dropped with the old loader.
+// `refresh` runs the same guarded load by hand: polling stops once nothing of this plan is unfinished, so a job
+// queued from another tab shows up only on a refresh or a new visit.
+function usePlanJobs(workspaceId, runId) {
+  const [state, setState] = useState({ jobs: null, error: null, pending: false });
+  const loader = useRef(null);
+  useEffect(() => {
+    const l = createJobsLoader({ fetchJobs: () => api.jobs(workspaceId), live: (jobs) => execution(planJobs(jobs, runId)).live, onState: setState });
+    loader.current = l;
+    l.load();
+    return () => { l.stop(); loader.current = null; };
+  }, [workspaceId, runId]);
+  return { ...state, refresh: () => loader.current?.load() };
+}
+
+function Facts({ rows, label }) {
+  return (
+    <dl className="dev-facts" style={{ display: 'grid', gap: 8 }} aria-label={label}>
+      {rows.map(([k, v]) => <div key={k} className="dev-fact"><dt>{k}</dt><dd>{v}</dd></div>)}
+    </dl>
+  );
+}
+
 function RequestedRun({ account, entry, role, options, run }) {
   const { catalog, methods, compute, datasets: eligible } = options;
   const model = catalog.find((m) => m.id === run.baseModelId);
   const where = compute.find((c) => c.id === run.compute);
   const datasetName = (d) => eligible.find((e) => e.projectId === d.projectId && e.version === d.version)?.projectName ?? 'Dataset';
+  // The plan is frozen; what has happened to it is read from the workspace's job records. Until a list has loaded
+  // (`checked`) nothing is claimed about what has or has not run.
+  const { jobs, error, pending, refresh } = usePlanJobs(entry.id, run.id);
+  const checked = jobs !== null;
+  const ex = execution(checked ? planJobs(jobs, run.id) : []);
+  const listed = jobWindow(jobs);
+  const onRunner = run.compute === 'runner';
+  // Absence is claimed only as far as the listed window reaches (plan-jobs.js).
+  const state = planState({ checked, error, ex, listed });
+  const weights = weightsState({ checked, ex, listed });
+  const stepState = (id) => (id === TRAINED_STEP ? state.training : 'Planned');
   return (
     <WorkspaceShell account={account} entry={entry} role={role} title={run.name} current="models-runs">
       <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
@@ -618,19 +658,18 @@ function RequestedRun({ account, entry, role, options, run }) {
           <Link className="ob-eyebrow" to={`/w/${entry.slug}/models/runs`}>Models · Enhance runs</Link>
           <h1 className="ob-h1">{run.name}</h1>
           <p className="ob-lede">Planned enhancement of {modelLabel(catalog, run.baseModelId)} on {plural(run.datasets.length, 'dataset version')}. Requested {date(run.requestedAt)} with a ${run.spendCapUsd.toLocaleString('en-US')} planning limit.</p>
-          <div className="ob-chips" style={{ gap: 6 }}><span className="ob-badge tile--orange">Requested · waiting for Valcairn</span><span className="ob-badge">Plan frozen</span></div>
+          <div className="ob-chips" style={{ gap: 6 }}><span className={`ob-badge ${state.tone}`}>{state.badge}</span><span className="ob-badge">Plan frozen</span></div>
         </div>
       </div>
-      <p className="ob-alert ob-alert--info" role="note">This is an approved plan, not a running job. A runner linked to the workspace can take its fine-tuning and export jobs; hosted GPU quotes, booking, metering and charges are planned, and only the fine-tuning step runs today.</p>
+      <p className="ob-alert ob-alert--info" role="note">This is an approved plan, not a running job. What has run for it is read below from the workspace’s job records. A runner linked to the workspace can take its fine-tuning and export jobs; hosted GPU quotes, booking, metering and charges are planned, and only the fine-tuning step runs today.</p>
 
       <section className="ob-card mdl-progress">
         {run.steps.map((s, i) => {
           const m = methods.find((x) => x.id === s);
           return (
             <div key={s} className="cell-stack" style={{ gap: 10 }}>
-              <div className="row-between" style={{ justifyContent: 'flex-start', gap: 10 }}><span className="ob-num">{i + 1}</span><strong>{m.name}</strong><span className="ob-muted" style={{ marginLeft: 'auto', fontSize: 12.5 }}>Waiting</span></div>
-              <span className="mdl-meter" aria-hidden="true"><span style={{ width: 0 }} /></span>
-              <span className="ob-muted" style={{ fontSize: 12.5 }}>{m.settings}</span>
+              <div className="row-between" style={{ justifyContent: 'flex-start', gap: 10 }}><span className="ob-num">{i + 1}</span><strong>{m?.name ?? s}</strong><span className="ob-muted" style={{ marginLeft: 'auto', fontSize: 12.5 }}>{stepState(s)}</span></div>
+              <span className="ob-muted" style={{ fontSize: 12.5 }}>{m?.settings}</span>
             </div>
           );
         })}
@@ -639,12 +678,55 @@ function RequestedRun({ account, entry, role, options, run }) {
       <div className="ds-split">
         <div className="ds-main">
           <section className="ob-card">
-            <h2>Training progress</h2>
-            <p className="ob-muted">Loss and reward curves appear here once the run starts.</p>
+            <div className="row-between" style={{ flexWrap: 'wrap', gap: 10 }}>
+              <h2>Jobs for this plan</h2>
+              <span style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                <span className="ob-muted" style={{ fontSize: 12 }}>{checked ? `${plural(ex.jobs.length, 'listed job')} among` : 'From'} the workspace’s latest {JOB_WINDOW} jobs</span>
+                <button type="button" className="btn-text" onClick={refresh} disabled={pending} aria-describedby="plan-jobs-refresh-help">{pending ? 'Refreshing…' : 'Refresh jobs'}</button>
+              </span>
+            </div>
+            {error && <p className="ob-alert" role="alert">{checked ? 'The job list could not be refreshed' : 'The job list could not be loaded'}: {error} <button type="button" className="btn-text" onClick={refresh} disabled={pending}>Retry</button></p>}
+            {!checked && !error && <p className="ob-muted" role="status">Checking the workspace’s jobs…</p>}
+            {checked && ex.jobs.length === 0 && (
+              <p className="ob-muted">
+                {listed.complete ? `No job has been queued for this plan; all ${plural(listed.listed, 'job')} of this workspace were checked.` : `No job for this plan among the workspace’s latest ${JOB_WINDOW} jobs; older jobs are not listed here.`}{' '}
+                {onRunner ? <>An owner or admin starts its fine-tuning from <Link to={`/w/${entry.slug}/compute`}>Compute</Link>.</> : 'This plan is set to a GPU provider, which is planned; only a plan set to a linked runner can be started today.'}
+              </p>
+            )}
+            {checked && ex.jobs.length > 0 && (
+              <>
+                <ul className="ob-list mdl-list">
+                  {ex.jobs.map(jobRow).map((j, i) => (
+                    <li key={j.id ?? i}>
+                      <Tile icon="panel" tone="teal" size="sm" />
+                      <div><strong>{j.kind}</strong><span className="ob-muted">queued {j.queued}{j.attempt ? ` · ${j.attempt}` : ''}</span></div>
+                      <span className={`ob-badge ${j.tone}`}>{j.status}</span>
+                      {j.id ? <Link className="btn-ghost" to={computeJobPath(entry.slug, j.id)}>Details</Link> : <span className="ob-muted" style={{ fontSize: 12.5 }}>No record id</span>}
+                    </li>
+                  ))}
+                </ul>
+                {!listed.complete && <p className="ob-muted" style={{ fontSize: 12.5 }}>Only jobs among the workspace’s latest {JOB_WINDOW} are listed; older jobs of this plan are not shown here.</p>}
+                {ex.trained && (
+                  <>
+                    <h3 style={{ fontSize: 14 }}>Latest successful training</h3>
+                    <Facts rows={trainingSummary(ex.trained.result)} label="Training result, reported by the runner" />
+                    <p className="ob-muted" style={{ fontSize: 12 }}>Measured and reported by the runner on held-out examples from this dataset; it does not show general model quality. <Link to={computeJobPath(entry.slug, ex.trained.id)}>Open the job</Link> for its loss curve and events.</p>
+                  </>
+                )}
+              </>
+            )}
+            <p id="plan-jobs-refresh-help" className="ob-muted" style={{ fontSize: 12 }}>The list refreshes on its own only while a job of this plan is unfinished. After starting one from Compute, or from another tab, use Refresh jobs.</p>
           </section>
           <section className="ob-card">
-            <h2>Saved weights</h2>
-            <p className="ob-muted">Each step saves its weights to your storage as it finishes. Nothing has been saved yet.</p>
+            <h2>Weights and exports</h2>
+            <p className="ob-muted">Nothing is copied into workspace storage: that, and downloading weights from here, is planned. A successful fine-tuning job leaves its LoRA adapter on the runner that trained it, and an export job writes a GGUF into Ollama on that same runner.</p>
+            {ex.exported && (
+              <>
+                <Facts rows={exportSummary(ex.exported.result)} label="Export, as the runner reported it" />
+                <p className="ob-muted" style={{ fontSize: 12 }}>Latest successful export, as the runner reported it at the time: the model was exported to Ollama on that runner. Whether it is still there, or loaded, is not checked by Valcairn. <Link to={computeJobPath(entry.slug, ex.exported.id)}>Open the export job</Link>.</p>
+              </>
+            )}
+            {weights && <p className="ob-muted">{weights}</p>}
           </section>
         </div>
         <aside className="ds-side">
