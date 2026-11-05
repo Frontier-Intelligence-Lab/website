@@ -10,7 +10,8 @@
 // and a note saying no person reviewed it. Nothing here is real customer data.
 //
 // It writes only to a disposable local database: DATABASE_URL is required (it never falls back to the in-memory store,
-// which would lose the data), its host must be loopback, and the database name must contain "demo", "test" or "qa".
+// which would lose the data), its host must be loopback, the database name must contain "demo", "test" or "qa", it
+// may carry no ?options or #fragment (user:password@host:port/name only), and NODE_PG_FORCE_NATIVE must be unset.
 // Pass --disposable-db to confirm that database may receive synthetic rows. NODE_ENV is not what decides this.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -24,12 +25,20 @@ const arg = (name) => { const i = process.argv.indexOf(name); return i > 0 ? pro
 const modelId = arg('--model');
 const objects = arg('--objects') ? resolve(arg('--objects')) : null;
 const fail = (message) => { console.error(message); process.exit(2); };
-// Checked before anything is created or written, including the object store.
+// Checked before anything is created or written, including the object store. The string is handed to pg exactly as
+// it is here, so it must carry nothing the driver could read as another destination: the installed connection-string
+// parser takes ?host= (a name, or %2F... for a Unix socket), ?port= and ?user= over the authority, and the last of a
+// repeated key wins. With no options, a loopback host in the authority and the database in the path, PGHOST and
+// PGDATABASE never apply (the driver only reads them when the URL leaves host or path empty); PGPORT can only pick
+// another loopback port when the URL names none. ?hostaddr=, ?dbname= and ?service= are ignored by this pure-JS
+// driver, but they are refused all the same rather than relied on. These facts hold for the pure-JS driver only, so
+// the native backend is refused below before pg can load.
 export function disposableDatabase(url) {
   if (!url) return 'Set DATABASE_URL to a disposable local database. The seed never uses the in-memory store.';
   let u;
   try { u = new URL(url); } catch { return 'DATABASE_URL is not a valid URL.'; }
   if (!['postgres:', 'postgresql:'].includes(u.protocol)) return 'DATABASE_URL must be a postgres:// URL.';
+  if (u.search || u.hash) return 'DATABASE_URL must carry no ?options or #fragment: the seed takes user:password@host:port/name only, because the driver would read ?host=, ?port= or ?user= over the authority.';
   if (!['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) return 'DATABASE_URL must point at this machine (127.0.0.1, localhost or ::1).';
   const name = decodeURIComponent(u.pathname.slice(1));
   if (!/(demo|test|qa)/i.test(name)) return 'The database name must contain "demo", "test" or "qa", so a real database is never seeded.';
@@ -37,9 +46,14 @@ export function disposableDatabase(url) {
 }
 const dbProblem = disposableDatabase(process.env.DATABASE_URL);
 if (dbProblem) fail(dbProblem);
+// pg selects its native libpq backend when NODE_PG_FORCE_NATIVE is any non-empty string (even "0"), as it loads.
+// libpq honours hostaddr, service files and more that the checks above do not model, so the seed refuses it here,
+// before createStore can load pg. The store is only created further down.
+if (process.env.NODE_PG_FORCE_NATIVE) fail('Unset NODE_PG_FORCE_NATIVE: the seed’s local-only checks are written for the pure-JS pg driver, not the native libpq backend it selects.');
 if (!process.argv.includes('--disposable-db')) fail('Pass --disposable-db to confirm this database may receive synthetic demo rows.');
 const config = loadConfig();
-if (!config.databaseUrl) fail('DATABASE_URL was not loaded.');
+// The store must receive the very string that was checked.
+if (config.databaseUrl !== process.env.DATABASE_URL) fail('DATABASE_URL was not loaded as it was checked.');
 if (!modelId || !config.modelCatalog.some((m) => m.id === modelId)) {
   console.error(`Pass --model with a model id from MODEL_CATALOG_FILE (${config.modelCatalog.map((m) => m.id).join(', ') || 'the catalog is empty'}).`);
   process.exit(2);

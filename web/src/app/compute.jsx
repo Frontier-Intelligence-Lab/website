@@ -1,9 +1,10 @@
-import { Component, useCallback, useEffect, useState } from 'react';
+import { Component, useCallback, useEffect, useRef, useState } from 'react';
 import { useLoaderData } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
 import { fix, hash, isNum, list, mb, obj, pct, txt } from './job-format.js';
+import { attempt, createDetailLoader } from './job-detail.js';
 
 const MANAGERS = ['owner', 'admin'];
 const ONLINE_MS = 90_000;
@@ -74,7 +75,7 @@ export function Compute() {
           <span className="ob-badge">Export to Ollama · runner 0.3 or later</span>
         </div>
       </div>
-      {notice && <p className={`ob-alert${notice.tone === 'ok' ? ' ob-alert--ok' : ''}`} role="status">{notice.text}</p>}
+      {notice && <p className={`ob-alert${notice.tone === 'ok' ? ' ob-alert--ok' : ''}`} role={notice.tone === 'ok' ? 'status' : 'alert'}>{notice.text}</p>}
       {manager ? <LinkCard workspaceId={entry.id} onLinked={refresh} /> : <p className="ob-muted">Owners and admins link runners and start jobs. You can see them here.</p>}
       {manager && plans.length > 0 && <PlansCard plans={plans} catalog={catalog} runners={active} onStart={(runner, plan) => queue(runner, { kind: 'train', enhanceRunId: plan.id }, `Training “${plan.name}”`)} />}
       <RunnersCard runners={runners} manager={manager} onProbe={queueProbe} workspaceId={entry.id} onChange={refresh} />
@@ -191,13 +192,18 @@ function RunnersCard({ runners, manager, onProbe, workspaceId, onChange }) {
 function RunnerRow({ runner: r, manager, onProbe, workspaceId, onChange }) {
   const [confirming, setConfirming] = useState(false);
   const [pending, setPending] = useState(false);
+  const [error, setError] = useState(null);
   const caps = r.capabilities ?? {};
   const state = r.status === 'revoked' ? 'Disconnected' : online(r) ? 'Online' : r.lastSeenAt ? `Offline · last seen ${when(r.lastSeenAt)}` : 'Waiting for the runner to start';
+  // Disconnecting is an authority action: a failed request must not look like a disconnect. The confirmation stays
+  // open with the reason, the list is refreshed either way so the row shows the runner's real state, and the
+  // person decides whether to try again.
   const revoke = async () => {
     setPending(true);
-    await api.revokeRunner(workspaceId, r.id).catch(() => null);
+    const { ok, error: why } = await attempt(() => api.revokeRunner(workspaceId, r.id), 'Valcairn could not be reached, so it is not known whether the runner was disconnected. Its status here is refreshed; disconnect again only if it is still connected.');
     setPending(false);
-    setConfirming(false);
+    setError(ok ? null : why);
+    if (ok) setConfirming(false);
     onChange();
   };
   const probe = async () => { setPending(true); await onProbe(r); setPending(false); };
@@ -214,13 +220,15 @@ function RunnerRow({ runner: r, manager, onProbe, workspaceId, onChange }) {
             {confirming ? (
               <span className="row-wrap gap-10" role="group" aria-label="Confirm disconnect">
                 <button type="button" className="btn-app" onClick={revoke} disabled={pending}>Disconnect runner</button>
-                <button type="button" className="btn-text" onClick={() => setConfirming(false)}>Keep it</button>
+                {/* Once the disconnect is dispatched, closing this box would not undo it, so it waits for the answer. */}
+                <button type="button" className="btn-text" onClick={() => setConfirming(false)} disabled={pending}>Keep it</button>
               </span>
             ) : <button type="button" className="btn-text" onClick={() => setConfirming(true)}>Disconnect…</button>}
           </div>
         )}
       </div>
       {confirming && <p className="ob-muted" style={{ fontSize: 13 }}>Its key stops working at once. A job it is running fails, and waiting jobs are cancelled.</p>}
+      {error && <p className="ob-alert" role="alert">{error}</p>}
       {r.lastSeenAt && (
         <dl className="dev-facts" style={{ display: 'grid', gap: 8 }}>
           <div className="dev-fact"><dt>GPUs</dt><dd>{caps.gpus?.length ? caps.gpus.map((g) => `${g.name} · ${Math.round(g.memoryMb / 1024)} GB`).join(', ') : 'None reported'}</dd></div>
@@ -278,46 +286,43 @@ function JobDetail(props) {
 }
 
 function JobDetailBody({ workspaceId, jobId, manager, onChange, onOpen }) {
-  const [job, setJob] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [detail, setDetail] = useState({ job: null, events: [], more: true, error: null });
   const [pending, setPending] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  const loader = useRef(null);
+  const exportKey = useRef(null);
+  // Pages through every event, finished job or not, and polls while the job runs. A failed request is shown with
+  // Retry, which resumes after the last event loaded; this component is keyed by job, so a late answer for another
+  // job is stopped with it (job-detail.js).
   useEffect(() => {
-    let stop = false;
-    let after = 0;
-    let timer;
-    // Pages through every event, finished job or not: a job with more than one page shows all of them.
-    const load = async () => {
-      const res = await api.job(workspaceId, jobId, after).catch(() => null);
-      if (stop) return;
-      if (!res?.ok) { setLoadingMore(false); return; }
-      setJob(res.data.job);
-      const page = list(res.data.events);
-      if (page.length) {
-        after = page.at(-1).id;
-        setEvents((prev) => [...prev, ...page.filter((e) => !prev.some((p) => p.id === e.id))]);
-      }
-      setLoadingMore(Boolean(res.data.more));
-      if (res.data.more) timer = setTimeout(load, 0);
-      else if (!FINISHED.includes(res.data.job.status)) timer = setTimeout(load, 2000);
-    };
-    load();
-    return () => { stop = true; clearTimeout(timer); };
+    const l = createDetailLoader({ fetchPage: (after) => api.job(workspaceId, jobId, after), finished: (j) => FINISHED.includes(j?.status), onState: setDetail });
+    loader.current = l;
+    l.load();
+    return () => { l.stop(); loader.current = null; };
   }, [workspaceId, jobId]);
-  if (!job) return <p className="ob-muted" role="status">Loading the job…</p>;
-  const cancel = async () => {
+  const retry = () => loader.current?.load();
+  const { job, events, more, error } = detail;
+  const problem = error && <p className="ob-alert" role="alert">{job ? 'This job could not be refreshed' : 'This job could not be loaded'}: {error} <button type="button" className="btn-text" onClick={retry}>Retry</button></p>;
+  if (!job) return problem || <p className="ob-muted" role="status">Loading the job…</p>;
+  // One action at a time. A failure stays on screen with its reason and the action stays available; the list is
+  // refreshed either way so the real state is shown. Nothing is retried on its own.
+  const act = async (call, unknown, done) => {
     setPending(true);
-    await api.cancelJob(workspaceId, jobId).catch(() => null);
+    const { ok, res, error: why } = await attempt(call, unknown);
     setPending(false);
+    setActionError(ok ? null : why);
     onChange();
+    if (ok) done(res);
   };
+  const cancel = () => act(() => api.cancelJob(workspaceId, jobId), 'Valcairn could not be reached, so it is not known whether the cancel went through. The status here shows it once it does; cancel again if the job is still running.', retry);
   const result = obj(job.result);
-  const exportRun = async () => {
-    setPending(true);
-    const res = await api.createJob(workspaceId, { kind: 'export', runnerId: job.runnerId, enhanceRunId: job.enhanceRunId, trainJobId: job.id, idempotencyKey: crypto.randomUUID() }).catch(() => null);
-    setPending(false);
-    onChange();
-    if (res?.ok) onOpen(res.data.job.id);
+  const exportRun = () => {
+    // One request key per export attempt: trying again after an unknown outcome sends the same request, and the
+    // server returns the export it already queued instead of a second one.
+    exportKey.current ??= crypto.randomUUID();
+    return act(() => api.createJob(workspaceId, { kind: 'export', runnerId: job.runnerId, enhanceRunId: job.enhanceRunId, trainJobId: job.id, idempotencyKey: exportKey.current }),
+      'Valcairn could not be reached, so it is not known whether the export was queued. Trying again is safe: the same request is sent, and an export already queued is returned rather than repeated.',
+      (res) => { exportKey.current = null; onOpen(res.data.job.id); });
   };
   const evaluation = obj(result.evaluation);
   const score = (s) => (isNum(obj(s).f1) ? `${pct(s.f1, 1)} token F1 · ${pct(s.exact, 0)} exact` : '—');
@@ -325,10 +330,12 @@ function JobDetailBody({ workspaceId, jobId, manager, onChange, onOpen }) {
   const gpus = list(result.sandboxGpus).filter((g) => g && typeof g === 'object');
   return (
     <div className="dev-facts-col" style={{ marginTop: 12 }} aria-live="polite">
+      {problem}
       <div className="row-between" style={{ flexWrap: 'wrap', gap: 10 }}>
         <h3>{KIND[job.kind] ?? job.kind} · {STATUS[job.status] ?? job.status}</h3>
         {manager && !FINISHED.includes(job.status) && job.status !== 'cancel_requested' && <button type="button" className="btn-ghost" onClick={cancel} disabled={pending}>Cancel job</button>}
       </div>
+      {actionError && <p className="ob-alert" role="alert">{actionError}</p>}
       {job.status === 'failed' && <p className="tone-warn">{FAILURE[job.failure] ?? 'The job failed.'}</p>}
       {job.status === 'cancelled' && <p className="ob-muted">Cancelled. Whatever the runner did after the cancel was requested is not used.</p>}
       {job.kind === 'probe' && job.status === 'succeeded' && (
@@ -369,7 +376,7 @@ function JobDetailBody({ workspaceId, jobId, manager, onChange, onOpen }) {
         </dl>
       )}
       {job.kind === 'train' && <LossChart points={events.filter((e) => e.kind === 'metric' && obj(e.data).name === 'train_loss' && isNum(e.data.value)).map((e) => e.data)} />}
-      <p className="ob-muted" style={{ fontSize: 12 }} role="status">{events.length} event{events.length === 1 ? '' : 's'}{loadingMore ? ', loading more…' : ''}. Each metric shows its latest value.</p>
+      <p className="ob-muted" style={{ fontSize: 12 }} role="status">{events.length} event{events.length === 1 ? '' : 's'}{more ? (error ? ', not all loaded' : ', loading more…') : ''}. Each metric shows its latest value.</p>
       <ol className="dev-steps" aria-label="Job events">
         {events.length === 0 ? <li className="ob-muted">No events yet.</li> : visible(events).map((e) => {
           const d = obj(e.data);
