@@ -29,6 +29,9 @@ jobs:
         run: |
           test -f tests/test_deploy.py
           python3 -m unittest discover -s tests -p 'test_deploy.py'
+      - name: Runner unit tests (standard library and injected fixtures; no Docker, GPU or model)
+        run: python3 -m unittest discover -s tests -v
+        working-directory: services/runner
       - name: Build the production web and migration images
         run: |
           docker build --target migrate --tag "valcairn-migrate:ci-$GITHUB_SHA" .

@@ -680,6 +680,17 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       extend(j, leaseMs);
       return publicJob(j);
     },
+    async releaseJobInputs({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS, versions = 0, files = 0 }) {
+      // Checked and recorded without an await in between, so a cancel, a revoke or an expiry is either wholly before
+      // this release (refused here) or wholly after it (the payload the caller prepared is delivered and only expires).
+      const j = heldJob({ runnerId, jobId, leaseHash });
+      if (j.status === 'cancel_requested') throw new StoreError('invalid_state');
+      const runner = runners.find((x) => x.id === runnerId);
+      if (runner.status !== 'active') throw new StoreError('lease_lost');
+      extend(j, leaseMs);
+      audit.push({ id: audit.length + 1, workspaceId: j.workspaceId, actorId: runner.createdBy, action: 'job.inputs_released', targetType: 'job', targetId: jobId, metadata: { runnerId, versions, files }, createdAt: stamp() });
+      return publicJob(j);
+    },
     async appendJobEvents({ runnerId, jobId, leaseHash, events, leaseMs = LEASE_MS }) {
       const j = heldJob({ runnerId, jobId, leaseHash });
       let added = 0;

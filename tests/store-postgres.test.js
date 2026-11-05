@@ -1058,6 +1058,67 @@ withStore('jobs: a lease that expires while waiting for the row lock is refused,
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM job_events WHERE job_id = $1', [job.id])).rows[0].n, 0, 'nor add events');
 });
 
+// Exact-head review of 2afe7bd: the input release is decided under the job row lock, so it is ordered against a cancel
+// and a revoke, and it never takes the runner row (revoke locks the runner, then its jobs), so it cannot deadlock.
+withStore('jobs: an input release waiting for the job row is refused once a cancel or the lease expiry commits, and does not deadlock with a revoke', async (store, pool) => {
+  const owner = await user(store);
+  const ws = await workspace(store, owner.id);
+  const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'e'.repeat(64), keyPrefix: 'vrk_eeeeee' });
+  const mk = (key) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: key, createdBy: owner.id });
+  const released = async (jobId) => (await pool.query("SELECT count(*)::int AS n FROM audit_events WHERE action = 'job.inputs_released' AND target_id = $1", [jobId])).rows[0].n;
+  const release = (jobId, h) => store.releaseJobInputs({ runnerId: runner.id, jobId, leaseHash: h.repeat(64), versions: 1 }).then(() => 'released', (err) => err.code);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // A cancel holds the job row (the same statement cancelJob runs) while the release starts and waits behind it.
+  const first = await mk('release-key-01');
+  await store.leaseJob({ runnerId: runner.id, leaseHash: '1'.repeat(64) });
+  assert.equal(await release(first.id, '1'), 'released', 'allowed while held and not cancelled');
+  const canceller = await pool.connect();
+  try {
+    await canceller.query('BEGIN');
+    await canceller.query("UPDATE jobs SET status = 'cancel_requested', cancelled_by = $2, updated_at = clock_timestamp() WHERE id = $1", [first.id, owner.id]);
+    const waiting = release(first.id, '1');
+    await sleep(300);
+    await canceller.query('COMMIT');
+    assert.equal(await waiting, 'invalid_state', 'the cancel committed first');
+  } finally { canceller.release(); }
+  assert.equal(await released(first.id), 1, 'the refused release is not on record');
+  await store.finishJob({ runnerId: runner.id, jobId: first.id, leaseHash: '1'.repeat(64), outcome: 'failed', failure: 'cancelled' });
+
+  // The lease runs out while the release waits for the row: refused, and the job goes back to the queue.
+  const second = await mk('release-key-02');
+  await store.leaseJob({ runnerId: runner.id, leaseHash: '2'.repeat(64), leaseMs: 500 });
+  const blocker = await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT id FROM jobs WHERE id = $1 FOR UPDATE', [second.id]);
+    const waiting = release(second.id, '2');
+    await sleep(900);
+    await blocker.query('COMMIT');
+    assert.equal(await waiting, 'lease_lost', 'the lease ran out while the release waited');
+  } finally { blocker.release(); }
+  assert.equal((await store.getJob({ workspaceId: ws.id, jobId: second.id })).status, 'queued');
+  assert.equal(await released(second.id), 0);
+
+  // A revoke in progress holds the runner row (its first statement) and has not reached the job rows yet. The release
+  // must not wait for the runner row: locking it after the job row would deadlock once the revoke reaches the jobs.
+  // A release committed before the revoke's job update is a grant made before the revoke; the next one is refused.
+  assert.equal((await store.leaseJob({ runnerId: runner.id, leaseHash: '3'.repeat(64) }))?.id, second.id);
+  const revoker = await pool.connect();
+  try {
+    await revoker.query('BEGIN');
+    await revoker.query("UPDATE runners SET status = 'revoked', revoked_at = clock_timestamp() WHERE id = $1", [runner.id]);
+    const outcome = await Promise.race([release(second.id, '3'), new Promise((resolve) => setTimeout(resolve, 2000, 'blocked').unref())]);
+    assert.equal(outcome, 'released', 'decided on the job row alone, without waiting for the runner row');
+    await revoker.query(`UPDATE jobs SET status = 'failed', failure = 'runner_revoked', lease_hash = NULL, lease_expires_at = NULL,
+      finished_at = clock_timestamp(), updated_at = clock_timestamp() WHERE runner_id = $1 AND status IN ('leased', 'running', 'cancel_requested')`, [runner.id]);
+    await revoker.query('COMMIT');
+  } finally { revoker.release(); }
+  assert.equal(await release(second.id, '3'), 'lease_lost', 'after the revoke');
+  const after = await store.getJob({ workspaceId: ws.id, jobId: second.id });
+  assert.deepEqual([after.status, after.failure, await released(second.id)], ['failed', 'runner_revoked', 1]);
+});
+
 withStore('jobs: a job is deleted only with its workspace, never one by one', async (store, pool) => {
   const owner = await user(store);
   const ws = await workspace(store, owner.id);

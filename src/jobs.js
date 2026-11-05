@@ -144,27 +144,39 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
   // The frozen inputs of a plan-based job, only for the runner that holds it: the dataset versions named in the
   // job's spec, resolved through each version's manifest, with short-lived signed download links.
   app.post('/api/runner/jobs/:jobId/inputs', runnerRoute, async (request, reply) => {
+    const who = { runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body) };
+    const cancelled = () => problem(reply, 409, 'This job was cancelled, so no new inputs are issued.', { code: 'job_cancelled' });
     let job;
-    try { job = await store.touchJob({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body) }); }
+    try { job = await store.touchJob(who); }
     catch (err) { return jobFail(reply, err); }
     if (job.kind === 'probe') return problem(reply, 400, 'A sandbox check has no inputs.');
     // A cancelled job gets no new input grants. Links issued before the cancel stay valid until they expire.
-    if (job.status === 'cancel_requested') return problem(reply, 409, 'This job was cancelled, so no new inputs are issued.', { code: 'job_cancelled' });
+    if (job.status === 'cancel_requested') return cancelled();
     const ingest = config.ingest;
     if (!ingest) return problem(reply, 503, 'File storage is not configured on this server.', { code: 'storage_unavailable' });
+    // The complete response, signed links included, is prepared first, outside any lock. Nothing has been granted
+    // yet: if the release below is refused, none of it leaves the server.
+    const exp = Math.floor(Date.now() / 1000) + INPUT_TTL_S;
     const datasets = [];
     for (const { projectId, version } of job.spec.plan.datasets) {
       const v = (await store.listDatasetVersions({ workspaceId: job.workspaceId, projectId })).find((x) => x.number === version);
       if (!v || !allowsTraining(v.manifest)) return problem(reply, 409, 'A dataset version in this plan is missing or no longer allows training.', { code: 'dataset_unavailable' });
-      const exp = Math.floor(Date.now() / 1000) + INPUT_TTL_S;
       datasets.push({
         projectId, version,
         files: v.manifest.files.map((f) => ({ id: f.id, filename: f.filename, sha256: f.sha256, sizeBytes: f.sizeBytes, contentType: f.contentType,
           url: `${ingest.publicUrl}/v1/objects?token=${encodeURIComponent(signToken(ingest.secret, { v: 1, kind: 'download', key: f.objectKey, filename: f.filename, exp }))}` })),
       });
     }
-    await store.recordAudit({ workspaceId: job.workspaceId, actorId: request.runner.createdBy, action: 'job.inputs_released', targetType: 'job', targetId: job.id, metadata: { runnerId: request.runner.id, versions: datasets.length } });
-    return { baseModel: { id: job.spec.baseModel.id, source: job.spec.baseModel.source, license: job.spec.baseModel.license }, datasets, expiresInSeconds: INPUT_TTL_S };
+    const payload = { baseModel: { id: job.spec.baseModel.id, source: job.spec.baseModel.source, license: job.spec.baseModel.license }, datasets, expiresInSeconds: INPUT_TTL_S };
+    // The checks above may be stale by now: the lookups took time, and a cancel, a revoke or the lease's expiry may
+    // have been committed meanwhile. The release is decided in the store under the job row lock that cancel and revoke
+    // also take, on the lease, job and runner as they are at that moment, and it records exactly this prepared
+    // payload (job.inputs_released, with its version and file counts). A cancel or revoke committed first wins and the
+    // prepared links are dropped; one committed later cannot withdraw a payload already released, which only expires.
+    // After the gate the prepared payload is returned as it is: nothing is signed and nothing is awaited.
+    try { await store.releaseJobInputs({ ...who, versions: datasets.length, files: datasets.reduce((n, d) => n + d.files.length, 0) }); }
+    catch (err) { return err instanceof StoreError && err.code === 'invalid_state' ? cancelled() : jobFail(reply, err); }
+    return payload;
   });
 
   app.post('/api/runner/jobs/:jobId/finish', runnerRoute, async (request, reply) => {
