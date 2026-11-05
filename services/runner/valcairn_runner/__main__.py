@@ -31,6 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings(
         ollama_host=os.environ.get("OLLAMA_HOST_URL", Settings.ollama_host),
         probe_image=os.environ.get("VALCAIRN_PROBE_IMAGE", Settings.probe_image),
+        train_image=os.environ.get("VALCAIRN_TRAIN_IMAGE", Settings.train_image),
+        convert_image=os.environ.get("VALCAIRN_CONVERT_IMAGE", Settings.convert_image),
+        home=os.environ.get("VALCAIRN_RUNNER_HOME", str(Path.home() / ".valcairn-runner")),
+        train_memory=os.environ.get("VALCAIRN_TRAIN_MEMORY", Settings.train_memory),
     )
     if args.command == "check":
         print(json.dumps(capabilities(settings.ollama_host), indent=2))
