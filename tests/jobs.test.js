@@ -414,6 +414,104 @@ test('review 5: once cancel is stored the job ends cancelled, even if the runner
   assert.deepEqual([stored.status, stored.result ?? null], ['cancelled', null], 'the late result is not stored');
 });
 
+// --- Regression for the exact-head review of 2afe7bd: an inputs request that is already past its first checks when a
+// cancel, a revoke or the lease's expiry commits must return no links and leave no release record.
+
+// A leased training job on a linked runner with one frozen version that allows training, served by the real routes.
+async function trainingSetup({ clock }) {
+  const store = createMemoryStore({ now: () => clock.now });
+  const app = await makeApp({ store, env: { MODEL_CATALOG_FILE: FIXTURE_CATALOG, INGEST_PUBLIC_URL: 'http://127.0.0.1:4100', INGEST_SHARED_SECRET: 's'.repeat(40) } });
+  const owner = await person(app, 'o@acme-robotics.com');
+  const ws = (await owner.post('/api/workspaces', { name: 'Acme Robotics' })).json().workspace;
+  const base = `/api/workspaces/${ws.id}`;
+  const { runner, key } = (await owner.post(`${base}/runners`, { label: 'Box' })).json();
+  const api = runnerClient(app, key);
+  const projectId = '00000000-0000-4000-8000-0000000000ac';
+  const manifest = { dataSource: { mode: 'upload', allowedUses: ['training'] }, files: [{ id: 'f1', filename: 'c.jsonl', sha256: 'a'.repeat(64), sizeBytes: 1, contentType: 'application/json', objectKey: `ws/${ws.id}/f1` }] };
+  store.listDatasetVersions = async ({ workspaceId, projectId: p }) => (workspaceId === ws.id && p === projectId ? [{ number: 1, manifest }] : []);
+  const plan = await runnerPlan(store, owner, ws, projectId);
+  const job = (await owner.post(`${base}/jobs`, { kind: 'train', runnerId: runner.id, enhanceRunId: plan.id, idempotencyKey: 'inflight-key-01' })).json().job;
+  const leased = (await api.post('/api/runner/lease')).json().job;
+  const inputs = () => api.post(`/api/runner/jobs/${job.id}/inputs`, { leaseToken: leased.leaseToken });
+  const released = async () => (await store.listAudit(ws.id)).filter((a) => a.action === 'job.inputs_released');
+  return { store, owner, base, runner, job, inputs, released };
+}
+
+// Holds the next manifest lookup until `resume`, so something else can commit while an inputs request is in flight.
+function holdLookup(store) {
+  const lookup = store.listDatasetVersions;
+  let resume;
+  const held = new Promise((resolve) => { resume = resolve; });
+  const entered = new Promise((enter) => {
+    store.listDatasetVersions = async (args) => { store.listDatasetVersions = lookup; enter(); await held; return lookup(args); };
+  });
+  return { entered, resume };
+}
+
+test('2afe review: an inputs request in flight when a cancel, a revoke or the lease expiry commits gets no links and no release record', async () => {
+  const interleavings = {
+    cancel: { act: ({ owner, base, job }) => owner.post(`${base}/jobs/${job.id}/cancel`), code: 'job_cancelled', after: ['cancel_requested', null] },
+    revoke: { act: ({ owner, base, runner }) => owner.post(`${base}/runners/${runner.id}/revoke`), code: 'lease_lost', after: ['failed', 'runner_revoked'] },
+    expiry: { act: ({ clock }) => { clock.now = new Date(clock.now.getTime() + LEASE_MS + 1); }, code: 'lease_lost', after: ['queued', null] },
+  };
+  for (const [name, { act, code, after }] of Object.entries(interleavings)) {
+    const clock = { now: new Date('2026-11-04T12:00:00Z') };
+    const t = await trainingSetup({ clock });
+    const before = await t.inputs();
+    assert.equal(before.statusCode, 200, `${name}: inputs while held, ${before.body}`);
+    assert.equal((await t.released()).length, 1, `${name}: the release before is on record`);
+    const hold = holdLookup(t.store);
+    const pending = t.inputs();
+    await hold.entered;
+    const acted = await act({ ...t, clock });
+    if (acted) assert.equal(acted.statusCode, 200, `${name}: ${acted.body}`);
+    hold.resume();
+    const res = await pending;
+    assert.deepEqual([res.statusCode, res.json().code, 'datasets' in res.json()], [409, code, false], `${name}: ${res.body}`);
+    assert.equal((await t.released()).length, 1, `${name}: the refused release is not on record`);
+    const stored = (await t.owner.get(`${t.base}/jobs/${t.job.id}`)).json().job;
+    assert.deepEqual([stored.status, stored.failure], after, name);
+  }
+});
+
+// The release gate authorizes a payload that is complete before it: the links are signed first, the gate records
+// exactly that payload, and nothing is signed or awaited after it. A cancel that commits between preparation and the
+// gate refuses it and none of the prepared links leave; one that commits right after the gate finds nothing left to do.
+test('2afe review: the gate authorizes the payload prepared before it; nothing is signed after the gate and nothing prepared leaves on refusal', async () => {
+  for (const cancelBeforeGate of [false, true]) {
+    const t = await trainingSetup({ clock: { now: new Date('2026-11-04T12:00:00Z') } });
+    const label = cancelBeforeGate ? 'cancel between preparation and the gate' : 'cancel right after the gate';
+    // Signing reads a file's objectKey. The sentinel notices a read that happens after the cancel was committed.
+    let cancelled = false;
+    let keyReadAfterCancel = false;
+    const file = { id: 'f1', filename: 'c.jsonl', sha256: 'a'.repeat(64), sizeBytes: 1, contentType: 'application/json' };
+    Object.defineProperty(file, 'objectKey', { enumerable: true, get() { if (cancelled) keyReadAfterCancel = true; return 'ws/qa/f1'; } });
+    t.store.listDatasetVersions = async () => [{ number: 1, manifest: { dataSource: { mode: 'upload', allowedUses: ['training'] }, files: [file, { ...file, id: 'f2', filename: 'd.jsonl', objectKey: 'ws/qa/f2' }] } }];
+    const files = (body) => body.datasets.reduce((n, d) => n + d.files.length, 0);
+
+    const known = await t.inputs();
+    assert.deepEqual([known.statusCode, files(known.json())], [200, 2], `${label}: a normal release, ${known.body}`);
+
+    const release = t.store.releaseJobInputs.bind(t.store);
+    const cancel = async () => { assert.equal((await t.owner.post(`${t.base}/jobs/${t.job.id}/cancel`)).statusCode, 200); cancelled = true; };
+    t.store.releaseJobInputs = cancelBeforeGate
+      ? async (args) => { await cancel(); return release(args); }
+      : async (args) => { const job = await release(args); await cancel(); return job; };
+    const res = await t.inputs();
+    assert.equal(keyReadAfterCancel, false, `${label}: no signing after the cancel, so none after the gate`);
+    const records = await t.released();
+    if (cancelBeforeGate) {
+      assert.deepEqual([res.statusCode, res.json().code, 'datasets' in res.json(), res.body.includes('token=')], [409, 'job_cancelled', false, false], `${label}: ${res.body}`);
+      assert.equal(records.length, 1, `${label}: a refused gate records nothing`);
+    } else {
+      assert.deepEqual([res.statusCode, files(res.json())], [200, 2], `${label}: released before the cancel, so delivered`);
+      assert.equal(records.length, 2, `${label}: the release is on record`);
+    }
+    assert.deepEqual(records.map((a) => a.metadata), records.map(() => ({ runnerId: t.runner.id, versions: 1, files: 2 })), `${label}: each record describes the payload that was returned`);
+    assert.equal((await t.owner.get(`${t.base}/jobs/${t.job.id}`)).json().job.status, 'cancel_requested', label);
+  }
+});
+
 test('review 2: one request key means one complete request, including the training run it names', async () => {
   const { store, owner, ws, link, queue } = await setup();
   const { runner, runnerApi } = await link();

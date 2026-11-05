@@ -783,4 +783,42 @@ export function runStoreContract(test, makeStore, label) {
     assert.deepEqual(page.map((e) => e.seq), [0, 1, 2, 3]);
     assert.deepEqual((await store.listJobEvents({ workspaceId: ws.id, jobId: job.id, afterId: page.at(-1).id, limit: 4 })).map((e) => e.seq), [4, 5, 6]);
   });
+
+  // Regression for the exact-head review of 2afe7bd: handing a runner its inputs is one decision, made on the lease,
+  // the job and the runner as they are at that moment, and recorded only when it is allowed.
+  withStore('jobs review: an input release is bound to the current lease, job state and runner, and records only what it allows', async (store) => {
+    const owner = await store.createUser({ email: 'i@acme.com', name: 'I', passwordHash: 'h' });
+    const ws = await store.createWorkspace({ kind: 'organization', name: 'I', slug: 'i-jobs', ownerId: owner.id });
+    const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'Box', keyHash: 'a'.repeat(64), keyPrefix: 'vrk_abcdef' });
+    const mk = (key) => store.createJob({ workspaceId: ws.id, runnerId: runner.id, kind: 'probe', spec: { checks: ['gpu'] }, idempotencyKey: key, createdBy: owner.id });
+    const released = async () => (await store.listAudit(ws.id)).filter((a) => a.action === 'job.inputs_released');
+    const job = await mk('key-inputs-0001');
+    const who = { runnerId: runner.id, jobId: job.id, leaseHash: 'b'.repeat(64) };
+    await assert.rejects(store.releaseJobInputs(who), { code: 'lease_lost' }, 'not before it holds the job');
+    await store.leaseJob({ runnerId: runner.id, leaseHash: 'b'.repeat(64) });
+    await assert.rejects(store.releaseJobInputs({ ...who, leaseHash: 'c'.repeat(64) }), { code: 'lease_lost' }, 'not with another lease');
+    await assert.rejects(store.releaseJobInputs({ ...who, runnerId: ws.id }), { code: 'not_found' }, 'not for another runner');
+    assert.equal((await released()).length, 0, 'a refused release records nothing');
+    assert.equal((await store.releaseJobInputs({ ...who, versions: 2, files: 3 })).status, 'running', 'allowed while held, and the lease is extended');
+    const [record] = await released();
+    assert.deepEqual([record.actorId, record.targetType, record.targetId, record.metadata], [owner.id, 'job', job.id, { runnerId: runner.id, versions: 2, files: 3 }], 'the record carries the counts of the payload the caller prepared');
+
+    // Once cancel is stored there is no release, though the runner still holds the job and can report.
+    await store.cancelJob({ workspaceId: ws.id, jobId: job.id, actorId: owner.id });
+    await assert.rejects(store.releaseJobInputs(who), { code: 'invalid_state' });
+    assert.equal((await store.touchJob(who)).status, 'cancel_requested');
+    assert.equal((await store.finishJob({ ...who, outcome: 'failed', failure: 'cancelled' })).status, 'cancelled');
+
+    // A lease that ran out is refused and the job goes back to the queue; a job a revoke has failed is refused too.
+    const lost = await mk('key-inputs-0002');
+    const lostBy = (h) => ({ runnerId: runner.id, jobId: lost.id, leaseHash: h.repeat(64) });
+    await store.leaseJob({ runnerId: runner.id, leaseHash: 'd'.repeat(64), leaseMs: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await assert.rejects(store.releaseJobInputs(lostBy('d')), { code: 'lease_lost' });
+    assert.equal((await store.getJob({ workspaceId: ws.id, jobId: lost.id })).status, 'queued');
+    await store.leaseJob({ runnerId: runner.id, leaseHash: 'e'.repeat(64) });
+    await store.revokeRunner({ workspaceId: ws.id, runnerId: runner.id, actorId: owner.id });
+    await assert.rejects(store.releaseJobInputs(lostBy('e')), { code: 'lease_lost' });
+    assert.deepEqual((await released()).map((a) => a.targetId), [job.id], 'only the one allowed release is on record');
+  });
 }

@@ -1015,6 +1015,21 @@ export function createPostgresStore(options) {
     async touchJob({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS }) {
       return transaction(async (client) => jobRow(await extendLease(client, await lockHeldJob(client, { runnerId, jobId, leaseHash }), leaseMs)));
     },
+    async releaseJobInputs({ runnerId, jobId, leaseHash, leaseMs = LEASE_MS, versions = 0, files = 0 }) {
+      return transaction(async (client) => {
+        // Under the job row lock, which cancelJob takes and which revokeRunner's job update waits for: the lease is
+        // decided after the wait (lockHeldJob), and a committed revoke has already failed the job, so lease_lost.
+        const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
+        if (j.status === 'cancel_requested') throw new StoreError('invalid_state');
+        // Read, not locked: revokeRunner locks the runner row and then the job rows, so taking the runner row here,
+        // after the job row, could deadlock with it. The job row above already orders this release against a revoke.
+        const runner = (await query('SELECT created_by, status FROM runners WHERE id = $1', [runnerId], client)).rows[0];
+        if (runner.status !== 'active') throw new StoreError('lease_lost');
+        const row = await extendLease(client, j, leaseMs);
+        await addAudit(client, { workspaceId: j.workspace_id, actorId: runner.created_by, action: 'job.inputs_released', targetType: 'job', targetId: jobId, metadata: { runnerId, versions, files } });
+        return jobRow(row);
+      });
+    },
     async appendJobEvents({ runnerId, jobId, leaseHash, events, leaseMs = LEASE_MS }) {
       return transaction(async (client) => {
         const j = await lockHeldJob(client, { runnerId, jobId, leaseHash });
