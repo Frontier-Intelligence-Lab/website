@@ -30,8 +30,9 @@ REQUIRED_JOBS = {"Web / no database", "Web / PostgreSQL 17", "Ingest / Rust 1.99
 # Capital included; Memory and Agents add no server table), plus 014 (Runners and jobs) and 015 (Evaluation),
 # registered ahead of their files. The migration ledger decides which groups must exist: a listed migration
 # requires its whole group, an unlisted one forbids it, each group on its own, so 014 and 015 may be applied
-# in either order or alone. 003, 005 and 008-010 add no tables. The ledger table itself comes from the
-# migrator, and 006 is the baseline the preflight needs.
+# in either order or alone. 003, 005, 008-010 and 016 (the Capital and Evaluation validators re-created with
+# schema-qualified nested calls so a populated backup restores) add no tables. The ledger table itself comes
+# from the migrator, and 006 is the baseline the preflight needs.
 TABLE_GROUPS = {
     "001": ("users", "email_codes", "workspaces", "memberships", "invitations", "join_requests", "projects", "audit_events"),
     "002": ("sessions",),
