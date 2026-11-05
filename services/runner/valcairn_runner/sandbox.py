@@ -76,12 +76,18 @@ class Sandbox:
 
     A stop is complete only when Docker itself says the container no longer exists or is not running: a failed
     `docker kill`, or a Docker client that exited, is not proof. If that cannot be confirmed, the container name is
-    kept in `unresolved` and every later step is refused until a person checks the machine."""
+    kept in `unresolved` and every later step is refused until a person checks the machine.
 
-    def __init__(self, popen=subprocess.Popen, run=subprocess.run, sleep=time.sleep):
+    The container and the docker client are two different things to end. `client_grace` is how long a client may
+    keep its output open after its container is confirmed gone before it is killed as well. It is short: a healthy
+    client closes its output as soon as its container is dead, `--rm` is honoured by the daemon rather than the
+    client, and the exit status of a stopped step is never success anyway."""
+
+    def __init__(self, popen=subprocess.Popen, run=subprocess.run, sleep=time.sleep, client_grace: float = 0.5):
         self._popen = popen
         self._run = run
         self._sleep = sleep
+        self._client_grace = client_grace
         self._lock = threading.Lock()
         self._current: str | None = None
         self._stop_requested = False
@@ -143,16 +149,24 @@ class Sandbox:
         with self._lock:
             self._current, self._stop_requested = name, False
         timed_out, finished, handled = threading.Event(), threading.Event(), threading.Event()
+        # read_ended: this thread is no longer reading the client's output. client_killed: the client was killed.
+        read_ended, client_killed = threading.Event(), threading.Event()
         proc = None
 
         def end_container():
             # Kill, then confirm with Docker. If that cannot be confirmed, remember the container and kill the docker
-            # client too, so this step returns instead of waiting on output that never ends.
-            if not self._stop_and_confirm(name):
+            # client at once. A confirmed stop says nothing about the client's output: a client that keeps it open
+            # would leave this step blocked reading, never reaching the bounded wait, so it gets a short grace to
+            # close its output and is then killed too. Either way, this step returns.
+            if self._stop_and_confirm(name):
+                client_exited = read_ended.wait(self._client_grace)
+            else:
                 with self._lock:
                     self.unresolved = name
-                if proc is not None:
-                    proc.kill()
+                client_exited = False
+            if proc is not None and not client_exited:
+                proc.kill()
+                client_killed.set()
             handled.set()
 
         def watch():
@@ -173,12 +187,16 @@ class Sandbox:
                 if cancelled.is_set() or timed_out.is_set():
                     break
                 on_line(line.rstrip("\n"))
+            read_ended.set()
             if (cancelled.is_set() or timed_out.is_set() or self._stop_requested) and not handled.is_set():
                 handled.wait(STOP_ATTEMPTS * STOP_CHECK_SECONDS * 4 + 60)
             code = self._wait(proc, name)
+            if client_killed.is_set():
+                code = self.CLIENT_KILLED  # a killed client's own status says nothing about the container
         except BaseException:
             # Whatever went wrong on this side, the container must not outlive the step.
             finished.set()
+            read_ended.set()
             if proc is not None:
                 if not handled.is_set():
                     end_container()

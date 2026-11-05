@@ -160,23 +160,32 @@ def run_job(api: Api, job: dict, sandbox: Sandbox, settings: Settings, caps: dic
     finally:
         stop.set()
         beat.join(timeout=5)
-    # The cancellation contract shared with Valcairn (docs/RUNNERS.md): once the runner has seen cancelRequested,
-    # the job ends cancelled, even if the handler had already finished its work. Valcairn records it that way too.
-    if ctx.cancelled.is_set() and outcome.get("failure") != "sandbox_error":
-        outcome = {"outcome": "failed", "failure": "cancelled"}
+
+    def settled() -> dict:
+        # The cancellation contract shared with Valcairn (docs/RUNNERS.md): once the runner has seen cancelRequested,
+        # the job ends cancelled, even if the handler had already finished its work. Valcairn records it that way too.
+        # The final flush below can be where the cancel is first seen, so this is decided when the end is reported,
+        # for every finish attempt, never from the outcome as it stood before the flush. A sandbox_error stays
+        # itself: Valcairn must learn that this runner holds an unresolved container.
+        if ctx.cancelled.is_set() and outcome.get("failure") != "sandbox_error":
+            return {"outcome": "failed", "failure": "cancelled"}
+        return outcome
+
     if ctx.unauthorized.is_set():
         log.error("job %s: Valcairn refused this runner's key during the job; nothing more is reported under it", job["id"])
         return "unauthorized"
     for _ in range(3):
         ctx.flush()
-    if ctx.unauthorized.is_set():
-        return "unauthorized"
-    if ctx.lost.is_set():
-        log.warning("job %s: Valcairn no longer holds this runner's lease; not reporting", job["id"])
-        return "lost"
     for attempt in range(5):
+        # Authority is read before every attempt, including after a backoff: a heartbeat or event reply still in
+        # flight while an attempt failed can have revoked it, and nothing is sent under a refused key or a lost lease.
+        if ctx.unauthorized.is_set():
+            return "unauthorized"
+        if ctx.lost.is_set():
+            log.warning("job %s: Valcairn no longer holds this runner's lease; not reporting", job["id"])
+            return "lost"
         try:
-            return api.finish(job["id"], job["leaseToken"], **outcome)["status"]
+            return api.finish(job["id"], job["leaseToken"], **settled())["status"]
         except LeaseLost:
             return "lost"
         except AuthError:
