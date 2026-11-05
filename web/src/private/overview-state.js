@@ -59,6 +59,19 @@ export function createOverviewLoader({ fetch, apply, now = () => new Date().toIS
   };
 }
 
+/**
+ * Ending the reviewer session from the overview, in the same order as the workspace shell: only after the server has
+ * confirmed the sign-out are this tab's local-memory keys forgotten and the page left. A failed sign-out changes
+ * nothing, so the keys are not dropped while the person is still signed in. Returns whether the sign-out succeeded.
+ */
+export async function signOutReviewer({ logout, forget, leave }) {
+  const res = await logout().catch(() => null);
+  if (!res?.ok) return false;
+  forget();
+  leave();
+  return true;
+}
+
 // Capital planning totals as the API returns them: whole US cents grouped by basis (quoted, estimated, incurred) and
 // period (one_time, monthly, annual), from totalsByBasis in src/lib/capital.js. Each line keeps its own basis and
 // period. A one-time amount is never added to a monthly or an annual one: they are not the same kind of number.

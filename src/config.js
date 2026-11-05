@@ -5,6 +5,7 @@ import { parseReviewers } from './lib/reviewers.js';
 import { parseModelCatalog } from './lib/models.js';
 import { parseCatalog } from './lib/devices.js';
 import { isEmail } from './lib/onboarding.js';
+import { parseDemoReviewerUsers } from './lib/demo-access.js';
 
 const truthy = (value, fallback) =>
   value == null || value === '' ? fallback : ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -122,6 +123,17 @@ export function loadConfig(env = process.env) {
   if (!demoStaffEmails.every(isEmail)) throw new Error('DEMO_STAFF_EMAILS must be a comma-separated list of email addresses');
   if (demoStaffEmails.length && !demoWorkspaceId) throw new Error('DEMO_STAFF_EMAILS requires DEMO_WORKSPACE_ID: demo staff are scoped to that one synthetic workspace');
   if (demoStaffEmails.some((e) => staffEmails.includes(e))) throw new Error('DEMO_STAFF_EMAILS must not repeat a STAFF_EMAILS entry: an address is either global staff or demo-scoped staff');
+  // Reviewer workspace entry (src/lib/demo-access.js): which dedicated demo owner and which synthetic organization
+  // each reviewer username opens. A read-only JSON file of ids, never passwords; unset means reviewers keep the
+  // read-only overview only. These organizations are the reviewers' own; the operator pin above is never one of them.
+  let demoReviewerUsers = [];
+  if (env.DEMO_REVIEWER_USERS_FILE) {
+    try { demoReviewerUsers = parseDemoReviewerUsers(readFileSync(env.DEMO_REVIEWER_USERS_FILE, 'utf8')); }
+    catch (err) { throw new Error(`DEMO_REVIEWER_USERS_FILE: ${err.message}`, { cause: err }); }
+  }
+  if (demoWorkspaceId && demoReviewerUsers.some((m) => m.workspaceId === demoWorkspaceId.toLowerCase())) {
+    throw new Error('DEMO_REVIEWER_USERS_FILE must not map a reviewer to the DEMO_WORKSPACE_ID operator workspace: each reviewer gets its own synthetic organization');
+  }
 
   // The open-weight model catalog is deployment data (docs/model-catalog.example.json), checked once here.
   // Unset leaves it empty: Models pages have nothing to pull and new enhance plans are refused, while pulls and
@@ -165,6 +177,7 @@ export function loadConfig(env = process.env) {
     } : null,
     staffEmails,
     demoStaffEmails,
+    demoReviewerUsers,
     localRuntimeOrigins,
     localMemoryOrigins,
     localModelCatalog,

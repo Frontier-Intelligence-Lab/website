@@ -4,6 +4,7 @@ import { hashPassword, verifyPassword } from './passwords.js';
 const USERNAME_RE = /^[a-z0-9._@+-]{1,64}$/;
 const ROLES = new Set(['viewer', 'admin']);
 export const normalizeUsername = (value) => String(value ?? '').trim().toLowerCase();
+export const isReviewerUsername = (value) => USERNAME_RE.test(String(value ?? ''));
 
 /**
  * Reviewer accounts: [{ "username": "...", "name": "...", "role": "viewer" | "admin", "passwordHash": "scrypt$..." }].

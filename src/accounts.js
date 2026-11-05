@@ -4,6 +4,7 @@ import { hashPassword, verifyPassword } from './lib/passwords.js';
 import { StoreError } from './store/index.js';
 import { PERSONAL_DOMAINS, emailDomain, isAcademicDomain, isEmail, normalizeDomain, slugify, validateProjectPatch, validateProjectStart } from './lib/onboarding.js';
 import { staffScopeFor } from './lib/staff-scope.js';
+import { DEMO_CAPABILITIES, demoRouteAllowed, resolveDemoAccess } from './lib/demo-access.js';
 
 const ROLES = ['owner', 'admin', 'member', 'finance', 'viewer'];
 const CAN = {
@@ -43,7 +44,7 @@ function createMailer(smtp, transport = smtp ? nodemailer.createTransport({ host
 }
 
 export async function registerAccountRoutes(app, { config, store, mailTransport, rateLimits = {}, helpers }) {
-  const { sameOrigin, privateHeaders, problem } = helpers;
+  const { sameOrigin, privateHeaders, problem, reviewerOf } = helpers;
   const mailer = createMailer(config.smtp, mailTransport);
   const pepper = (value) => createHmac('sha256', config.sessionSecret).update(String(value)).digest('hex');
   const exposeCodes = !config.isProd && !mailer.configured;
@@ -59,16 +60,47 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     privateHeaders(reply);
     if (!store) return problem(reply, 503, 'Accounts are not available on this server yet.');
   };
-  const signedIn = async (request, reply) => {
+  /**
+   * Who this request acts as: a normal account session (unchanged, and it always wins), or a reviewer-derived
+   * session (src/lib/demo-access.js) re-validated here on every request. The one resolver behind both /api/account
+   * and `signedIn`, memoized per request only. A reviewer-derived session that no longer resolves is cleared.
+   */
+  const resolveAccount = async (request) => {
+    if (request.accountResolved) return request.accountResolution;
+    request.accountResolved = true;
     const userId = request.session.get('account')?.userId;
-    const user = userId ? await store.getUserById(userId) : null;
-    if (!user) return problem(reply, 401, 'Sign in first.');
-    request.user = user;
+    if (userId) {
+      const user = await store.getUserById(userId);
+      // A normal account session never carries a reviewer-derived marker.
+      if (request.session.get('demoAccess')) request.session.set('demoAccess', undefined);
+      return (request.accountResolution = user ? { user, demoAccess: null } : null);
+    }
+    const marker = request.session.get('demoAccess') ?? null;
+    if (!marker) return (request.accountResolution = null);
+    const access = await resolveDemoAccess({ config, store, reviewer: await reviewerOf(request), marker });
+    if (!access) {
+      request.session.set('demoAccess', undefined);
+      return (request.accountResolution = null);
+    }
+    return (request.accountResolution = { user: access.user, demoAccess: access });
+  };
+  const signedIn = async (request, reply) => {
+    const resolved = await resolveAccount(request);
+    if (!resolved) return problem(reply, 401, 'Sign in first.');
+    request.user = resolved.user;
+    request.demoAccess = resolved.demoAccess;
+    // A reviewer-derived session reaches a finite set of registered routes; everything else is refused here, before
+    // any route code runs, whatever the URL looks like.
+    if (request.demoAccess && !demoRouteAllowed(request)) {
+      return problem(reply, 403, 'The reviewer demo cannot do this. It can plan, edit and evaluate inside the synthetic demo workspace only.', { code: 'demo_access_denied' });
+    }
   };
   const verified = async (request, reply) => {
     if (!request.user.emailVerifiedAt) return problem(reply, 403, 'Confirm your email first.', { code: 'email_unverified' });
   };
   const member = (ability) => async (request, reply) => {
+    // A reviewer-derived session reaches exactly the pinned workspace, whatever other memberships the identity has.
+    if (request.demoAccess && request.params.workspaceId !== request.demoAccess.workspace.id) return problem(reply, 404, 'Not found.');
     const membership = await store.getMembership(request.params.workspaceId, request.user.id);
     // Not a member: answer as if the workspace did not exist.
     if (!membership) return problem(reply, 404, 'Not found.');
@@ -110,6 +142,19 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     };
   }
 
+  // The projection of a reviewer-derived session: the pinned workspace and nothing else about the identity.
+  const demoAccountView = (access) => ({
+    user: access.user,
+    isStaff: false,
+    staffScope: null,
+    staffWorkspace: null,
+    workspaces: [{ id: access.workspace.id, kind: access.workspace.kind, name: access.workspace.name, slug: access.workspace.slug, role: access.role, synthetic: true }],
+    joinRequests: [],
+    match: null,
+    signupOpen: false,
+    demoAccess: { reviewer: access.reviewer, workspace: access.workspace, capabilities: DEMO_CAPABILITIES },
+  });
+
   async function domainMatch(user) {
     const domain = emailDomain(user.email);
     if (!user.emailVerifiedAt || !domain || PERSONAL_DOMAINS.has(domain)) return null;
@@ -121,14 +166,15 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   const limit = (max) => ({ rateLimit: { max, timeWindow: '15 minutes' } });
 
   app.get('/api/account', get(), async (request) => {
-    const userId = request.session.get('account')?.userId;
-    const user = userId ? await store.getUserById(userId) : null;
-    if (!user) return { user: null, signupOpen: config.accountSignup };
-    return { ...(await accountView(user)), match: await domainMatch(user), signupOpen: config.accountSignup };
+    const resolved = await resolveAccount(request);
+    if (!resolved) return { user: null, signupOpen: config.accountSignup };
+    if (resolved.demoAccess) return demoAccountView(resolved.demoAccess);
+    return { ...(await accountView(resolved.user)), match: await domainMatch(resolved.user), signupOpen: config.accountSignup };
   });
 
   app.post('/api/account/signup', { ...post(), config: limit(rateLimits.signup ?? 10) }, async (request, reply) => {
     if (!config.accountSignup) return problem(reply, 503, 'New accounts are not open yet.');
+    if (request.session.get('demoAccess')) return problem(reply, 403, 'Sign out of the reviewer demo before creating an account.', { code: 'demo_access_denied' });
     const name = text(request.body?.name, 120);
     const email = text(request.body?.email, 254).toLowerCase();
     const password = typeof request.body?.password === 'string' ? request.body.password.slice(0, 256) : '';
@@ -160,8 +206,10 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     return accountView(auth.user);
   });
 
+  // Ends the whole session: a normal account, and a reviewer sign-in with any workspace entry derived from it.
   app.post('/api/account/signout', post(), async (request) => {
     request.session.set('account', undefined);
+    request.session.set('demoAccess', undefined);
     await request.session.destroy();
     return { ok: true };
   });

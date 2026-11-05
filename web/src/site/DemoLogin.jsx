@@ -15,7 +15,8 @@ export default function DemoLogin() {
     setError(null);
     const res = await api.login(Object.fromEntries(new FormData(event.currentTarget))).catch(() => null);
     setPending(false);
-    if (res?.ok) return navigate('/demo/review');
+    // The server names the destination: the real workspace when an entry is configured for this account, else the overview.
+    if (res?.ok) return navigate(typeof res.data.to === 'string' && res.data.to.startsWith('/w/') ? res.data.to : '/demo/review');
     setError(res?.data.error ?? 'Sign-in failed. Please try again.');
   }
 

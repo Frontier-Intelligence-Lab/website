@@ -40,13 +40,17 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
   const navigate = useNavigate();
   const [signOutState, setSignOutState] = useState('idle');
   const [collapsed, setCollapsed] = useState(storedCollapsed);
+  // A reviewer-derived session (src/lib/demo-access.js): the real workspace as a dedicated demo identity, with the
+  // server refusing team, machine, job, approval, funding and account actions. The UI only explains that.
+  const demo = account.demoAccess ?? null;
   async function signOut() {
     setSignOutState('pending');
-    const res = await api.signout().catch(() => null);
+    // The reviewer sign-out ends the reviewer session and the workspace entry derived from it in one step.
+    const res = await (demo ? api.logout() : api.signout()).catch(() => null);
     if (!res?.ok) return setSignOutState('failed');
     // The signed-in person is gone from this tab, so its local-memory keys go too; the memories stay in the store.
     forgetConnections();
-    navigate('/signin');
+    navigate(demo ? '/demo' : '/signin');
   }
   const toggle = () => {
     const next = !collapsed;
@@ -64,10 +68,10 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
           <div className="ob-brand"><span className="dash-mark" aria-hidden="true" /><strong>Valcairn</strong></div>
           <button type="button" className="ob-side-toggle" onClick={toggle} aria-expanded={!collapsed} aria-label={toggleLabel} title={toggleLabel}><Icon name="panel" size={16} stroke={2} /></button>
         </div>
-        <Link className="ob-org-switch" to="/start" aria-label="Switch or add a workspace" title={entry.name}>
+        <Link className="ob-org-switch" to={demo ? `/w/${entry.slug}` : '/start'} aria-label={demo ? 'Workspace' : 'Switch or add a workspace'} title={entry.name}>
           <span className="ob-monogram ob-monogram--sm" aria-hidden="true">{initials(entry.name)}</span>
-          <span className="ob-org-text" style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 14 }}>{entry.name}</strong><span className="ob-muted" style={{ fontSize: 12 }}>{entry.kind === 'personal' ? 'Personal' : roleName(role)}</span></span>
-          <Icon name="updown" size={14} />
+          <span className="ob-org-text" style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 14 }}>{entry.name}</strong><span className="ob-muted" style={{ fontSize: 12 }}>{entry.kind === 'personal' ? 'Personal' : roleName(role)}{demo ? ' · reviewer demo' : ''}</span></span>
+          {!demo && <Icon name="updown" size={14} />}
         </Link>
         <nav aria-label="Workspace">
           <Link to={`/w/${entry.slug}`} title="Projects" aria-current={current === 'projects' ? 'page' : undefined}><Tile icon="grid" tone="orange" size="sm" /><span className="ob-side-label">Projects</span></Link>
@@ -95,7 +99,9 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
           <Link to={`/w/${entry.slug}/agents`} title="Agents" aria-current={current === 'agents' ? 'page' : undefined}><Tile icon="target" tone="blue" size="sm" /><span className="ob-side-label">Agents</span></Link>
           <Link to={`/w/${entry.slug}/compute`} title="Compute" aria-current={current === 'compute' ? 'page' : undefined}><Tile icon="panel" tone="teal" size="sm" /><span className="ob-side-label">Compute</span></Link>
           {entry.kind === 'organization' && CAPITAL_ROLES.includes(role) && <Link to={`/w/${entry.slug}/capital`} title="Capital" aria-current={current.startsWith('capital') ? 'page' : undefined}><Tile icon="bank" tone="amber" size="sm" /><span className="ob-side-label">Capital</span></Link>}
-          {entry.kind === 'organization' && <Link to={`/w/${entry.slug}/setup/team`} title="Team"><Tile icon="people" tone="violet" size="sm" /><span className="ob-side-label">Team</span></Link>}
+          {entry.kind === 'organization' && !demo && <Link to={`/w/${entry.slug}/setup/team`} title="Team"><Tile icon="people" tone="violet" size="sm" /><span className="ob-side-label">Team</span></Link>}
+          {demo && <Link to="/demo/review" title="Reviewer overview"><Tile icon="shield" tone="plain" size="sm" /><span className="ob-side-label">Reviewer overview</span></Link>}
+          {demo?.reviewer.role === 'admin' && <Link to="/demo/review#access-log" title="Sign-in log (admin reviewers)"><Tile icon="clock" tone="plain" size="sm" /><span className="ob-side-label">Sign-in log</span></Link>}
           {account.isStaff && <Link to="/staff" title={account.staffScope === 'demo_workspace' ? 'Review queue: synthetic demo workspace only' : 'Review queue'}><Tile icon="shield" tone="green" size="sm" /><span className="ob-side-label">Review queue</span>{account.staffScope === 'demo_workspace' && <span className="ob-badge">demo only</span>}</Link>}
           {account.isStaff && <Link to="/staff/capital" title={account.staffScope === 'demo_workspace' ? 'Capital review: synthetic demo workspace only' : 'Capital review'}><Tile icon="bank" tone="green" size="sm" /><span className="ob-side-label">Capital review</span>{account.staffScope === 'demo_workspace' && <span className="ob-badge">demo only</span>}</Link>}
         </nav>
@@ -110,6 +116,7 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
         </div>
       </aside>
       <main className="ob-body">
+        {demo && <p className="ob-alert" role="note"><strong>Reviewer demo mode.</strong> Signed in as reviewer <strong>{demo.reviewer.username}</strong>, working as the dedicated demo owner “{account.user.name}” of the synthetic organization {entry.name}, which exists only for this demonstration. You can plan, edit and evaluate here, request model pulls and draft plans, record your own local device runs and draft Capital cases. Linking machines, starting or cancelling jobs, approving plans, sending Capital to review, credit records, team and account changes are off for reviewers; the Valcairn operator does those separately.</p>}
         {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Its inputs are generated samples and it is not a real customer. The statuses and results shown here are only what was actually recorded in it: reviews, dataset versions, imported-answer evaluations, and any training or export that an approved plan ran on a linked compatible machine. Hosted GPU scheduling and charges, deployment and funding are planned, not running.</p>}
         {children}
       </main>

@@ -315,8 +315,9 @@ export function OrgMatch() {
 }
 
 export async function teamLoader({ params }) {
-  const { entry } = await requireWorkspace(params.slug);
-  if (entry.kind !== 'organization') throw redirect(`/w/${entry.slug}`);
+  const { account, entry } = await requireWorkspace(params.slug);
+  // Team administration is off in the reviewer demo (the server refuses it too); the page simply is not offered.
+  if (entry.kind !== 'organization' || account.demoAccess) throw redirect(`/w/${entry.slug}`);
   return { entry, detail: await api.workspace(entry.id) };
 }
 

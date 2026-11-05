@@ -23,6 +23,7 @@ export const api = {
   login: (fields) => request('/api/login', fields),
   logout: () => request('/api/logout', {}),
   demoOverview: () => request('/api/demo/overview'),
+  demoEnter: () => request('/api/demo/enter', {}),
 
   account: () => load('/api/account'),
   signup: (fields) => request('/api/account/signup', fields),

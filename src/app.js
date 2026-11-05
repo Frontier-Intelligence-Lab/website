@@ -23,6 +23,7 @@ import { registerCapitalRoutes } from './capital.js';
 import { registerEvalRoutes } from './eval.js';
 import { registerJobRoutes } from './jobs.js';
 import { UNAVAILABLE, buildDemoOverview } from './lib/demo-overview.js';
+import { DEMO_ALLOWED_MUTATIONS, DEMO_ALLOWED_READS, demoDestination, demoEntryFor, demoMarker, resolveDemoAccess } from './lib/demo-access.js';
 
 const DEFAULT_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 
@@ -155,7 +156,13 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
       return page(reply);
     });
   }
-  const helpers = { sameOrigin, privateHeaders, problem };
+  // Every registered API route, as "METHOD pattern". The reviewer-demo allowlist is checked against it below, so an
+  // entry that names no real route stops startup instead of silently permitting or masking anything.
+  const registeredRoutes = new Set();
+  app.addHook('onRoute', (route) => { for (const method of [].concat(route.method)) registeredRoutes.add(`${method} ${route.url}`); });
+  app.decorate('registeredRoutes', registeredRoutes);
+
+  const helpers = { sameOrigin, privateHeaders, problem, reviewerOf };
   const { guards } = await registerAccountRoutes(app, { config, store: accountStore, mailTransport, rateLimits, helpers });
   registerDatasetRoutes(app, { config, store: accountStore, helpers, guards, ingestClient });
   registerWorkspaceDataRoutes(app, { config, store: accountStore, helpers, guards });
@@ -164,6 +171,21 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   registerCapitalRoutes(app, { config, store: accountStore, helpers, guards });
   registerEvalRoutes(app, { store: accountStore, helpers, guards });
   registerJobRoutes(app, { config, store: accountStore, helpers, guards });
+  for (const url of DEMO_ALLOWED_MUTATIONS) if (!registeredRoutes.has(`POST ${url}`)) throw new Error(`reviewer demo allowlist names an unregistered route: POST ${url}`);
+  for (const url of DEMO_ALLOWED_READS) if (!registeredRoutes.has(`GET ${url}`)) throw new Error(`reviewer demo allowlist names an unregistered route: GET ${url}`);
+
+  // Reviewer entry into the real workspace (src/lib/demo-access.js): derives the configured dedicated identity for
+  // the current reviewer and records it in this session. Never on a session that holds a normal account, and never
+  // from anything the client names: the mapping, workspace and user all come from server configuration.
+  const demoEntry = async (request) => {
+    const reviewer = await reviewerOf(request);
+    if (!reviewer) return { code: 'reviewer' };
+    if (request.session.get('account')?.userId) return { code: 'account_session' };
+    const access = await resolveDemoAccess({ config, store: accountStore, reviewer });
+    if (!access) return { code: 'unavailable' };
+    request.session.set('demoAccess', { ...demoMarker(access), enteredAt: new Date().toISOString() });
+    return { to: demoDestination(access), workspace: access.workspace };
+  };
 
   app.get('/api/config', async () => ({
     bookingUrl: config.bookingUrl,
@@ -212,8 +234,20 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
     request.session.set('reviewer', { ...reviewer, signedInAt: new Date().toISOString() });
     await signins.record({ event: 'signin', username: reviewer.username });
     request.log.info({ username: reviewer.username }, 'reviewer signed in');
-    return { reviewer: request.session.get('reviewer') };
+    // On a fresh session the configured workspace entry, if any, is derived now and the real destination returned.
+    const entry = await demoEntry(request);
+    return { reviewer: request.session.get('reviewer'), ...(entry.to ? { to: entry.to, workspace: entry.workspace } : {}) };
   });
+  // An existing reviewer session enters the workspace with a same-origin POST; no authority ever comes from a GET.
+  app.post('/api/demo/enter', { preHandler: sameOrigin }, async (request, reply) => {
+    privateHeaders(reply);
+    const entry = await demoEntry(request);
+    if (entry.code === 'reviewer') return problem(reply, 401, 'Sign in first.');
+    if (entry.code === 'account_session') return problem(reply, 409, 'This browser is signed in to a workspace account. Sign out of it before opening the reviewer demo.', { code: 'account_session' });
+    if (entry.code) return problem(reply, 403, 'The workspace entry for this reviewer account is not configured on this server.', { code: 'demo_entry_unavailable' });
+    return entry;
+  });
+  // Ends the reviewer session and with it any workspace entry derived from it.
   app.post('/api/logout', { preHandler: sameOrigin }, async (request) => {
     const reviewer = request.session.get('reviewer') ?? null;
     await request.session.destroy();
@@ -221,13 +255,26 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
     return { ok: true };
   });
 
-  // The reviewer overview: actual records of the one workspace named by DEMO_WORKSPACE_ID, read-only. The reviewer
-  // account is re-checked like everywhere else (a disabled one is signed out), nothing in the request selects a
-  // workspace, and session.account is never read or written here.
+  // The reviewer overview, read-only. A reviewer with a configured entry sees its OWN organization, resolved from its
+  // username through the same checks as workspace entry (no marker needed yet), or a plain unavailable answer when
+  // any check fails. Only an ADMIN reviewer without an entry sees the operator overview of DEMO_WORKSPACE_ID; a
+  // viewer without an entry (unset, empty or removed mapping) gets nothing, never the operator's records. Nothing in
+  // the request selects a workspace; session.account is never read or written here.
   app.get('/api/demo/overview', async (request, reply) => {
     privateHeaders(reply);
-    if (!(await reviewerOf(request))) return problem(reply, 401, 'Sign in first.');
-    const result = await buildDemoOverview({ store: accountStore, workspaceId: config.demoWorkspaceId });
+    const reviewer = await reviewerOf(request);
+    if (!reviewer) return problem(reply, 401, 'Sign in first.');
+    let workspaceId;
+    if (demoEntryFor(config, reviewer)) {
+      const access = await resolveDemoAccess({ config, store: accountStore, reviewer });
+      if (!access) return problem(reply, 503, 'The demo organization configured for this reviewer account is not available right now.', { code: 'demo_entry_unavailable' });
+      workspaceId = access.workspace.id;
+    } else if (reviewer.role === 'admin') {
+      workspaceId = config.demoWorkspaceId;
+    } else {
+      return problem(reply, 403, 'No demo organization is configured for this reviewer account.', { code: 'demo_overview_unavailable' });
+    }
+    const result = await buildDemoOverview({ store: accountStore, workspaceId });
     return result.code ? problem(reply, 503, UNAVAILABLE[result.code], { code: result.code }) : result.overview;
   });
 

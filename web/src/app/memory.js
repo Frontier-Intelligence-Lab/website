@@ -62,6 +62,21 @@ export function forgetConnections(storage) {
 }
 
 /**
+ * Cleanup decided before a page renders, when a route loader has already confirmed there is no reviewer session.
+ * The keys are forgotten only when the ordinary account is confirmed absent too: a normal workspace account may
+ * simply be visiting the reviewer pages and keeps its connection. A failed account check (network, server without
+ * accounts) confirms nothing and leaves the keys alone. Returns whether the keys were forgotten.
+ */
+export async function forgetIfSignedOut({ reviewer, fetchAccount, forget = forgetConnections }) {
+  if (reviewer) return false;
+  let account;
+  try { account = await fetchAccount(); } catch { return false; }
+  if (account?.user) return false;
+  forget();
+  return true;
+}
+
+/**
  * Operation identity for one action: only its newest run may change state. Starting a run aborts the previous one;
  * a run that was stopped, replaced or answered late finds itself no longer current and must change nothing.
  */

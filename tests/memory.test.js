@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { loadConfig } from '../src/config.js';
-import { LIMITS, MemoryError, connectMemory, createMemoryClient, derivedSources, fileImport, forgetConnections, newest, primarySource, readConnection, readTextFile, referencePrompt, sourcesForSave, toPassage, writeConnection } from '../web/src/app/memory.js';
+import { LIMITS, MemoryError, connectMemory, createMemoryClient, derivedSources, fileImport, forgetConnections, forgetIfSignedOut, newest, primarySource, readConnection, readTextFile, referencePrompt, sourcesForSave, toPassage, writeConnection } from '../web/src/app/memory.js';
 import { makeApp, json, postHeaders } from './helpers.js';
 
 const KEY = 'qa-only-synthetic-key';
@@ -221,6 +221,21 @@ test('the connection lives in session storage per workspace and person, and disc
   assert.equal(readConnection('ws-1', 'user-1', storage), null);
   assert.equal(storage.length, 0);
   assert.equal(readConnection('ws-1', 'user-1', undefined), null, 'no storage at all is not an error');
+});
+
+test('a route loader forgets the connection only when both the reviewer and the ordinary account are confirmed absent', async () => {
+  const conn = { origin: 'http://127.0.0.1:8787', key: KEY, scope: SCOPE };
+  const run = async ({ reviewer, fetchAccount }) => {
+    const storage = fakeStorage();
+    writeConnection('ws-1', 'user-1', conn, storage);
+    const forgotten = await forgetIfSignedOut({ reviewer, fetchAccount, forget: () => forgetConnections(storage) });
+    return { forgotten, kept: readConnection('ws-1', 'user-1', storage) !== null };
+  };
+  assert.deepEqual(await run({ reviewer: null, fetchAccount: async () => ({ user: null, signupOpen: false }) }), { forgotten: true, kept: false }, 'no reviewer and no account: the keys go before the redirect');
+  assert.deepEqual(await run({ reviewer: { username: 'ycinsider' }, fetchAccount: async () => { throw new Error('must not be asked'); } }), { forgotten: false, kept: true }, 'a live reviewer keeps everything');
+  assert.deepEqual(await run({ reviewer: null, fetchAccount: async () => ({ user: { id: 'u1' }, workspaces: [] }) }), { forgotten: false, kept: true }, 'an ordinary account visiting the reviewer pages keeps its connection');
+  assert.deepEqual(await run({ reviewer: null, fetchAccount: async () => { throw new Response('', { status: 503 }); } }), { forgotten: false, kept: true }, 'a failed account check confirms nothing');
+  assert.deepEqual(await run({ reviewer: null, fetchAccount: async () => { throw new TypeError('network'); } }), { forgotten: false, kept: true }, 'nor does a network failure');
 });
 
 test('an imported file is checked by size first, decoded strictly, and digested as the bytes picked', async () => {

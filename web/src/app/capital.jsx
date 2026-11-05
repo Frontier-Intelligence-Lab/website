@@ -175,7 +175,7 @@ export function CapitalHome() {
               <div><button className="btn-app" type="submit" disabled={state.pending}>{state.pending ? 'Creating…' : 'Create case'}</button></div>
             </form>
           </section>
-          <Credits entry={entry} credits={credits} />
+          <Credits entry={entry} credits={credits} readOnly={Boolean(account.demoAccess)} />
         </div>
         <aside className="ds-side">
           <section className="ob-card">
@@ -202,7 +202,7 @@ export function CapitalHome() {
 
 const blankCredit = { provider: '', status: 'claimed', amount: '', expiresOn: '', restrictions: '', reference: '' };
 
-function Credits({ entry, credits }) {
+function Credits({ entry, credits, readOnly = false }) {
   const revalidator = useRevalidator();
   const [form, setForm] = useState({ ...blankCredit, supersedes: null });
   const [state, setState] = useState({ pending: false, error: null, errors: {} });
@@ -225,8 +225,9 @@ function Credits({ entry, credits }) {
     <section className="ob-card">
       <div className="row-between"><h2>Outside credits</h2><span className="ob-muted" style={{ fontSize: 12.5 }}>{plural(current.length, 'current record')}</span></div>
       <p className="ob-muted">Credits a provider has promised or confirmed to the company, as you state them. They are not a Valcairn balance and cannot be spent here. A correction adds a new record; the old one stays on file.</p>
-      {current.length > 0 && <CreditTable credits={current} onCorrect={correct} />}
+      {current.length > 0 && <CreditTable credits={current} onCorrect={readOnly ? undefined : correct} />}
       {history.length > 0 && <details><summary>Corrected records · {history.length}</summary><ul className="ob-list">{history.map((c) => <li key={c.id}><div><strong>{c.provider} · {formatUsd(c.amountCents)}</strong><span className="ob-muted">{CREDIT_STATUS[c.status]?.[0]} · recorded {date(c.createdAt)} · corrected later</span></div></li>)}</ul></details>}
+      {readOnly ? <p className="ob-muted">Recording or correcting a credit is off in the reviewer demo; the server refuses it. The records above are what the workspace recorded.</p> : (
       <form className="cap-form" onSubmit={save} noValidate>
         <h3 className="cap-h3">{form.supersedes ? 'Correct a record' : 'Add a credit record'}</h3>
         {state.error && <p className="ob-alert" role="alert">{state.error}</p>}
@@ -243,6 +244,7 @@ function Credits({ entry, credits }) {
           {form.supersedes && <button type="button" className="btn-ghost" onClick={() => setForm({ ...blankCredit, supersedes: null })}>Cancel</button>}
         </div>
       </form>
+      )}
     </section>
   );
 }
@@ -416,7 +418,9 @@ export function CapitalRequest() {
   const set = (patch) => { setForm((f) => ({ ...f, ...patch })); setNotice(null); };
   const company = (patch) => set({ company: { ...form.company, ...patch } });
   const readOnly = locked || status.pending;
-  const sender = SENDERS.includes(role);
+  // In the reviewer demo the server refuses sending and withdrawing; the draft and its evidence stay editable.
+  const sender = SENDERS.includes(role) && !data.account?.demoAccess;
+  const senderNote = data.account?.demoAccess ? 'Sending to Valcairn’s internal review is off in the reviewer demo; the workspace operator does that separately.' : null;
   const latest = submissions.at(-1) ?? null;
   const currentCredits = credits.filter((c) => !c.supersededBy);
   const linkedProject = options.projects.find((p) => p.id === kase.projectId);
@@ -541,7 +545,7 @@ export function CapitalRequest() {
             {locked ? (
               <>
                 <p className="ob-muted">Revision {kase.submittedRevision} was sent {date(latest?.submittedAt)}. Staff can request changes or mark the evidence reviewed. That is an internal check, not a credit decision.</p>
-                {sender ? <button type="button" className="btn-ghost" disabled={send.pending} onClick={withdraw}>{send.pending ? 'Withdrawing…' : 'Withdraw from review'}</button> : <p className="ob-muted">An owner or admin can withdraw it.</p>}
+                {sender ? <button type="button" className="btn-ghost" disabled={send.pending} onClick={withdraw}>{send.pending ? 'Withdrawing…' : 'Withdraw from review'}</button> : <p className="ob-muted">{senderNote ?? 'An owner or admin can withdraw it.'}</p>}
               </>
             ) : step.action === 'save' ? (
               <>
@@ -556,7 +560,7 @@ export function CapitalRequest() {
                 <label className="ob-check"><input type="checkbox" checked={consent} disabled={send.pending} onChange={(e) => setConsentHash(e.target.checked ? contentHash : null)} />I have read this request, its plan, evidence and credit records as listed on this page, and choose to send them to Valcairn’s internal review.</label>
                 <button type="button" className="btn-app" disabled={step.action !== 'send'} onClick={sendForReview}>{send.pending ? 'Sending…' : `Send revision ${kase.revision} to review`}</button>
               </>
-            ) : <p className="ob-muted">An owner or admin sends the request to Valcairn’s internal review.</p>}
+            ) : <p className="ob-muted">{senderNote ?? 'An owner or admin sends the request to Valcairn’s internal review.'}</p>}
           </section>
           {submissions.length > 0 && (
             <section className="ob-card">
