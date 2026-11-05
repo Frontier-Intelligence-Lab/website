@@ -434,6 +434,28 @@ class FeatureGuards(unittest.TestCase):
             with self.subTest(case=name), self.assertRaises(deploy.ReleaseError):
                 deploy.verify_tables(ledger, present)
 
+    def test_qualified_validators_repair_is_function_only_and_the_ledger_accepts_it(self):
+        """016 re-creates the Capital and Evaluation validators that call other validators, with schema-qualified nested calls,
+        so a backup holding Capital or Evaluation rows restores under pg_restore's empty search_path. It adds no table, grant
+        or row statement, so no table group, grant or digest changes, and the ledger-aware presence check accepts it beside
+        013 alone, 014, 015 or both."""
+        name = "016_qualified_validators.sql"
+        statements = re.sub(r"--[^\n]*", "", (MIGRATIONS / name).read_text())
+        self.assertEqual(re.findall(r"^CREATE OR REPLACE FUNCTION public\.([a-z_]+)\(", statements, re.MULTILINE), ["capital_cost_item_valid", "capital_draft_valid", "eval_acceptance_valid"])
+        self.assertIsNone(re.search(r"\b(CREATE TABLE|ALTER|GRANT|REVOKE|INSERT|UPDATE|DELETE|DROP|TRUNCATE|SET)\b", statements, re.IGNORECASE))
+        self.assertNotIn("016", deploy.TABLE_GROUPS)
+        self.assertEqual(ledger_through("016"), ledger_through("015") + [name])
+        thirteen, base = ledger_through("013"), tables_through("013")
+        accepted = ((thirteen + [name], base), (thirteen + ["014_jobs.sql", name], base + JOBS),
+                    (thirteen + ["015_evaluation.sql", name], base + EVALUATION), (ledger_through("016"), deploy.KNOWN_TABLES))
+        for ledger, present in accepted:
+            with self.subTest(ledger=ledger[13:]):
+                self.assertEqual(deploy.verify_tables(ledger, present), (sorted(present), sorted(set(deploy.KNOWN_TABLES) - set(present))))
+        # 016 in the ledger never excuses an unlisted, missing or partial table group.
+        for ledger, present in ((thirteen + [name], base + JOBS), (thirteen + ["014_jobs.sql", name], base), (ledger_through("016"), tables_through("015")[:-1])):
+            with self.subTest(ledger=ledger[13:]), self.assertRaises(deploy.ReleaseError):
+                deploy.verify_tables(ledger, present)
+
     def test_grant_contract_is_explicit_and_never_deletes_immutable_records(self):
         self.assertEqual(set(deploy.GRANTS) - set(deploy.KNOWN_TABLES), set())
         for table in ("enhance_runs", "device_reports", "execution_runs", "capital_submissions", "credit_records", "capital_review_marks",
@@ -1385,6 +1407,29 @@ class PostgresSemantics(unittest.TestCase):
         self.assertEqual(self.node(self.urls["app"], "await pool.query('SELECT 1 FROM projects FOR UPDATE');console.log('{}');"), {})
         self.role_contract(app, migrator)
         self.landed_feature_schema(app)
+
+    def test_qualified_validators_repair_lands_after_jobs_and_evaluation_against_a_real_database(self):
+        """Production at 013 receives 014, 015 and 016 in one migrator run: 016 replaces functions only, the ledger-aware presence
+        check accepts the full schema, a rerun applies nothing, the grant contract is unchanged, and both repaired validator
+        chains resolve under the empty search_path pg_restore uses."""
+        app = self.roles["app"]
+        self.reset_schema()
+        self.assertEqual(self.migrate("013"), ledger_through("013"))
+        self.assertEqual(self.migrate("016"), ["014_jobs.sql", "015_evaluation.sql", "016_qualified_validators.sql"])
+        self.assertEqual(self.migrate("016"), [])
+        record = self.snapshot(self.urls["migrator"])
+        self.assertEqual((deploy.verify_tables(record["ledger"], record["tables"]), len(record["ledger"])), ((sorted(deploy.KNOWN_TABLES), []), 16))
+        release = self.release_as(app)
+        release.ensure_grants()
+        self.assertEqual((release.receipt["grants"]["tables"], release.receipt["grants"]["sequences"]), ({t: list(p) for t, p in deploy.GRANTS.items()}, {"job_events_id_seq": ["USAGE"]}))
+        drafts = [{"costItems": [{"amountCents": cents, "category": "compute", "period": "monthly", "basis": "quoted"}]} for cents in (1, -1)]
+        rules = [{"version": 1, "scoreBasis": "human_only", "minPassRate": rate, "minCoverage": 1, "criticalMustPass": True, "requireHumanOnCritical": True,
+                  "requireHumanOnDisagreement": True, "requireHumanWhenNoExpectedAnswer": True} for rate in (0.9, 1.5)]
+        probe = ("const c=await pool.connect();try{await c.query('BEGIN');await c.query(\"SET LOCAL search_path = ''\");"
+                 "console.log(JSON.stringify((await c.query('SELECT public.capital_draft_valid($1::jsonb) AS ok,public.capital_draft_valid($2::jsonb) AS bad,"
+                 "public.eval_acceptance_valid($3::jsonb) AS rule,public.eval_acceptance_valid($4::jsonb) AS bad_rule',"
+                 + json.dumps([json.dumps(d) for d in drafts + rules]) + ")).rows[0]));await c.query('ROLLBACK');}finally{c.release();}")
+        self.assertEqual(self.node(self.urls["app"], probe), {"ok": True, "bad": False, "rule": True, "bad_rule": False})
 
 
 if __name__ == "__main__":

@@ -68,6 +68,9 @@ jobs:
       - run: env -u DATABASE_URL npm run check
         env:
           TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/valcairn_ci_test
+          # tests/restore.test.js runs the real pg_dump and pg_restore inside the service container, whose tools
+          # match its server; the runner's own client tools may be older than PostgreSQL 17.
+          PG_TOOLS_CONTAINER: ${{ job.services.postgres.id }}
 
   ingest:
     name: Ingest / Rust 1.99.1

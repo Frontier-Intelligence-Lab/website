@@ -245,6 +245,8 @@ Remove-Item Env:TEST_DATABASE_URL
 
 With `TEST_DATABASE_URL` unset, the Postgres suite skips cleanly and `npm run check` still runs without a database.
 
+`tests/restore.test.js` additionally proves that a populated backup restores: it creates sibling `*_test_*` databases on the same server, runs the real `pg_dump` and `pg_restore` against them and drops them. It needs client tools at least as new as the server, found on `PATH`, in the directory named by `PG_BIN`, or inside the Docker container named by `PG_TOOLS_CONTAINER` (CI points this at its PostgreSQL service container, whose tools match). Those tools run with every `PG*` and `DOCKER_*` variable removed from their environment and the URL's password passed only as `PGPASSWORD`; `NODE_PG_FORCE_NATIVE` and `PGOPTIONS` are refused. Docker is always pinned with `-H` to the platform's local socket or named pipe (or to `DOCKER_HOST` when that is itself one); a TCP or SSH `DOCKER_HOST` or a selected `DOCKER_CONTEXT` is refused before docker runs, and a container is used only after `docker inspect` shows its own environment carries no libpq variable (`PGDATA` and the image's `PG_*` version facts are fine). Without the tools the test skips with the reason, except in the hosted job, where it fails.
+
 ### Migrations and schema
 
 `scripts/migrate.js` applies numbered SQL files in order, records their SHA-256 checksums in `schema_migrations`, and commits each file and its ledger entry atomically. It serializes concurrent runners with a database/schema advisory lock. Applied files must remain unchanged; append a new numbered migration instead. The exported `applyMigrations({ pool })` also accepts an existing `pg.Pool`, which lets the tests select an isolated schema without modifying the SQL files.
