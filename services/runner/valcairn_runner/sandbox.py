@@ -27,7 +27,7 @@ class Step:
     image: str
     command: list[str]
     gpus: bool = False
-    entrypoint: str | None = None  # "" clears the image's own entrypoint
+    entrypoint: str | None = None  # "" clears the image's own entrypoint (export runs the GGUF converter directly)
     network: str = "none"  # only the fetch step uses "bridge"
     inputs: dict[str, str] = field(default_factory=dict)  # host path -> container path, mounted read-only
     output: str | None = None  # host directory mounted at /out

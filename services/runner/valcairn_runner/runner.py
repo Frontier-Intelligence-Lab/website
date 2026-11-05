@@ -23,7 +23,10 @@ class RunnerHalted(Exception):
 class Settings:
     ollama_host: str = "http://127.0.0.1:11434"
     probe_image: str = "ubuntu:24.04"
-    train_image: str = "valcairn-train:0.1"
+    # The training image is built from images/train for each runner release, because it ships the runner's shared
+    # example rules; an older tag would apply older rules. A tag is a mutable local name; set VALCAIRN_TRAIN_IMAGE
+    # to an image ID to pin one build. There is no fallback to another tag when this one is missing.
+    train_image: str = "valcairn-train:0.4.0"
     # llama.cpp's published image, pinned by digest (convert_hf_to_gguf.py and quantize).
     convert_image: str = "ghcr.io/ggml-org/llama.cpp@sha256:e414b8b4a5b8618b13292095cde7bd6520b01124c6d1c3b800c4b0382a2851cb"
     home: str = ""  # where inputs, model caches and outputs live; defaults to ~/.valcairn-runner

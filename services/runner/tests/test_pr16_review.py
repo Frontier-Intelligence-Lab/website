@@ -9,7 +9,8 @@ import threading
 import unittest
 from pathlib import Path
 
-from fixtures_runner import EXPORT_JOB, TRAIN_JOB, Box, Ctx, Inputs, Ollama, export_spec, serve_data, trained
+from fixtures_runner import TRAIN_JOB, Box, Ctx, Inputs, serve_data, trained
+from fixtures_export import EXPORT_JOB, Ollama, export_spec
 from valcairn_runner import examples, export as exporter, training
 from valcairn_runner.sandbox import Cancelled
 from valcairn_runner.training import JobFailure
@@ -291,8 +292,8 @@ class Cleanup(unittest.TestCase):
 
             def read(self, n):
                 raise OSError("connection reset")
-        with self.assertRaises(OSError):
-            training.download("http://ingest/x", dest, "0" * 64, opener=lambda url, timeout: Broken())
+        with self.assertRaises(JobFailure):  # a network error becomes a retryable dataset_error, the link never shown
+            training.download("https://ingest.example/x", dest, "0" * 64, opener=lambda url, cancelled, deadline, name, context: (None, Broken()))
         self.assertEqual(list(dest.parent.iterdir()), [])
 
     def test_a_cancelled_training_attempt_keeps_no_dataset_bytes(self):

@@ -8,8 +8,6 @@ from .export import export
 from .training import JobFailure, train
 
 
-
-
 def probe(ctx) -> dict:
     """Sandbox check: start a locked-down container with the GPUs and read them from inside it."""
     caps = ctx.capabilities
