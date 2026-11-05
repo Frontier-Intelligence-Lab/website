@@ -5,13 +5,25 @@ The Valcairn Runner runs Valcairn jobs on your own machine: a workstation, a GPU
 | Job | Status |
 | --- | --- |
 | `probe`: start a sandbox with no network, read the GPUs from inside it, check Ollama | Implemented and run against a real RTX 5090 with Docker Desktop and Ollama 0.40.13. |
-| `train`, `evaluate`, `export` | **Planned**, as separate increments. A job of these kinds ends as `unsupported` until its handler lands. |
+| `train`: LoRA fine-tuning of an approved plan's base model on its frozen dataset versions, with held-out loss of the base and the tuned model | Implemented (runner 0.2). Author-reported run on a real RTX 5090, before the lineage and split repairs of runner 0.4: on a synthetic 252-example support set with Qwen3-0.6B, held-out loss fell from 4.4707 on the base model to 0.0785 after 58 steps (38 s). Not independently reproduced. |
+| Held-out answers (part of `train`): base and tuned each answer the held-out examples; token F1 and exact match against the reference | Implemented. Same author-reported run: token F1 21.7% → 99.1%, exact match 0% → 83% on 24 held-out examples. These show adaptation to a narrow, templated synthetic task; token F1 is not the customer's acceptance rule. |
+| `evaluate`, `export` | **Planned**, as separate increments. A job of these kinds ends as `unsupported` until its handler lands. |
 
 ## Requirements
 
 - Python 3.11 or later. The Runner uses only the standard library.
 - Docker (Docker Desktop on Windows and macOS). For GPU jobs, add the NVIDIA driver and GPU support in Docker: Docker Desktop on WSL 2, or the NVIDIA Container Toolkit on Linux.
 - Optional: Ollama on this machine (`http://127.0.0.1:11434` by default).
+
+## Build the training image (once per runner release, for `train`)
+
+```bash
+docker build -t valcairn-train:0.4.0 images/train
+```
+
+The image pins PyTorch 2.15 (CUDA 13.4), transformers 5.22.1, peft 0.21.2, trl 1.17.1, accelerate 1.15.0, datasets 5.1.0 and huggingface_hub 2.4.0. It needs an NVIDIA driver that supports CUDA 13.4.
+
+The tag follows the runner release because the image ships the runner's shared example rules (`images/train/examples.py`); an older image would apply older rules to the same job. The runner uses `valcairn-train:0.4.0` unless `VALCAIRN_TRAIN_IMAGE` says otherwise and never falls back to another tag: when the image is missing, Docker cannot start the step (`Unable to find image … locally`, exit code 125), the job fails, and the runner's own log shows why. An earlier `valcairn-train:0.1` is left alone; remove it by hand with `docker image rm` once you no longer need it. A tag is a mutable local name, not an immutable identity. To pin the exact build, set `VALCAIRN_TRAIN_IMAGE` to its image ID (the `sha256:…` value from `docker image inspect -f '{{.Id}}' valcairn-train:0.4.0`, which `docker run` accepts); the training manifest records the configured image reference as it is, so it then names that exact build. The converter image is already pinned by digest (`VALCAIRN_CONVERT_IMAGE`).
 
 ## Link and run
 
@@ -45,6 +57,24 @@ VALCAIRN_URL=https://your-valcairn-site VALCAIRN_RUNNER_KEY_FILE=~/.valcairn-run
 | `VALCAIRN_RUNNER_KEY` | none | The key itself, if no file is set. |
 | `OLLAMA_HOST_URL` | `http://127.0.0.1:11434` | The Ollama on this machine. Cloud models (those with a remote host) are never reported as local. |
 | `VALCAIRN_PROBE_IMAGE` | `ubuntu:24.04` | The image the sandbox check starts. |
+| `VALCAIRN_TRAIN_IMAGE` | `valcairn-train:0.4.0` | The training image built above: a tag, or an image ID to pin one build. No other tag is tried when it is missing. |
+| `VALCAIRN_RUNNER_HOME` | `~/.valcairn-runner` | Where job inputs, model caches (`models/`) and outputs (`jobs/<id>/attempt-<n>/out`) are kept. |
+| `VALCAIRN_TRAIN_MEMORY` | `32g` | Memory limit of the training container. |
+| `HF_TOKEN` | none | not read by the runner today; gated models are not fetched. |
+
+Not yet verified: the writable output folders under the sandbox user (UID 65534) on Linux hosts, and the pinned packages and images resolving together on a fresh machine. Record the image digests you built before claiming a run is reproducible.
+
+## How a training job runs
+
+1. **Inputs.** The runner checks that the job id is a Valcairn UUID and the attempt a small number before any path is built from them, and every folder it writes or removes must stay inside the runner home without passing through a link. It asks Valcairn for the job's inputs: the base model's source and short-lived signed links to the frozen files of each dataset version. A link must be a well-formed `https://` link (verified against the system's certificate trust), or `http://` to this machine for development; any other scheme or a malformed link is refused unopened (a `file:` link would read a local file as dataset bytes), a redirect is never followed, and only a 200 reply is accepted. It downloads the `.jsonl` files (any letter case; up to 2 GB each and 20 GB together), checks each file's SHA-256 against the version's manifest, and refuses any file that does not match. Each file has a total download deadline (30 minutes, whatever its size) and, while it downloads, the runner keeps looking at the cancel flag: a cancel or lost authority stops the transfer at once, closes the connection, removes the partial file, and never keeps a file whose last bytes arrived with the cancel. Partial downloads are always deleted, and a failed download is reported by file name, never by link.
+2. **Weights.** If the base model is not cached, a **fetch** step resolves the revision to one commit and downloads it into `models/<name>-<hash of source and revision>/`, recording the source, the commit and every file's SHA-256. Each later use checks that record, so another source, a changed config or tokenizer, or altered weights are fetched again rather than trained on. This is the only step with network access. It downloads only safetensors weights and plain config and tokenizer files: no pickled weights and no custom code (`trust_remote_code` is off).
+3. **Training** runs with `--network none`, with the weights and data mounted read-only. It uses LoRA (rank 32, alpha 64, all linear layers, 2 epochs, bf16). With more than one GPU it runs through `accelerate launch --multi_gpu`.
+4. **Held-out comparison.** About one distinct example in ten, chosen by a hash of its content so the split is reproducible, is held out. Identical examples stay together on one side, so no held-out example is also in the training split; with fewer than five distinct usable examples the job fails with `dataset_error` instead. The rules are in `valcairn_runner/examples.py`, which the image ships unchanged (`images/train/examples.py`). Their loss is measured on the unchanged base model first, then on the tuned model. The split's hashes are saved as `split.json`.
+5. **Result.** The adapter stays on this machine in safetensors, with `manifest.json`: the base model's source, revision and file hashes, the dataset files, the split, the settings and the adapter's files. Valcairn receives the adapter's SHA-256, size and location, the manifest's SHA-256, the base model's revision and hashes, the report (example counts, steps, time, GPUs, peak GPU memory, both held-out losses) and the live loss curve. These numbers are measured and reported by the runner. A successful run's dataset files stay under `jobs/<id>/` so export can find the held-out prompts; a failed or cancelled attempt keeps none of them.
+
+Examples are JSON lines: `{"messages": [{"role": "user", "content": "…"}, {"role": "assistant", "content": "…"}]}`, ending with the assistant answer that is scored and with a non-empty user turn before it (longer completed chats are fine), or `{"prompt": "…", "completion": "…"}` with a non-empty prompt. Other lines, including JSON that is not an object and chats whose last turn is an unanswered user turn, are counted as skipped. Only fine-tuning (`sft`) runs today; preference tuning and reinforcement learning steps in a plan are shown as skipped.
+
+Training steps also get a scratch `/cache` tmpfs where executables are allowed, because Triton compiles GPU kernels there and loads them. It is not persisted, and `/tmp` stays `noexec`.
 
 ## What the sandbox allows
 
