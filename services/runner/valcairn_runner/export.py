@@ -8,12 +8,20 @@ prompts, and only then publish the tuned model under its final name with a manif
   use it, so weights never go to another daemon through an inherited OLLAMA_HOST.
 - Names: models are created under a provisional name for this job and attempt and copied to the final name only after
   the load test passed. Nothing is ever created over an existing name, so a retry cannot replace an earlier result
-  or a model someone made by hand.
-- Cancellation and lost authority are checked before every conversion, model creation and load test.
+  or a model someone made by hand. Ollama has no create-only-if-absent, so this is a check followed by a create: a
+  model made by hand under exactly this job's provisional name in between would be replaced. The names carry the
+  job's UUID and attempt, so that takes a deliberate collision. A cancel known before the copy means no publication;
+  a cancel seen after the copy was dispatched ends the attempt and removes the copied model best effort, because
+  the copy itself cannot be undone atomically.
+- Cancellation and lost authority are checked before every conversion, model creation and load test, and again while
+  Ollama is answering a load-test request, whichever packet of the reply is awaited: the wait ends, the connection
+  is shut down and the answer is not used. Ollama stops a generation whose client is gone; that is its behaviour,
+  not something this runner confirms.
 Every container step runs with no network."""
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -30,10 +38,15 @@ from .examples import digest, is_data_file, normalise, prompt_turns
 from .sandbox import Cancelled, Limits, Step
 from .training import (JOB_ID, JobFailure, attempt_dir, cache_dir, check, confined, file_hashes, forward, remove,
                        runner_home, sha256_file, sha256_json, verified_cache)
+from .transport import exchange, shutdown
 
 QUANT = "q8_0"
 MAX_PROMPTS = 3
 CREATE_SECONDS = 1800
+CHAT_SECONDS = 300
+STOP_SECONDS = 10  # how long a killed `ollama create` client is waited for
+MAX_COUNTER = 2**53  # Ollama's token and nanosecond counters are small non-negative integers
+MAX_REPLY_BYTES = 1 << 20  # a non-streaming chat reply of 160 tokens is a few KB; more than this is not one
 
 
 # --- Ollama on this machine
@@ -78,39 +91,90 @@ def ollama_copy(host: str, source: str, destination: str, opener=None) -> None:
 
 
 def ollama_delete(host: str, name: str, opener=None) -> None:
-    """Best effort: removes a provisional model this export created."""
+    """Best effort: removes a model this export created (its provisional one, or its final one after a copy that
+    was dispatched before a cancel was seen)."""
     try:
         _http(host, "/api/delete", {"model": name}, method="DELETE", opener=opener, timeout=60)
     except (OSError, ValueError):
         pass
 
 
-def ollama_chat(host: str, model: str, messages: list[dict], opener=None) -> dict:
-    return _http(host, "/api/chat", {"model": model, "messages": messages, "stream": False, "think": False,
-                                     "options": {"temperature": 0, "seed": 7, "num_predict": 160}}, opener=opener)
+def ollama_chat(host: str, model: str, messages: list[dict], cancelled=None, timeout=CHAT_SECONDS) -> dict:
+    """One /api/chat request on its own connection, with the job's cancel flag looked at while Ollama is answering.
+    Every packet of the reply (status line, headers, body) is awaited through the cooperative transport, so a
+    cancel ends the wait within a slice wherever the reply stands, the connection is shut down (the daemon sees its
+    client go) and `Cancelled` is raised. An answer that arrives after the cancel was seen is not used either.
+    http.client follows no redirect, nothing is retried, the whole request is bounded by `timeout` and the reply
+    by `MAX_REPLY_BYTES`. The reply is returned as parsed JSON; its shape is checked by `chat_reply`."""
+    u = urllib.parse.urlsplit(host)
+    body = json.dumps({"model": model, "messages": messages, "stream": False, "think": False,
+                       "options": {"temperature": 0, "seed": 7, "num_predict": 160}}).encode()
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    try:
+        res = exchange(conn, "POST", "/api/chat", body, {"content-type": "application/json"}, cancelled, deadline,
+                       lambda: JobFailure("timeout", f"Ollama on this machine took too long to answer for {model}."))
+        status, raw = res.status, res.read(MAX_REPLY_BYTES + 1)
+    except (OSError, http.client.HTTPException):
+        if cancelled is not None and cancelled.is_set():
+            raise Cancelled() from None
+        raise JobFailure("runtime_error", f"Ollama on this machine did not answer for {model}.") from None
+    finally:
+        shutdown(conn)
+    if cancelled is not None and cancelled.is_set():
+        raise Cancelled()  # the answer came after the cancel was seen; it is not used
+    if status != 200:
+        raise JobFailure("runtime_error", f"Ollama on this machine refused a load-test request for {model} (HTTP {status}).")
+    if len(raw) > MAX_REPLY_BYTES:
+        raise JobFailure("runtime_error", f"Ollama on this machine returned a malformed reply for {model}.")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise JobFailure("runtime_error", f"Ollama on this machine returned a malformed reply for {model}.") from None
 
 
-def load_test(host: str, model: str, conversations: list[list[dict]], cancelled=None, opener=None) -> dict:
-    """The same held-out conversations, greedy decoding; speed from Ollama's own counters (nanoseconds)."""
+def chat_reply(reply, model: str) -> tuple[str, int, int]:
+    """The answer and Ollama's two counters (tokens, nanoseconds) from one /api/chat reply. A reply of another shape
+    is a clear failure: no exception from inside the parser, and no speed computed from a counter that is not one."""
+    malformed = JobFailure("runtime_error", f"Ollama on this machine returned a malformed reply for {model}.")
+    if not isinstance(reply, dict):
+        raise malformed
+    message = reply.get("message", {})
+    content = message.get("content", "") if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        raise malformed
+    counters = []
+    for key in ("eval_count", "eval_duration"):
+        value = reply.get(key, 0)  # Ollama leaves a zero counter out
+        if type(value) is not int or not 0 <= value <= MAX_COUNTER:  # no bool, float, NaN, negative or absurd value
+            raise malformed
+        counters.append(value)
+    return content.strip()[:600], counters[0], counters[1]
+
+
+def load_test(host: str, model: str, conversations: list[list[dict]], cancelled=None) -> dict:
+    """The same held-out conversations, greedy decoding; speed from Ollama's own counters (nanoseconds). The cancel
+    flag is looked at before each request, while Ollama answers it, and before its answer and counters are kept."""
     answers, tokens, eval_ns = [], 0, 0
     for turns in conversations:
         if cancelled is not None and cancelled.is_set():
             raise Cancelled()
         try:
-            r = ollama_chat(host, model, turns, opener)
+            r = ollama_chat(host, model, turns, cancelled)
         except (OSError, ValueError):
             raise JobFailure("runtime_error", f"Ollama on this machine did not answer for {model}.") from None
-        message = r.get("message") if isinstance(r, dict) else None
-        content = message.get("content") if isinstance(message, dict) else None
-        answers.append(content.strip()[:600] if isinstance(content, str) else "")
-        tokens += r.get("eval_count", 0) if isinstance(r.get("eval_count"), int) else 0
-        eval_ns += r.get("eval_duration", 0) if isinstance(r.get("eval_duration"), int) else 0
+        answer, count, ns = chat_reply(r, model)
+        answers.append(answer)
+        tokens += count
+        eval_ns += ns
     return {"model": model, "tokensPerSec": round(tokens / (eval_ns / 1e9), 1) if eval_ns else None, "answers": answers}
 
 
 def ollama_create(name: str, folder: Path, host: str, cancelled, popen=subprocess.Popen, seconds=CREATE_SECONDS) -> None:
     """Native Ollama: `ollama create` reads the Modelfile next to the GGUF and stores the model. It is sent to the
-    validated target only, and stopped if the job is cancelled while it runs."""
+    validated target only, and its client is killed if the job is cancelled or the time is up; the wait for the
+    killed client is bounded, and the job ends cancelled or timed out either way. Killing the client does not
+    prove the daemon dropped the create, so the caller treats the name as possibly created."""
     if cancelled.is_set():
         raise Cancelled()
     env = {**os.environ, "OLLAMA_HOST": host}
@@ -119,7 +183,10 @@ def ollama_create(name: str, folder: Path, host: str, cancelled, popen=subproces
     while proc.poll() is None:
         if cancelled.wait(0.5) or time.monotonic() > deadline:
             proc.kill()
-            proc.wait()
+            try:
+                proc.wait(timeout=STOP_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass  # a client that will not go does not change the outcome
             if cancelled.is_set():
                 raise Cancelled()
             raise JobFailure("timeout", "Ollama took too long to create the model.")
@@ -133,14 +200,27 @@ def _lost(message: str) -> JobFailure:
     return JobFailure("model_unavailable", message)
 
 
+def readable_manifest(manifest) -> bool:
+    """Whether this is a training manifest of the schema this runner writes, with every field export reads below."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != "valcairn.training/1":
+        return False
+    adapter, base = manifest.get("adapter"), manifest.get("baseModel")
+    return (isinstance(adapter, dict) and isinstance(adapter.get("files"), dict)
+            and isinstance(manifest.get("splitSha256"), str) and isinstance(manifest.get("dataFiles"), dict)
+            and isinstance(base, dict) and isinstance(base.get("source"), str) and isinstance(base.get("files"), dict))
+
+
 def verified_training(home: Path, source: dict) -> tuple[Path, dict]:
-    """The training run's folder and manifest, if everything export will use still matches what was frozen."""
+    """The training run's folder and manifest, if everything export will use still matches what was frozen. Every
+    folder hashed or mounted here is checked to be a real folder inside the runner home, not a link elsewhere."""
     train_id, rel = source.get("trainJobId"), source.get("adapterLocation") or ""
     m = re.fullmatch(r"jobs/([0-9a-f-]{36})/attempt-([1-9]|10)/out/adapter", rel)
     if not isinstance(train_id, str) or not JOB_ID.fullmatch(train_id) or not m or m.group(1) != train_id:
         raise _lost("The training run's adapter is not on this runner.")
     train_dir = attempt_dir(home, train_id, int(m.group(2)))
-    out = train_dir / "out"
+    out, data_dir = train_dir / "out", train_dir / "data"
+    for path in (out, out / "adapter", out / "manifest.json", out / "split.json", data_dir):
+        confined(home, path)
     if not (out / "adapter" / "adapter_model.safetensors").is_file():
         raise _lost("The training run's adapter is not on this runner.")
     expected = source.get("trainingManifestSha256")
@@ -148,14 +228,19 @@ def verified_training(home: Path, source: dict) -> tuple[Path, dict]:
         raise _lost("This training run has no verified lineage on this runner; train again before exporting.")
     if sha256_file(out / "manifest.json") != expected:
         raise _lost("The training manifest on this runner is not the one Valcairn recorded.")
-    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    except ValueError:
+        manifest = None
+    if not readable_manifest(manifest):
+        raise _lost("The training manifest on this runner is not one this runner can read; train again before exporting.")
     if manifest.get("trainJobId") != train_id:
         raise _lost("The training manifest names another training run.")
     if file_hashes(out / "adapter") != manifest["adapter"]["files"] or manifest["adapter"]["files"].get("adapter_model.safetensors") != source.get("adapterSha256"):
         raise _lost("The adapter, its config or its tokenizer changed since training.")
-    if sha256_file(out / "split.json") != manifest["splitSha256"]:
+    if not (out / "split.json").is_file() or sha256_file(out / "split.json") != manifest["splitSha256"]:
         raise _lost("The training split changed since training, so its held-out examples cannot be trusted.")
-    data = {p.name: sha256_file(p) for p in (train_dir / "data").iterdir() if is_data_file(p)} if (train_dir / "data").is_dir() else {}
+    data = {p.name: sha256_file(p) for p in data_dir.iterdir() if is_data_file(p)} if data_dir.is_dir() else {}
     if data != manifest["dataFiles"]:
         raise _lost("The dataset files of the training run changed since training.")
     return train_dir, manifest
@@ -165,7 +250,7 @@ def base_model_for(home: Path, manifest: dict, spec_source: str) -> Path:
     base = manifest["baseModel"]
     if base["source"] != spec_source:
         raise _lost("This export names another base model than the one the adapter was trained on.")
-    model_dir = cache_dir(home, base["source"], base.get("revision")) / "model"
+    model_dir = confined(home, cache_dir(home, base["source"], base.get("revision")) / "model")
     record = verified_cache(model_dir, base["source"], base.get("revision"))
     if not record or record["files"] != base["files"]:
         raise _lost("The base model on this runner differs from the one the adapter was trained on.")
@@ -176,7 +261,9 @@ def held_out(train_dir: Path) -> tuple[list[list[dict]], str | None]:
     """Up to three held-out conversations, without their reference answers, found through the training run's own
     split (the same example rules as train.py), and the system prompt if every example used the same one."""
     split = json.loads((train_dir / "out" / "split.json").read_text(encoding="utf-8"))
-    held = set(split["heldOut"]) - set(split["train"])
+    if not isinstance(split, dict) or not all(isinstance(split.get(k), list) for k in ("train", "heldOut")):
+        raise _lost("The training split on this runner is not one this runner can read; train again before exporting.")
+    held = {h for h in split["heldOut"] if isinstance(h, str)} - {t for t in split["train"] if isinstance(t, str)}
     conversations, systems = [], set()
     for path in sorted(p for p in (train_dir / "data").iterdir() if is_data_file(p)):
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -257,11 +344,12 @@ def export(ctx) -> dict:
 
     job, attempt = ctx.job["id"], ctx.job["attempt"]
     provisional, final = f"valcairn-p-{job}-a{attempt}", f"valcairn-{job}-a{attempt}"
-    created: list[str] = []
+    created: list[str] = []  # names this attempt made (or started to make) and removes on failure; nothing else
     remove(home, work)
     try:
-        if ollama_has(host, final):
-            raise JobFailure("runtime_error", f"An Ollama model named {final} already exists; it is left as it is.")
+        for name in (provisional, final):
+            if ollama_has(host, name):
+                raise JobFailure("runtime_error", f"An Ollama model named {name} already exists; it is left as it is.")
         check(ctx)
         (work / "merged").mkdir(parents=True)
         merge = Step(image=ctx.settings.train_image, command=["python", "merge.py"], gpus=bool(ctx.capabilities.get("gpus")),
@@ -282,8 +370,10 @@ def export(ctx) -> dict:
         conversations, system = held_out(train_dir)
         ctx.emit("stage", name="ollama_create", status="started")
         check(ctx)
-        ollama_create(provisional, modelfile(tuned_dir, tuned, system), host, ctx.cancelled)
+        # The provisional name was free a moment ago, so whatever appears under it from here on is this attempt's,
+        # including a model the daemon finishes after a cancelled create; it is listed before the create for that.
         created.append(provisional)
+        ollama_create(provisional, modelfile(tuned_dir, tuned, system), host, ctx.cancelled)
         check(ctx)
         # The base model is named by its GGUF's SHA-256, so an existing one holds exactly these bytes and is shared.
         if not ollama_has(host, base_name):
@@ -295,17 +385,23 @@ def export(ctx) -> dict:
         started = time.time()
         tuned_test = load_test(host, provisional, conversations, ctx.cancelled)
         base_test = load_test(host, base_name, conversations, ctx.cancelled)
-        ctx.emit("metric", name="tuned_tokens_per_sec", value=tuned_test["tokensPerSec"] or 0)
-        ctx.emit("metric", name="base_tokens_per_sec", value=base_test["tokensPerSec"] or 0)
+        for name, test in (("tuned_tokens_per_sec", tuned_test), ("base_tokens_per_sec", base_test)):
+            if test["tokensPerSec"] is not None:  # an unknown speed (no counters) is not reported as a measured zero
+                ctx.emit("metric", name=name, value=test["tokensPerSec"])
         ctx.emit("stage", name="load_test", status="finished")
 
-        # Publish: the final name appears only now, and never over an existing model.
+        # Publish: the final name appears only now, never over an existing model, and never once a cancel is known.
         check(ctx)
         if ollama_has(host, final):
             raise JobFailure("runtime_error", f"An Ollama model named {final} appeared during the export; it is left as it is.")
+        check(ctx)  # the lookup blocked; a cancel seen meanwhile means no publication at all
+        created.append(final)  # the copy is this attempt's publication: if the attempt does not finish, it goes too
         ollama_copy(host, provisional, final)
         ollama_delete(host, provisional)
         created.remove(provisional)
+        # The copy is dispatched and cannot be undone atomically. A cancel seen now still ends the attempt before any
+        # artifact is written: the cleanup below removes the copied model (best effort) and the working files.
+        check(ctx)
 
         ctx.emit("artifact", name=tuned.name, sha256=tuned_sha, sizeBytes=tuned.stat().st_size)
         result_manifest = {

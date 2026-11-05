@@ -76,17 +76,17 @@ class FakeSandbox:
 
 
 def opener_for(body):
-    return lambda url, timeout: io.BytesIO(body)
+    return lambda url, *args, **kwargs: (None, io.BytesIO(body))  # no connection, the reply's bytes
 
 
 class TrainTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
-        self.files = [{"id": "f1", "filename": "chats.jsonl", "sha256": hashlib.sha256(DATA).hexdigest(), "url": "http://ingest/x"}]
-        training.urllib.request.urlopen, self._open = opener_for(DATA), training.urllib.request.urlopen
+        self.files = [{"id": "f1", "filename": "chats.jsonl", "sha256": hashlib.sha256(DATA).hexdigest(), "url": "https://ingest.example/x"}]
+        training.open_link, self._open = opener_for(DATA), training.open_link
 
     def tearDown(self):
-        training.urllib.request.urlopen = self._open
+        training.open_link = self._open
 
     def test_fetches_once_trains_offline_and_reports_the_adapter(self):
         box = FakeSandbox()
@@ -146,10 +146,10 @@ class TrainTests(unittest.TestCase):
     def test_a_file_that_does_not_match_its_checksum_is_refused(self):
         dest = self.home / "x.jsonl"
         with self.assertRaises(JobFailure) as e:
-            download("http://ingest/x", dest, "0" * 64, opener=opener_for(DATA))
+            download("https://ingest.example/x", dest, "0" * 64, opener=opener_for(DATA))
         self.assertEqual(e.exception.category, "dataset_error")
         self.assertFalse(dest.exists())
-        download("http://ingest/x", dest, hashlib.sha256(DATA).hexdigest(), opener=opener_for(DATA))
+        download("https://ingest.example/x", dest, hashlib.sha256(DATA).hexdigest(), opener=opener_for(DATA))
         self.assertEqual(dest.read_bytes(), DATA)
 
     def test_names_are_safe_on_disk(self):

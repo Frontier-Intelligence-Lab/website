@@ -1,7 +1,8 @@
-"""Regressions for the independent PR16 review (comment 6638291593). Each one fails on a6e3513 and passes after.
-Only temporary folders, in-memory fakes and the real stdlib helpers are used: no Docker, model, GPU or Ollama."""
+"""Regressions for the independent PR16 review (comment 6638291593) that exercise the export handler. Each one
+fails on a6e3513 and passes after. The train handler's live in test_training_review.py, the shared example rules'
+in test_examples.py. Only temporary folders, in-memory fakes and the real stdlib helpers are used: no Docker,
+model, GPU or Ollama."""
 
-import importlib.util
 import json
 import os
 import tempfile
@@ -9,119 +10,13 @@ import threading
 import unittest
 from pathlib import Path
 
-from fixtures_runner import EXPORT_JOB, TRAIN_JOB, Box, Ctx, Inputs, Ollama, export_spec, serve_data, trained
-from valcairn_runner import examples, export as exporter, training
+from fixtures_export import EXPORT_JOB, Ollama, export_spec
+from fixtures_runner import TRAIN_JOB, Box, Ctx, trained
+from valcairn_runner import export as exporter
 from valcairn_runner.sandbox import Cancelled
 from valcairn_runner.training import JobFailure
 
 HERE = Path(__file__).resolve().parent.parent
-IMAGE_EXAMPLES = HERE / "images" / "train" / "examples.py"
-
-
-def image_module():
-    """The image's own example rules, loaded from the file the image copies (no ML imports)."""
-    spec = importlib.util.spec_from_file_location("image_examples", IMAGE_EXAMPLES)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def chat(i, answer="a"):
-    return {"messages": [{"role": "user", "content": f"q{i}"}, {"role": "assistant", "content": answer}]}
-
-
-class HeldOutIntegrity(unittest.TestCase):
-    """1 (P1): the fallback moved one row out of a duplicate group, so the same example was trained on and held out."""
-
-    def test_identical_examples_stay_on_one_side_with_zero_overlap(self):
-        image = image_module()
-        for distinct in range(5, 40):
-            rows = [chat(i) for i in range(distinct)] + [chat(0)] * 4 + [chat(1)] * 3  # duplicate groups
-            train, held = image.split(rows)
-            self.assertTrue(held, distinct)
-            self.assertFalse({image.digest(e) for e in train} & {image.digest(e) for e in held}, f"{distinct} distinct: overlap")
-            self.assertEqual(len(train) + len(held), len(rows))
-
-    def test_five_identical_examples_fail_clearly_instead_of_leaking(self):
-        image = image_module()
-        with self.assertRaises(image.SplitError):
-            image.split([chat(0)] * 5)
-        with self.assertRaises(image.SplitError):
-            image.split([chat(i) for i in range(4)] * 3)
-
-    def test_the_overlap_check_itself_refuses(self):
-        with self.assertRaises(examples.SplitError):
-            examples.check_disjoint([chat(1)], [chat(1)])
-
-
-class ImageParser(unittest.TestCase):
-    """8: non-object JSON rows crashed the image loader; answer-first chats gave an empty prompt; .JSONL was missed."""
-
-    def test_the_image_loader_counts_non_objects_and_bad_order_as_skipped(self):
-        image = image_module()
-        folder = Path(tempfile.mkdtemp())
-        lines = ["[1, 2]", "null", "7", '"text"', "{not json", json.dumps({"messages": [{"role": "assistant", "content": "a"}, {"role": "user", "content": "q"}]}),
-                 json.dumps({"messages": [{"role": "user", "content": "  "}, {"role": "assistant", "content": "a"}]}), json.dumps({"prompt": "", "completion": "x"}),
-                 json.dumps(chat(1)), json.dumps({"prompt": "p", "completion": "c"})]
-        (folder / "UPPER.JSONL").write_text("\n".join(lines), encoding="utf-8")
-        (folder / "notes.txt").write_text(json.dumps(chat(9)), encoding="utf-8")
-        rows, skipped = image.load_examples(folder)
-        self.assertEqual((len(rows), skipped), (2, 8))
-        self.assertTrue(all(image.prompt_turns(r) and any(m["role"] == "user" for m in image.prompt_turns(r)) for r in rows))
-
-    def test_runner_and_image_rules_are_the_same_file(self):
-        self.assertEqual((HERE / "valcairn_runner" / "examples.py").read_bytes(), IMAGE_EXAMPLES.read_bytes())
-        self.assertIn("examples.py", (HERE / "images" / "train" / "Dockerfile").read_text(), "the image ships the shared rules")
-        self.assertIn("from examples import", (HERE / "images" / "train" / "train.py").read_text())
-
-
-class PathConfinement(unittest.TestCase):
-    """2: a leased job id reached host paths and rmtree without validation."""
-
-    def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self.marker = self.root / "outside" / "marker"
-        self.marker.parent.mkdir()
-        self.marker.write_text("keep")
-
-    def test_malformed_job_ids_and_attempts_write_and_remove_nothing(self):
-        serve_data(self)
-        for job_id, attempt in [("../../outside", 1), ("j1", 1), (TRAIN_JOB.upper(), 1), (TRAIN_JOB, "1"), (TRAIN_JOB, 0), (TRAIN_JOB, True), (None, 1)]:
-            with self.assertRaises(JobFailure, msg=f"{job_id!r} {attempt!r}"):
-                training.train(Ctx(self.home, job_id, attempt, api=Inputs()))
-        self.assertEqual(self.marker.read_text(), "keep")
-        self.assertEqual(list(self.home.iterdir()), [], "nothing was created")
-
-    def test_a_link_inside_the_home_is_never_followed_for_writes_or_removal(self):
-        (self.home / "jobs").symlink_to(self.marker.parent, target_is_directory=True) if hasattr(os, "symlink") else None
-        if not (self.home / "jobs").is_symlink():
-            self.skipTest("this machine cannot create symlinks")
-        serve_data(self)
-        with self.assertRaises(JobFailure):
-            training.train(Ctx(self.home, TRAIN_JOB, api=Inputs()))
-        self.assertEqual(sorted(p.name for p in self.marker.parent.iterdir()), ["marker"])
-
-
-class CacheIdentity(unittest.TestCase):
-    """3: org/model and org-model shared one cache folder; a changed config.json was accepted."""
-
-    def test_distinct_sources_never_share_a_cache_and_any_changed_file_refetches(self):
-        home = Path(tempfile.mkdtemp())
-        serve_data(self)
-        box = Box()
-        training.train(Ctx(home, TRAIN_JOB, api=Inputs("org/model"), sandbox=box))
-        box2 = Box()
-        result = training.train(Ctx(home, TRAIN_JOB[:-1] + "b", api=Inputs("org-model"), sandbox=box2))
-        self.assertEqual(box2.steps[0].command[-1], "fetch.py", "a different source is fetched, not reused")
-        self.assertEqual(result["baseModel"]["source"], "org-model")
-        self.assertEqual(len(list((home / "models").iterdir())), 2)
-        config = next(p for p in (home / "models").rglob("config.json"))
-        config.write_text('{"arch": 2}')
-        box3 = Box()
-        training.train(Ctx(home, TRAIN_JOB[:-1] + "c", api=Inputs(json.loads(config.with_name(training.SOURCE_RECORD).read_text())["source"]), sandbox=box3))
-        self.assertEqual(box3.steps[0].command[-1], "fetch.py", "a changed config is not trusted")
 
 
 class ExportLineage(unittest.TestCase):
@@ -199,7 +94,7 @@ class CancellationBeforeNativeWork(unittest.TestCase):
             def kill(self):
                 self.killed = True
 
-            def wait(self):
+            def wait(self, timeout=None):
                 return 0
         proc, cancelled = Proc(), threading.Event()
         threading.Timer(0.1, cancelled.set).start()
@@ -274,34 +169,6 @@ class ProvisionalIdentities(unittest.TestCase):
         with self.assertRaises(JobFailure):
             exporter.export(Ctx(home, EXPORT_JOB, 3, spec=export_spec(result), kind="export"))
         self.assertEqual(ollama.models[f"valcairn-{EXPORT_JOB}-a3"], "user-made", "an existing model is never overwritten")
-
-
-class Cleanup(unittest.TestCase):
-    """10: interrupted downloads left .part files; failed attempts kept plaintext dataset bytes."""
-
-    def test_an_interrupted_download_leaves_no_part_file(self):
-        dest = Path(tempfile.mkdtemp()) / "000.jsonl"
-
-        class Broken:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self, n):
-                raise OSError("connection reset")
-        with self.assertRaises(OSError):
-            training.download("http://ingest/x", dest, "0" * 64, opener=lambda url, timeout: Broken())
-        self.assertEqual(list(dest.parent.iterdir()), [])
-
-    def test_a_cancelled_training_attempt_keeps_no_dataset_bytes(self):
-        home = Path(tempfile.mkdtemp())
-        serve_data(self)
-        ctx = Ctx(home, TRAIN_JOB, api=Inputs(), sandbox=Box(lambda step, c: (_ for _ in ()).throw(Cancelled()) if step.command[-1] == "train.py" else None))
-        with self.assertRaises(Cancelled):
-            training.train(ctx)
-        self.assertFalse((home / "jobs" / TRAIN_JOB / "attempt-1").exists())
 
 
 class HonestClaims(unittest.TestCase):

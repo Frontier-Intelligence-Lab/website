@@ -8,17 +8,23 @@ stores the manifest's SHA-256 with the result, and export refuses anything that 
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import re
 import shutil
-import urllib.request
+import ssl
+import time
+import urllib.parse
 from pathlib import Path
 
-from .api import ApiError, LeaseLost
+from .api import LOOPBACK, ApiError, LeaseLost
 from .sandbox import Cancelled, Limits, Step
+from .transport import exchange, shutdown
 
 MAX_FILE_BYTES = 2 * 1024**3
 MAX_TOTAL_BYTES = 20 * 1024**3  # all dataset files of one job together
+DOWNLOAD_SECONDS = 1800  # one dataset file, whatever its size: 2 GiB needs about 1.2 MB/s
+CONNECT_SECONDS = 60  # connecting and, for https, the handshake
 # Progress lines from the training image; anything else stays on this machine.
 PREFIX = "@@valcairn "
 EVENT_KINDS = {"log", "metric", "stage", "artifact"}
@@ -101,19 +107,75 @@ def check(ctx) -> None:
         raise Cancelled()
 
 
-def download(url: str, dest: Path, expected_sha: str, opener=None, budget: int = MAX_FILE_BYTES) -> int:
-    """Fetch one dataset file through its signed link and refuse it unless its SHA-256 matches the manifest. Partial
-    bytes never stay on disk, whatever stops the download. Returns the size."""
+def link_allowed(url) -> bool:
+    """A signed dataset link may be https, or plain http to this machine for development, and must be well formed:
+    never another scheme (a file: link would make the runner read a local file as dataset bytes), never plain http
+    elsewhere, no user name or password, a valid port, ASCII only and no space or control character (http.client
+    refuses those later with an error that names the whole link). Percent-encoded paths and queries are fine."""
+    if not isinstance(url, str) or not url.isascii() or any(ch <= " " or ch == "\x7f" for ch in url):
+        return False
+    try:
+        u = urllib.parse.urlsplit(url)
+        port = u.port  # a port that is not a number in range raises here
+    except ValueError:
+        return False
+    if not u.hostname or u.username is not None or u.password is not None or port == 0:
+        return False
+    return u.scheme == "https" or (u.scheme == "http" and u.hostname in LOOPBACK)
+
+
+def open_link(url: str, cancelled, deadline: float, name: str, context=None):
+    """Opens a well-formed signed dataset link (see `link_allowed`): TLS with certificate and host-name checks for
+    https (`context`, the system's trust by default), plain http to this machine otherwise. No redirect is
+    followed and only a 200 reply is accepted. Every wait looks at the cancel flag and the deadline. Returns the
+    connection and the reply; the caller reads the body through the same cooperative reader and then shuts the
+    connection down."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=CONNECT_SECONDS, context=context or ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=CONNECT_SECONDS)
+    try:
+        res = exchange(conn, "GET", urllib.parse.urlunsplit(("", "", u.path or "/", u.query, "")), None, {}, cancelled, deadline,
+                       lambda: JobFailure("timeout", f"{name} took too long to download.", retryable=True))
+        if res.status != 200:
+            raise JobFailure("dataset_error", f"The link for {name} answered with HTTP {res.status}, not the file.", retryable=True)
+    except BaseException:
+        shutdown(conn)
+        raise
+    return conn, res
+
+
+def download(url: str, dest: Path, expected_sha: str, opener=None, budget: int = MAX_FILE_BYTES, cancelled=None, context=None) -> int:
+    """Fetch one dataset file through its signed link and refuse it unless its SHA-256 matches the manifest. Every
+    wait looks at the job's cancel flag (which also stands for a lost lease or lost authority) and at the file's
+    deadline; whatever stops the download, the connection is closed and no partial bytes stay on disk, and once the
+    cancel was seen the file is not kept even if its last byte had arrived with it. Returns the size. Failures name
+    the file, never the link."""
+    if not link_allowed(url):
+        raise JobFailure("dataset_error", f"The link for {dest.name} is not a well-formed https link (or http to this machine); it was not opened.")
     tmp = dest.with_suffix(dest.suffix + ".part")
     h, size, limit = hashlib.sha256(), 0, min(MAX_FILE_BYTES, budget)
+    deadline, conn = time.monotonic() + DOWNLOAD_SECONDS, None
     try:
-        with (opener or urllib.request.urlopen)(url, timeout=120) as res, tmp.open("wb") as out:
-            for chunk in iter(lambda: res.read(1024 * 1024), b""):
-                size += len(chunk)
-                if size > limit:
-                    raise JobFailure("dataset_error", f"{dest.name} is larger than this job's dataset size limit.")
-                h.update(chunk)
-                out.write(chunk)
+        try:
+            conn, res = (opener or open_link)(url, cancelled, deadline, dest.name, context)
+            with tmp.open("wb") as out:
+                for chunk in iter(lambda: res.read(1024 * 1024), b""):
+                    size += len(chunk)
+                    if size > limit:
+                        raise JobFailure("dataset_error", f"{dest.name} is larger than this job's dataset size limit.")
+                    h.update(chunk)
+                    out.write(chunk)
+        except (OSError, http.client.HTTPException):
+            # Network, TLS and HTTP parser errors alike (their messages can carry the link): never re-raised, never
+            # logged with the link. Refused, reset, unparsable, or not storable: a later attempt gets fresh links.
+            raise JobFailure("dataset_error", f"{dest.name} could not be downloaded or stored.", retryable=True) from None
+        finally:
+            if conn is not None:
+                shutdown(conn)
+        if cancelled is not None and cancelled.is_set():
+            raise Cancelled()  # the cancel was seen; bytes that arrived with it are not kept
         if h.hexdigest() != expected_sha:
             raise JobFailure("dataset_error", f"{dest.name} does not match the checksum in the dataset version.")
         tmp.replace(dest)
@@ -164,7 +226,7 @@ def cached_model(ctx, home: Path, source: str, revision: str | None = None) -> t
     half-finished, altered or different model is never trained on. The weights themselves are trusted on first fetch
     from the catalog's source."""
     cache = cache_dir(home, source, revision)
-    model_dir = cache / "model"
+    model_dir = confined(home, cache / "model")  # what is mounted into the sandbox is a real folder here, not a link
     record = verified_cache(model_dir, source, revision)
     if record:
         ctx.emit("stage", name="fetch_model", status="skipped")
@@ -260,7 +322,7 @@ def _train(ctx, home: Path, work: Path, inputs: dict) -> dict:
         check(ctx)
         # Stored under a fixed name with a lower-case .jsonl suffix, which train.py and export both read.
         name = f"{i:03d}.jsonl"
-        total += download(f["url"], data / name, f["sha256"], budget=MAX_TOTAL_BYTES - total)
+        total += download(f["url"], data / name, f["sha256"], budget=MAX_TOTAL_BYTES - total, cancelled=ctx.cancelled)
         data_files[name] = f["sha256"]
     ctx.emit("metric", name="dataset_files", value=len(files))
     ctx.emit("stage", name="download_data", status="finished")

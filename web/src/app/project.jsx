@@ -11,13 +11,13 @@ const MODALITIES = ['Text', 'Documents', 'Images', 'Video', 'Audio', 'Sensor or 
 const STARTS = [
   { id: 'own', icon: 'data', tone: 'teal', title: 'We have our own data', body: 'Describe it and record its rights. It stays private to your workspace.' },
   { id: 'need', icon: 'store', tone: 'green', title: 'We need data', body: 'License an existing dataset, or have one collected and labeled.' },
-  { id: 'model', icon: 'layers', tone: 'blue', title: 'We already have a model', body: 'Record it and how you want it tested. Testing and deployment are planned, not running yet.' },
+  { id: 'model', icon: 'layers', tone: 'blue', title: 'We already have a model', body: 'Record it and how you want it tested. Imported answers can be scored on Evaluate. Deployment is planned, not running yet.' },
   { id: 'unsure', icon: 'question', tone: 'violet', title: 'Not sure yet', body: 'Book a short call and we will scope it with you.' },
 ];
 const PLANS = {
   own: [['Describe the task', 'You are here'], ['Record your data and its rights', 'Where it came from and how it may be used'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Approve dataset version 1', 'Locked, versioned, private to you'], ['Train and evaluate', 'Planned. Will start only after you approve a cost estimate', true], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
   need: [['Describe the task', 'You are here'], ['Shortlist or commission data', 'Compare samples, coverage and allowed uses'], ['Agree license terms', 'Nothing is bought until you approve'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Train and evaluate', 'Planned. Will start only after you approve a cost estimate', true], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
-  model: [['Describe the task', 'You are here'], ['Connect your model', 'An endpoint or a model file you are allowed to use'], ['Add a test set', 'Examples with the answers you expect'], ['Compare against a baseline', 'Planned. See where it passes and fails', true], ['Deploy', 'Planned. Readiness checks before anything goes live', true]],
+  model: [['Describe the task', 'You are here'], ['Connect your model', 'An endpoint or a model file you are allowed to use'], ['Add a test set', 'Examples with the answers you expect'], ['Compare against a baseline', 'Import both sets of answers on Evaluate. Valcairn does not call the endpoint.'], ['Deploy', 'Planned. Readiness checks before anything goes live', true]],
   unsure: [['Describe the task', 'You are here'], ['Scoping call', '30 minutes with our team'], ['Get a written plan', 'Data, approach, test method and a cost range']],
 };
 
@@ -173,7 +173,7 @@ export function ProjectSuccess() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">How will you know it works?</h1>
-            <p className="ob-lede">Set the bar before any training. Training and testing are planned, not running yet: when they open, every model version will be tested against this bar and you decide whether to accept it.</p>
+            <p className="ob-lede">Set the bar before any training. Training is still planned. You can already score imported answers on Evaluate. This sentence is not the rule those scores use, and Valcairn does not call a model endpoint from here.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           <div className="ob-grid">
@@ -233,7 +233,7 @@ export function ProjectSuccess() {
               ? <p style={{ lineHeight: 1.6 }}>Accept the dataset when <strong>{criteria || '[your quality bar]'}</strong>.</p>
               : measure === 'rubric'
                 ? <p style={{ lineHeight: 1.6 }}>Accept a model when reviewers find that <strong>{criteria || '[your criteria]'}</strong>, and it does better than <strong>{baselineLabel}</strong>.</p>
-                : <p style={{ lineHeight: 1.6 }}>Accept a model when it scores <strong>{target || '[target]'}</strong> on <strong>{measureLabel}</strong> against held-out examples, does better than <strong>{baselineLabel}</strong>{runsOn === 'device' ? <>, and runs on <strong>{device || '[your device]'}</strong></> : ''}.</p>}
+                : <p style={{ lineHeight: 1.6 }}>Accept a model when it scores <strong>{target || '[target]'}</strong> on <strong>{measureLabel}</strong> on the evaluation cases you freeze, does better than <strong>{baselineLabel}</strong>{runsOn === 'device' ? <>, and runs on <strong>{device || '[your device]'}</strong></> : ''}.</p>}
             <span className="ob-muted">You can change this until you send the project for review. Reopening the project lets you change it again.</span>
           </div>
           <div className="ob-card">
@@ -241,7 +241,7 @@ export function ProjectSuccess() {
             <ul className="ob-list">
               <li><Tile icon="shield" tone="blue" size="sm" /><div><span className="ob-muted">We check your data, model and device fit together first.</span></div></li>
               <li><Tile icon="check" tone="green" size="sm" /><div><span className="ob-muted">You see a cost estimate and approve it before any training.</span></div></li>
-              <li><Tile icon="layers" tone="violet" size="sm" /><div><span className="ob-muted">Planned: results will come from tests on your held-out data. Nothing has been trained or tested yet.</span></div></li>
+              <li><Tile icon="layers" tone="violet" size="sm" /><div><span className="ob-muted">Imported answers can be scored on Evaluate. Calling the model, and training, are still planned.</span></div></li>
             </ul>
           </div>
         </aside>
@@ -400,7 +400,7 @@ export function ProjectModel() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">Tell us about your model</h1>
-            <p className="ob-lede">Record it now. When evaluation opens (planned), it will be tested against your acceptance rule before anything is deployed, and nothing is retrained unless you ask.</p>
+            <p className="ob-lede">Record it now. Valcairn does not call this endpoint. You can import its answers on Evaluate and score them. Running the model from here is planned, and nothing is retrained unless you ask.</p>
           </div>
           {errors.form && <p className="ob-alert" role="alert">{errors.form}</p>}
           <fieldset aria-describedby="source-error">
@@ -458,7 +458,7 @@ export function ProjectModel() {
             <p className="ob-muted">{target ? <>From your acceptance rule: <strong style={{ color: 'var(--text)' }}>{target}</strong>.</> : 'Not decided yet. You can set it in your acceptance rule.'}</p>
             <Link to={`/w/${entry.slug}/projects/${project.id}/success`}>Change it</Link>
           </div>
-          <div className="ob-note tile--amber"><Tile icon="info" tone="amber" size="sm" /><span>Evaluation runs and deployment aren't open yet. We save this now so your project is ready when they are. We never call your endpoint from this form.</span></div>
+          <div className="ob-note tile--amber"><Tile icon="info" tone="amber" size="sm" /><span>This form does not call your endpoint. Score imported answers on Evaluate. Deployment is still planned.</span></div>
         </aside>
       </form>
     </Shell>
@@ -644,7 +644,7 @@ export function ProjectHome() {
   ] : modelPath ? [
     { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
     { label: 'Model and test plan', st: dataDone ? 'done' : taskDone ? 'now' : 'todo' },
-    { label: 'Evaluate against your rule', st: 'todo', soon: true, note: 'Compare with your baseline on held-out examples.' },
+    { label: 'Evaluate against your rule', st: 'todo', note: 'Import baseline and candidate answers and score them. Valcairn does not call the model. The set is not a secret holdout.' },
     { label: 'Readiness check and deploy', st: 'todo', soon: true, note: 'Only a model that meets your rule can be deployed.' },
   ] : [
     { label: 'Task and acceptance rule', st: taskDone ? 'done' : 'now' },
@@ -719,8 +719,8 @@ export function ProjectHome() {
     'in-review': { title: 'In review with Valcairn', body: 'The files, rights record and acceptance rule are locked while the review is open.' },
     'approve-version': { title: `Approve dataset version ${(latest?.number ?? 0) + 1}`, body: 'This freezes exactly the reviewed files, rights record and acceptance rule. Training will only use an approved version.', custom: <>{noRule}<button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : `Approve version ${(latest?.number ?? 0) + 1}`}</button>{reopenBlock}</> },
     'wait-admin': { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.', custom: noRule },
-    'versioned-manage': { title: `Dataset version ${latest?.number} approved`, body: `${plural(latest?.files ?? 0, 'file')} and their rights record are frozen in this version. Training and evaluation are planned; nothing runs yet.`, custom: <>{noRule}{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}{reopenBlock}</> },
-    versioned: { title: `Dataset version ${latest?.number} approved`, body: 'Training and evaluation are planned; nothing runs yet.', custom: noRule },
+    'versioned-manage': { title: `Dataset version ${latest?.number} approved`, body: `${plural(latest?.files ?? 0, 'file')} and their rights record are frozen in this version. Training is planned. Imported answers can be scored on Evaluate.`, custom: <>{noRule}{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}<Link className="btn-ghost" to={`${base}/evaluate`}>Evaluate answers</Link>{reopenBlock}</> },
+    versioned: { title: `Dataset version ${latest?.number} approved`, body: 'Training is planned. Imported answers can be scored on Evaluate.', custom: noRule },
   };
   const next = kind ? steps_[kind] : null;
 
@@ -734,6 +734,7 @@ export function ProjectHome() {
         </div>
         <div className="ob-row-actions">
           {!modelPath && !unsure && <Link className="btn-ghost" to={`${base}/dataset`}><Icon name="data" size={16} />Open dataset</Link>}
+          {!unsure && <Link className="btn-ghost" to={`${base}/evaluate`}><Icon name="check" size={16} />Evaluate answers</Link>}
           {writer && editable && !unsure && <Link className="btn-ghost" to={`${base}/success`}>Edit setup</Link>}
         </div>
       </div>

@@ -2,7 +2,8 @@ import hashlib
 import json
 import unittest
 
-from fixtures_runner import EXPORT_JOB, SYSTEM, Box, Ctx, Ollama, export_spec, trained
+from fixtures_export import EXPORT_JOB, Ollama, export_spec
+from fixtures_runner import SYSTEM, Box, Ctx, trained
 from valcairn_runner import export as exporter
 from valcairn_runner.sandbox import Cancelled
 from valcairn_runner.training import JobFailure
