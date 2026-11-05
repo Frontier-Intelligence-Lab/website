@@ -26,10 +26,12 @@ from contextlib import contextmanager
 
 REPOSITORY = "Frontier-Intelligence-Lab/website"
 REQUIRED_JOBS = {"Web / no database", "Web / PostgreSQL 17", "Ingest / Rust 1.99.1"}
-# Tables grouped by the numbered migration that creates them, 001-014 as in migrations/ (Models, Device,
-# Capital and Runners/jobs included; Memory and Agents add no server table). The migration ledger decides which groups
-# must exist: a listed migration requires its whole group, an unlisted one forbids it. 003, 005 and 008-010
-# add no tables. The ledger table itself comes from the migrator, and 006 is the baseline the preflight needs.
+# Tables grouped by the numbered migration that creates them: 001-013 as in migrations/ (Models, Device and
+# Capital included; Memory and Agents add no server table), plus 014 (Runners and jobs) and 015 (Evaluation),
+# registered ahead of their files. The migration ledger decides which groups must exist: a listed migration
+# requires its whole group, an unlisted one forbids it, each group on its own, so 014 and 015 may be applied
+# in either order or alone. 003, 005 and 008-010 add no tables. The ledger table itself comes from the
+# migrator, and 006 is the baseline the preflight needs.
 TABLE_GROUPS = {
     "001": ("users", "email_codes", "workspaces", "memberships", "invitations", "join_requests", "projects", "audit_events"),
     "002": ("sessions",),
@@ -40,6 +42,8 @@ TABLE_GROUPS = {
     "012": ("devices", "device_reports", "model_installs", "execution_runs"),
     "013": ("capital_cases", "capital_submissions", "credit_records", "capital_evidence", "capital_review_marks"),
     "014": ("runners", "jobs", "job_events"),
+    "015": ("eval_sets", "eval_cases", "eval_issue_notes", "eval_set_versions", "eval_batches", "eval_predictions",
+            "eval_comparisons", "eval_judgments", "eval_reports"),
 }
 LEDGER_TABLE, BASELINE = "schema_migrations", "006"
 KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
@@ -60,17 +64,31 @@ GRANTS = {
     "capital_review_marks": ("SELECT", "INSERT"),
     # Runners and jobs (014): runners and jobs are locked and updated in place; job events are append-only.
     "runners": ("SELECT", "INSERT", "UPDATE"), "jobs": ("SELECT", "INSERT", "UPDATE"), "job_events": ("SELECT", "INSERT"),
+    # Evaluation (015): sets, comparisons and judgments are edited in place; cases and issue notes are draft rows
+    # that are also removed; a set version is only row-locked (UPDATE) while an import or comparison is made and its
+    # append-only trigger refuses any actual change; batches, predictions and reports are insert-only.
+    "eval_sets": ("SELECT", "INSERT", "UPDATE"), "eval_cases": ROW_PRIVILEGES, "eval_issue_notes": ROW_PRIVILEGES,
+    "eval_set_versions": ("SELECT", "INSERT", "UPDATE"), "eval_batches": ("SELECT", "INSERT"), "eval_predictions": ("SELECT", "INSERT"),
+    "eval_comparisons": ("SELECT", "INSERT", "UPDATE"), "eval_judgments": ("SELECT", "INSERT", "UPDATE"), "eval_reports": ("SELECT", "INSERT"),
 }
 # job_events.id is a bigserial (event pages are read in id order): inserting needs USAGE on its sequence and
 # nothing more. SELECT or UPDATE on it (setval) is excess and stops the release.
 SEQUENCE_PRIVILEGES = ("USAGE", "SELECT", "UPDATE")
 SEQUENCE_GRANTS = {"job_events": {"job_events_id_seq": ("USAGE",)}}
 # Records a migration must leave byte-for-byte alone, digested per row; digests never leave the controller.
+# Evaluation versions, batches, predictions and reports are append-only in full; a comparison's pair and rule and
+# a judgment's case are frozen identity (the trigger-protected columns), while their review state still moves.
 FROZEN_QUERIES = {
     "enhance_runs": "SELECT id::text,md5(jsonb_build_object('name',name,'base',base_model_id,'datasets',datasets,'steps',steps,'compute',compute,'cap',spend_cap_usd,'by',requested_by,'at',requested_at,'workspace',workspace_id)::text) AS digest FROM enhance_runs WHERE status='requested' ORDER BY id",
     "capital_submissions": "SELECT id::text,md5(jsonb_build_object('case',case_id,'workspace',workspace_id,'revision',revision,'snapshot',snapshot,'hash',content_hash,'by',submitted_by,'at',submitted_at,'decision',decision,'decidedBy',decided_by,'decidedAt',decided_at,'notes',notes)::text) AS digest FROM capital_submissions ORDER BY id",
     "credit_records": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'provider',provider,'status',status,'amount',amount_cents,'expires',expires_on,'restrictions',restrictions,'reference',reference,'supersedes',supersedes,'by',created_by,'at',created_at)::text) AS digest FROM credit_records ORDER BY id",
     "capital_review_marks": "SELECT id::text,md5(jsonb_build_object('submission',submission_id,'evidence',evidence_id,'reviewer',reviewer_id,'at',created_at)::text) AS digest FROM capital_review_marks ORDER BY id",
+    "eval_set_versions": "SELECT id::text,md5(jsonb_build_object('set',set_id,'workspace',workspace_id,'project',project_id,'number',number,'revision',revision,'manifest',manifest,'hash',content_hash,'by',created_by,'at',created_at)::text) AS digest FROM eval_set_versions ORDER BY id",
+    "eval_batches": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'version',version_id,'role',role,'label',label,'system',claimed_system,'scorer',claimed_scorer,'rubric',rubric_version,'provenance',provenance,'hash',content_hash,'by',imported_by,'at',imported_at)::text) AS digest FROM eval_batches ORDER BY id",
+    "eval_predictions": "SELECT id::text,md5(jsonb_build_object('batch',batch_id,'case',case_key,'status',status,'output',output,'error',error_code)::text) AS digest FROM eval_predictions ORDER BY id",
+    "eval_comparisons": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'set',set_id,'version',version_id,'baseline',baseline_batch_id,'candidate',candidate_batch_id,'acceptance',acceptance,'by',created_by,'at',created_at)::text) AS digest FROM eval_comparisons ORDER BY id",
+    "eval_judgments": "SELECT id::text,md5(jsonb_build_object('comparison',comparison_id,'workspace',workspace_id,'case',case_key)::text) AS digest FROM eval_judgments ORDER BY id",
+    "eval_reports": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'comparison',comparison_id,'revision',revision,'snapshot',snapshot,'hash',content_hash,'decision',decision,'by',approved_by,'at',approved_at)::text) AS digest FROM eval_reports ORDER BY id",
 }
 CATALOG_VARIABLES = ("MODEL_CATALOG_FILE", "LOCAL_MODEL_CATALOG_FILE")
 LOOPBACK_VARIABLES = ("LOCAL_RUNTIME_ORIGINS", "LOCAL_MEMORY_ORIGINS")
