@@ -13,7 +13,7 @@ The executable definition of the contract is `tests/store-contract.js`. Every st
 ## Rules for every implementation
 
 - Every method is `async` and returns plain objects with camelCase keys. Timestamps are ISO 8601 strings in UTC. `null` means not found.
-- Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`, `quota_exceeded`, `forbidden`, `issues_open`, `label_in_use`, `invalid_label`, `invalid_kind`, `stale_plan`, `stale_revision`, `evidence_in_use`, `missing_reference`, `lease_lost`.
+- Expected conflicts throw `StoreError` (`src/store/errors.js`) with one of these codes: `email_taken`, `slug_taken`, `personal_exists`, `not_found`, `already_decided`, `already_member`, `invite_expired`, `duplicate_upload`, `invalid_state`, `quota_exceeded`, `forbidden`, `issues_open`, `label_in_use`, `invalid_label`, `invalid_kind`, `stale_plan`, `stale_revision`, `evidence_in_use`, `missing_reference`, `invalid_import`, `lease_lost`.
 - **Approval integrity.** A project's review-relevant content is editable only while its status is `draft` or `changes_requested`. That content is `name, task, modalities, startingPoint, success, dataSource, model`, the `labelSet` (changed only through `setLabelSet`), its uploads (including each upload's `kind` and `offsetMs`), its annotations and its issue notes. In `in_review`, `approved` and `versioned`, every write to it (`updateProject` content fields, `setLabelSet`, `createUpload`, `deleteUpload`, `updateUpload`, `createAnnotation`, `updateAnnotation`, `deleteAnnotation`, `setIssueNote`, `deleteIssueNote`) throws `invalid_state`. The check and the write must be atomic: one conditional statement, or a check under the project row lock that submission also takes. Postgres additionally enforces this with triggers (`005_review_integrity.sql`, `007_dataset_workspace.sql`, `008_dataset_locking.sql`, whose guard takes a share lock on the parent project so a write cannot pass the check while a freeze is in flight, `009_freeze_upload_updates.sql`, which applies that guard to every `UPDATE` of an upload, with no column exceptions, and `010_annotation_box_stored_form.sql`, which makes the database accept only boxes in the stored form).
 - **Rules that depend on other rows are checked under the project lock.** The Resolve gate (`submitForReview` with `requireResolved`), label-set changes against labels in use, and a label's fit to its file (scope, data type, box bounds; `checkAnnotation` in `src/lib/dataset.js`) are evaluated in the same transaction, under the same project lock, as the write they guard. Routes may pre-check for clearer messages but never instead. Lifecycle `status` is never patchable through `updateProject`.
 - Password hashes and token hashes never leave the store. The only exception is `getUserAuthByEmail`, which returns the password hash for login.
@@ -128,7 +128,31 @@ project    { id, workspaceId, createdBy, name, task, modalities: string[], start
 
 `profile`, `success`, `dataSource` and `model` are JSON objects that the routes validate before they're stored. Store them as `jsonb`.
 
+## Evaluation
+
+Both stores implement the same methods. Rules live in `src/lib/eval.js` and `docs/EVALUATION.md`. Postgres additionally enforces them in `015_evaluation.sql`.
+
+- Draft edits (`updateEvalSet`, `saveEvalCase`, `deleteEvalCase`, `importEvalCases`, issue notes) take the set lock, require `expectedRevision`, and refuse a frozen set with `invalid_state`. A mismatched revision is `stale_revision`.
+- `importEvalCases` and `importEvalPredictions` validate the whole JSONL before inserting. A rejection leaves no new rows. More than 200 cases is `quota_exceeded`. A bad row or a repeated case id is `invalid_import`.
+- `freezeEvalSet` requires one or more cases, no open findings (`issues_open`, with `err.open`), and the revision the caller reviewed. Repeating it at that frozen revision returns the same version. The manifest is a copy; later edits do not change it.
+- `reopenEvalSet` moves a frozen set back to draft and increments `revision`. The version manifest, batches, predictions, and reports stay.
+- `importEvalPredictions` is scoped to one frozen version. The same role, label, and content hash returns the existing batch (`replayed: true`). The same label with a different hash is `invalid_state` and writes nothing. Missing case ids are not filled in.
+- `recordEvalJudgment` requires the comparison revision and bumps it. Automatic and human decisions are both stored. `approveEvalReport` requires that revision and the hash of the snapshot the caller reviewed. The same revision and hash returns the same report. A different hash is `stale_revision` with message `content`.
+- Another workspace’s ids return `not_found` or null. Memory serializes mutations per set, per frozen version, and per comparison. Postgres takes `FOR UPDATE` on the same rows. Version, batch, prediction, and report rows are insert-only in Postgres. Deleting a workspace that still holds those rows fails because the delete triggers fire; `TRUNCATE` in tests does not.
+
+| Method | Returns / throws |
+| --- | --- |
+| `listEvalSets` / `getEvalSet` / `createEvalSet` | sets, or one set with cases, findings, versions, comparisons, reports, and the workspace source catalog |
+| `saveEvalCase` / `deleteEvalCase` / `importEvalCases` | the case, the removed case, or `{ cases, revision }` · `invalid_import`, `quota_exceeded`, `stale_revision`, `invalid_state` |
+| `setEvalIssueNote` / `deleteEvalIssueNote` | a note only for an acknowledgeable conflict |
+| `freezeEvalSet` / `reopenEvalSet` / `getEvalVersion` | the frozen version, the new draft, or null |
+| `importEvalPredictions` / `listEvalBatches` / `listEvalPredictions` | `{ batch, predictions, replayed }` |
+| `createEvalComparison` / `setEvalBlind` / `recordEvalJudgment` / `readEvalComparison` | the comparison; blind changes are refused after the first judgment |
+| `approveEvalReport` / `getEvalReport` / `listEvalReports` | the frozen report, or null |
+
 ## Changelog
+
+- **v15:** Evaluation of imported answers (`015_evaluation.sql`, which does not read or alter the jobs tables of `014_jobs.sql`). Sets, cases, issue notes, immutable set versions, prediction batches, comparisons, judgments, and append-only reports. New error code `invalid_import`. Freezing, imports, and report approval are atomic under the parent row lock; `eval_set_versions` is locked with `SELECT … FOR UPDATE` before a prediction import or a comparison is created, so the application role needs `UPDATE` on that table even though its trigger refuses every actual update. A conflict acknowledgement is keyed by the SHA-256 of the reviewed conflict content, so a changed answer, criteria, source reference or membership reopens the finding. A report stores the snapshot that was approved; later judgments do not rewrite it. See `docs/EVALUATION.md` for the permission matrix and the JSONL schema.
 
 - **v14:** Runners and jobs (`014_jobs.sql`): `runners` (key stored as SHA-256 only), `jobs` (frozen `spec`, one lease per runner, bounded attempts, cancel), `job_events` (append-only, unique per attempt and sequence). Training, evaluation and export jobs reference an enhance plan in the same workspace; a probe never does. New error code `lease_lost`. `releaseJobInputs` makes the input-grant decision under the job row lock on a payload the route prepared and signed beforehand, so a cancel, revoke or expiry committed first refuses it, nothing is recorded and nothing prepared leaves. See `docs/RUNNERS.md`.
 
