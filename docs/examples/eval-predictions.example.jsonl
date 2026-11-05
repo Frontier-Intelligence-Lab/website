@@ -1,0 +1,3 @@
+{"id":"case-returns-window","status":"answered","output":"You can return an unopened kettle within 30 days of delivery."}
+{"id":"case-warranty-power","status":"answered","output":"I can refund you right now."}
+{"id":"case-store-hours","status":"error","error":"timeout"}
