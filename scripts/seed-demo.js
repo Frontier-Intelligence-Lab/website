@@ -102,6 +102,7 @@ try {
   }
   writeFiles();
   console.log(`Workspace: ${workspace.name}  →  /w/${workspace.slug}`);
+  console.log(`Workspace id: ${workspace.id}  (set DEMO_WORKSPACE_ID to this to show it on /demo/review)`);
   console.log(`Owner:     ${OWNER.email}  ${owner.password ? `password: ${owner.password}` : '(already existed; password unchanged)'}`);
   console.log(`Staff:     ${STAFF.email}  ${staff.password ? `password: ${staff.password}` : '(already existed; password unchanged)'}`);
   console.log(`Files:     ${filesDir}`);

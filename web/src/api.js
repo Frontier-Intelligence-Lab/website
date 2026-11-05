@@ -22,6 +22,7 @@ export const api = {
   contact: (fields) => request('/api/contact', fields),
   login: (fields) => request('/api/login', fields),
   logout: () => request('/api/logout', {}),
+  demoOverview: () => request('/api/demo/overview'),
 
   account: () => load('/api/account'),
   signup: (fields) => request('/api/account/signup', fields),

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'react-router';
 import { api, uploadFile } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireWorkspace } from './ui.jsx';
-import { WorkspaceShell, plural, roleName } from './shell.jsx';
+import { CAPITAL_ROLES, WorkspaceShell, plural, roleName } from './shell.jsx';
 import { nextStepKind } from './lifecycle.js';
 import { ruleProblem } from '../../../src/lib/onboarding.js';
 
@@ -15,8 +15,8 @@ const STARTS = [
   { id: 'unsure', icon: 'question', tone: 'violet', title: 'Not sure yet', body: 'Book a short call and we will scope it with you.' },
 ];
 const PLANS = {
-  own: [['Describe the task', 'You are here'], ['Record your data and its rights', 'Where it came from and how it may be used'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Approve dataset version 1', 'Locked, versioned, private to you'], ['Train and evaluate', 'Planned. Will start only after you approve a cost estimate', true], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
-  need: [['Describe the task', 'You are here'], ['Shortlist or commission data', 'Compare samples, coverage and allowed uses'], ['Agree license terms', 'Nothing is bought until you approve'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Train and evaluate', 'Planned. Will start only after you approve a cost estimate', true], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
+  own: [['Describe the task', 'You are here'], ['Record your data and its rights', 'Where it came from and how it may be used'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Approve dataset version 1', 'Locked, versioned, private to you'], ['Train and evaluate', 'On a machine you link, after an owner approves the plan. Hosted GPUs and charges are planned'], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
+  need: [['Describe the task', 'You are here'], ['Shortlist or commission data', 'Compare samples, coverage and allowed uses'], ['Agree license terms', 'Nothing is bought until you approve'], ['Rights and quality review', 'We check permissions, labels and duplicates'], ['Train and evaluate', 'On a machine you link, after an owner approves the plan. Hosted GPUs and charges are planned'], ['Accept the model and deploy', 'Planned. Your cloud, your servers or a supported device', true]],
   model: [['Describe the task', 'You are here'], ['Connect your model', 'An endpoint or a model file you are allowed to use'], ['Add a test set', 'Examples with the answers you expect'], ['Compare against a baseline', 'Import both sets of answers on Evaluate. Valcairn does not call the endpoint.'], ['Deploy', 'Planned. Readiness checks before anything goes live', true]],
   unsure: [['Describe the task', 'You are here'], ['Scoping call', '30 minutes with our team'], ['Get a written plan', 'Data, approach, test method and a cost range']],
 };
@@ -173,7 +173,7 @@ export function ProjectSuccess() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">How will you know it works?</h1>
-            <p className="ob-lede">Set the bar before any training. Training is still planned. You can already score imported answers on Evaluate. This sentence is not the rule those scores use, and Valcairn does not call a model endpoint from here.</p>
+            <p className="ob-lede">Set the bar before any training. Training runs on a machine you link once an owner approves the plan; hosted GPUs are planned. You can already score imported answers on Evaluate. This sentence is not the rule those scores use, and Valcairn does not call a model endpoint from here.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           <div className="ob-grid">
@@ -241,7 +241,7 @@ export function ProjectSuccess() {
             <ul className="ob-list">
               <li><Tile icon="shield" tone="blue" size="sm" /><div><span className="ob-muted">We check your data, model and device fit together first.</span></div></li>
               <li><Tile icon="check" tone="green" size="sm" /><div><span className="ob-muted">You see a cost estimate and approve it before any training.</span></div></li>
-              <li><Tile icon="layers" tone="violet" size="sm" /><div><span className="ob-muted">Imported answers can be scored on Evaluate. Calling the model, and training, are still planned.</span></div></li>
+              <li><Tile icon="layers" tone="violet" size="sm" /><div><span className="ob-muted">Imported answers can be scored on Evaluate, and training runs on a machine you link after approval. Calling your model endpoint, and hosted training, are still planned.</span></div></li>
             </ul>
           </div>
         </aside>
@@ -652,7 +652,7 @@ export function ProjectHome() {
     ...(mode === 'upload' ? [{ label: 'Upload a sample', st: uploads.length ? 'done' : dataDone ? 'now' : 'todo', note: uploads.length ? plural(uploads.length, 'file') : undefined }] : []),
     { label: 'Rights and quality review', st: reviewed ? 'done' : ['in_review', 'changes_requested'].includes(s) ? 'now' : 'todo', note: s === 'in_review' ? 'With Valcairn' : s === 'changes_requested' ? 'Changes requested' : 'Valcairn checks rights, consent, labels and duplicates.' },
     { label: `Approve dataset version ${s === 'versioned' ? latest.number : (latest?.number ?? 0) + 1}`, st: s === 'versioned' ? 'done' : s === 'approved' ? 'now' : 'todo', note: s === 'versioned' ? `Version ${latest.number} · ${plural(latest.files, 'file')}` : 'Locks exactly the files and rights record that were reviewed.' },
-    { label: 'Train and test', st: 'todo', soon: true, note: 'Planned. You will approve a cost estimate first.' },
+    { label: 'Train and test', st: 'todo', note: 'On a machine you link, after an owner approves the plan on Models. Hosted GPUs and charges are planned.' },
     { label: 'Accept and deploy', st: 'todo', soon: true, note: 'Planned. Only a model that meets your rule can be accepted.' },
   ];
 
@@ -679,6 +679,16 @@ export function ProjectHome() {
 
   // Lifecycle first (see lifecycle.js): frozen projects always keep their reopen, withdraw and version actions.
   const kind = nextStepKind({ status: s, startingPoint: project.startingPoint, role, hasSuccess: taskDone, hasData: dataDone });
+  // Where an approved version goes next, on pages that exist: a plan on Models names the version, a linked machine on
+  // Compute runs and exports it, and Capital (organizations, finance roles) plans the costs. None of them starts anything
+  // by itself, and Models takes no version from the link; the plan picks it.
+  const afterVersion = (
+    <>
+      <Link className="btn-ghost" to={`/w/${entry.slug}/models`}>{writer ? 'Plan training on Models' : 'See Models'}</Link>
+      <Link className="btn-ghost" to={`/w/${entry.slug}/compute`}>{manager ? 'Link a machine on Compute' : 'See Compute'}</Link>
+      {entry.kind === 'organization' && CAPITAL_ROLES.includes(role) && <Link className="btn-ghost" to={`/w/${entry.slug}/capital`}>Plan costs on Capital</Link>}
+    </>
+  );
   const fixRule = project.success ? 'complete it' : 'set one';
   const noRule = !taskDone && !unsure && <p className="ob-alert">{project.success ? 'This project’s acceptance rule is incomplete.' : 'This project has no acceptance rule.'} {s === 'in_review' ? `Withdraw it from review to ${fixRule}.` : manager ? `Reopen it to ${fixRule} before the next review.` : `An owner or admin can reopen it to ${fixRule}.`}</p>;
   const needsFiles = mode === 'upload' && uploads.length === 0;
@@ -719,8 +729,8 @@ export function ProjectHome() {
     'in-review': { title: 'In review with Valcairn', body: 'The files, rights record and acceptance rule are locked while the review is open.' },
     'approve-version': { title: `Approve dataset version ${(latest?.number ?? 0) + 1}`, body: 'This freezes exactly the reviewed files, rights record and acceptance rule. Training will only use an approved version.', custom: <>{noRule}<button className="btn-app" type="button" disabled={pending} onClick={() => act(() => api.createVersion(entry.id, project.id))}>{pending ? 'Approving…' : `Approve version ${(latest?.number ?? 0) + 1}`}</button>{reopenBlock}</> },
     'wait-admin': { title: 'Waiting for an admin', body: 'An owner or admin approves the dataset version.', custom: noRule },
-    'versioned-manage': { title: `Dataset version ${latest?.number} approved`, body: `${plural(latest?.files ?? 0, 'file')} and their rights record are frozen in this version. Training is planned. Imported answers can be scored on Evaluate.`, custom: <>{noRule}{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}<Link className="btn-ghost" to={`${base}/evaluate`}>Evaluate answers</Link>{reopenBlock}</> },
-    versioned: { title: `Dataset version ${latest?.number} approved`, body: 'Training is planned. Imported answers can be scored on Evaluate.', custom: noRule },
+    'versioned-manage': { title: `Dataset version ${latest?.number} approved`, body: `${plural(latest?.files ?? 0, 'file')} and their rights record are frozen in this version. Training on a machine you link starts from a plan approved on Models; hosted GPUs are planned. Imported answers can be scored on Evaluate.`, custom: <>{noRule}{afterVersion}{entry.kind === 'organization' && <Link className="btn-ghost" to={`/w/${entry.slug}/setup/team`}>Invite your team</Link>}<Link className="btn-ghost" to={`${base}/evaluate`}>Evaluate answers</Link>{reopenBlock}</> },
+    versioned: { title: `Dataset version ${latest?.number} approved`, body: 'Training on a machine you link starts from a plan approved on Models; hosted GPUs are planned. Imported answers can be scored on Evaluate.', custom: <>{noRule}{afterVersion}</> },
   };
   const next = kind ? steps_[kind] : null;
 

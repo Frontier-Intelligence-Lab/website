@@ -10,6 +10,8 @@ const truthy = (value, fallback) =>
 
 // Keywords understood by Fastify's proxy-addr based trustProxy.
 const PROXY_KEYWORDS = new Set(['loopback', 'linklocal', 'uniquelocal']);
+// Store ids (src/store/postgres.js uses the same form).
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * TRUST_PROXY: unset/false -> no forwarded headers are trusted.
@@ -105,6 +107,14 @@ export function loadConfig(env = process.env) {
   if (env.REVIEWERS_FILE) reviewers = parseReviewers(readFileSync(env.REVIEWERS_FILE, 'utf8'));
   else if (env.REVIEWERS_JSON) reviewers = parseReviewers(env.REVIEWERS_JSON);
 
+  // The one workspace the /demo reviewer overview reads: the id of the seeded synthetic workspace (a UUID, the same
+  // form as every store id). Unset leaves the overview unconfigured; the server never substitutes sample data. The
+  // workspace must also carry profile.synthetic === true at request time, checked in src/lib/demo-overview.js.
+  const demoWorkspaceId = String(env.DEMO_WORKSPACE_ID ?? '').trim() || null;
+  if (demoWorkspaceId && !UUID.test(demoWorkspaceId)) {
+    throw new Error('DEMO_WORKSPACE_ID must be the UUID of the synthetic demo workspace (printed by scripts/seed-demo.js), or unset');
+  }
+
   // The open-weight model catalog is deployment data (docs/model-catalog.example.json), checked once here.
   // Unset leaves it empty: Models pages have nothing to pull and new enhance plans are refused, while pulls and
   // runs already recorded stay readable. An unreadable or invalid file stops startup with the reason.
@@ -129,6 +139,7 @@ export function loadConfig(env = process.env) {
     contactPublicEmail: env.CONTACT_PUBLIC_EMAIL ?? 'contact@frontierintelligencelab.com',
     bookingUrl: env.BOOKING_URL ?? 'https://cal.com/ayushozha/15-min-getting-to-know',
     reviewers,
+    demoWorkspaceId,
     modelCatalog,
     signinLogFile: env.SIGNIN_LOG_FILE || null,
     databaseUrl,

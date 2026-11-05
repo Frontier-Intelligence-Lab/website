@@ -110,7 +110,7 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
         </div>
       </aside>
       <main className="ob-body">
-        {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Everything here is generated for demonstration. It is not a real customer, and training, deployment and financing are planned, not running.</p>}
+        {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Its inputs are generated samples and it is not a real customer. The statuses and results shown here are only what was actually recorded in it: reviews, dataset versions, imported-answer evaluations, and any training or export that an approved plan ran on a linked compatible machine. Hosted GPU scheduling and charges, deployment and funding are planned, not running.</p>}
         {children}
       </main>
     </div>

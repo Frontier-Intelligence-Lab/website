@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireVerified, requireWorkspace } from './ui.jsx';
+import { forgetConnections } from './memory.js';
 
 const PERSONAL = ['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'proton.me', 'protonmail.com', 'aol.com'];
 const domainOf = (email) => email.split('@')[1]?.toLowerCase() ?? '';
@@ -14,8 +15,20 @@ export async function startLoader() {
 }
 
 export function Start() {
-  const { user, workspaces, joinRequests } = useLoaderData();
+  // isStaff is decided by the server (STAFF_EMAILS plus a confirmed email); nothing here infers it.
+  const { user, workspaces, joinRequests, isStaff } = useLoaderData();
+  const navigate = useNavigate();
+  const [signOutState, setSignOutState] = useState('idle');
   const work = !PERSONAL.includes(domainOf(user.email));
+  // Same rule as the workspace shell: only after the server has ended the session does this tab forget its
+  // local-memory keys and leave. A failed sign-out stays visible and can be retried; nothing is cleared for it.
+  async function signOut() {
+    setSignOutState('pending');
+    const res = await api.signout().catch(() => null);
+    if (!res?.ok) return setSignOutState('failed');
+    forgetConnections();
+    navigate('/signin');
+  }
   return (
     <SetupShell context={user.email} status={null} exit={workspaces[0] ? { to: `/w/${workspaces[0].slug}`, label: 'Back to workspace' } : null}>
       <title>How will you use Valcairn? — Valcairn</title>
@@ -28,12 +41,22 @@ export function Start() {
         {joinRequests.map((r) => (
           <p key={r.id} className="ob-alert ob-alert--info" role="status">Your request to join <strong>{r.workspaceName}</strong> is waiting for an admin. We'll let you in as soon as it's approved.</p>
         ))}
+        {isStaff && (
+          <section className="ob-card" aria-labelledby="staff-review-title">
+            <h2 id="staff-review-title">Valcairn staff review</h2>
+            <p className="ob-muted">Your account is on the staff list, so the review queues are open to you without a workspace of your own. Reviews must stay independent: you cannot decide on a workspace you belong to.</p>
+            <div className="ob-row-actions">
+              <Link className="btn-ghost" to="/staff"><Icon name="shield" size={16} />Review queue</Link>
+              <Link className="btn-ghost" to="/staff/capital"><Icon name="bank" size={16} />Capital review</Link>
+            </div>
+          </section>
+        )}
         <div className="ob-doors">
           <Link to="/setup/organization" className={`ob-door${work ? ' ob-door--suggested' : ''}`}>
             <span className="ob-door-head"><Tile icon="building" tone="blue" size="lg" />{work && <span className="ob-badge tile--blue">Suggested for your email</span>}</span>
             <span className="ob-door-title">For my company or team</span>
             <p>Create an organization. Colleagues share projects, data and models, each with their own role.</p>
-            <span className="ob-door-foot">Shared projects, team roles and (planned) financing need an organization.</span>
+            <span className="ob-door-foot">Shared projects, team roles and Capital planning need an organization.</span>
           </Link>
           <Link to="/setup/personal" className={`ob-door${work ? '' : ' ob-door--suggested'}`}>
             <span className="ob-door-head"><Tile icon="study" tone="violet" size="lg" />{!work && <span className="ob-badge tile--violet">Suggested for your email</span>}</span>
@@ -55,6 +78,18 @@ export function Start() {
           </Link>
         </div>
         <p className="ob-muted">Not sure? Most people building a product choose <strong>For my company or team</strong>. Students on a lab project should ask the lab to invite them.</p>
+        <section className="ob-actions" aria-labelledby="account-title">
+          <div className="ob-intro" style={{ gap: 2 }}>
+            <h2 id="account-title" style={{ fontSize: 15, fontWeight: 600 }}>Signed in as {user.email}</h2>
+            <span className="ob-muted">Not you, or finished here? Sign out to switch accounts.</span>
+          </div>
+          <div>
+            {signOutState === 'failed' && <p className="ob-alert" role="alert">We couldn't sign you out, so you're still signed in. Check your connection and try again.</p>}
+            <button type="button" className="btn-ghost" disabled={signOutState === 'pending'} onClick={signOut}>
+              {signOutState === 'pending' ? 'Signing out…' : signOutState === 'failed' ? 'Try signing out again' : 'Sign out'}
+            </button>
+          </div>
+        </section>
       </main>
     </SetupShell>
   );
@@ -118,7 +153,7 @@ export function OrgCreate() {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">Create your organization</h1>
-            <p className="ob-lede">One shared, private home for your company's projects and data. Models and financing are planned.</p>
+            <p className="ob-lede">One shared, private home for your company's projects, data, models and cost plans. Funding from lenders is planned; Capital stops at Valcairn's internal review.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           <div className="ob-grid">
@@ -203,8 +238,8 @@ export function OrgCreate() {
               <ul className="ob-areas">
                 <li><Tile icon="grid" tone="orange" size="sm" />Projects</li>
                 <li><Tile icon="data" tone="teal" size="sm" />Data</li>
-                <li><Tile icon="layers" tone="blue" size="sm" />Models (planned)</li>
-                <li><Tile icon="bank" tone="amber" size="sm" />Financing (planned)</li>
+                <li><Tile icon="layers" tone="blue" size="sm" />Models</li>
+                <li><Tile icon="bank" tone="amber" size="sm" />Capital planning (funding planned)</li>
               </ul>
               <div className="ob-org-switch"><span className="avatar" style={{ width: 28, height: 28, fontSize: 11 }}>{initials(user.name)}</span><span>{user.name} · <strong>Owner</strong></span></div>
             </div>
@@ -393,7 +428,7 @@ function OrgTeamManage({ entry, detail }) {
         <section className="ob-col">
           <div className="ob-intro">
             <h1 className="ob-h1">Who else should be here?</h1>
-            <p className="ob-lede">Invite the people you'll work with. Roles decide who can see and change data today; approving spend and financing are planned.</p>
+            <p className="ob-lede">Invite the people you'll work with. Roles decide who can see and change data, who approves plans and links machines, and who plans costs on Capital. Enforced spend limits and funding are planned.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           {(detail.joinRequests.length > 0 || detail.workspace.joinByDomain) && <JoinRequests workspaceId={entry.id} requests={detail.joinRequests} />}
@@ -460,7 +495,7 @@ function OrgTeamManage({ entry, detail }) {
               <div style={{ display: 'flex', gap: 12 }}><Tile icon="link" tone="plain" size="sm" /><span className="ob-muted"><strong style={{ color: 'var(--text)' }}>Invitations work for any email.</strong> Use them for contractors and partners outside your domain.</span></div>
             </div>
           </div>
-          <div className="ob-note tile--amber"><span>Financing is planned, not available yet. The Finance role exists so finance colleagues can follow projects read-only today and get financing access when it opens.</span></div>
+          <div className="ob-note tile--amber"><span>The Finance role sees projects read-only and, with owners and admins, plans costs, records outside credits and gathers evidence on Capital. Only owners and admins send a case to Valcairn's internal review. Lender offers and funding are planned, not available.</span></div>
         </aside>
       </form>
     </SetupShell>
