@@ -30,7 +30,7 @@ function AuthLayout({ children }) {
         </div>
         <ul className="ob-features">
           <li><Tile icon="data" tone="orange" /><div><strong>Data with its rights attached</strong><span className="ob-muted">Your own, licensed or newly collected.</span></div></li>
-          <li><Tile icon="layers" tone="blue" /><div><strong>Models tested on your task (planned)</strong><span className="ob-muted">You set the bar now; training and evaluation are not running yet.</span></div></li>
+          <li><Tile icon="layers" tone="blue" /><div><strong>Evaluate models on your task</strong><span className="ob-muted">Freeze test cases, import predictions and review the results. Training runs on a linked compatible machine; hosted GPUs are planned.</span></div></li>
           <li><Tile icon="bank" tone="amber" /><div><strong>Financing for growth (planned)</strong><span className="ob-muted">For compute, equipment and rollouts. Not available yet.</span></div></li>
         </ul>
       </section>
