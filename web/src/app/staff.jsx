@@ -33,22 +33,23 @@ async function requireStaff() {
 }
 
 export async function queueLoader({ request }) {
-  await requireStaff();
+  const account = await requireStaff();
   const status = new URL(request.url).searchParams.get('status') ?? 'pending';
-  return { status, ...(await api.staffReviews(status)) };
+  return { status, staffScope: account.staffScope, staffWorkspace: account.staffWorkspace, ...(await api.staffReviews(status)) };
 }
 
 export function StaffQueue() {
-  const { status, reviews } = useLoaderData();
+  const { status, reviews, staffScope, staffWorkspace } = useLoaderData();
   const [, setParams] = useSearchParams();
+  const demoOnly = staffScope === 'demo_workspace';
   return (
     <SetupShell tone="green" context="Review queue" status={null} exit={{ to: '/start', label: 'Back' }}>
       <title>Review queue — Valcairn</title>
       <main className="ob-main ob-main--narrow" style={{ maxWidth: 960 }}>
         <div className="ob-intro">
-          <span className="ob-eyebrow">Valcairn staff</span>
+          <span className="ob-eyebrow">{demoOnly ? `Demo review · ${staffWorkspace?.name ?? 'synthetic workspace'} only` : 'Valcairn staff'}</span>
           <h1 className="ob-h1">Rights and quality review</h1>
-          <p className="ob-lede">Customer data waiting for an independent check. Opening a review is recorded in the customer's audit log.</p>
+          <p className="ob-lede">{demoOnly ? 'Reviews from the one synthetic demo workspace your access covers. Nothing from any other workspace is listed or reachable here.' : 'Customer data waiting for an independent check.'} Opening a review is recorded in the customer's audit log.</p>
         </div>
         <div className="ob-segment" role="group" aria-label="Status">
           {[['pending', 'Waiting'], ['changes_requested', 'Changes requested'], ['approved', 'Approved']].map(([id, label]) => (

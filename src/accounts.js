@@ -3,6 +3,7 @@ import nodemailer from 'nodemailer';
 import { hashPassword, verifyPassword } from './lib/passwords.js';
 import { StoreError } from './store/index.js';
 import { PERSONAL_DOMAINS, emailDomain, isAcademicDomain, isEmail, normalizeDomain, slugify, validateProjectPatch, validateProjectStart } from './lib/onboarding.js';
+import { staffScopeFor } from './lib/staff-scope.js';
 
 const ROLES = ['owner', 'admin', 'member', 'finance', 'viewer'];
 const CAN = {
@@ -96,9 +97,14 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
   async function accountView(user) {
     const memberships = await store.listWorkspacesForUser(user.id);
     const requests = await store.listJoinRequestsForUser(user.id);
+    // The same decision the staff routes make on each request: whether this account may open the review queues at
+    // all, and whether that reaches every workspace or only the one synthetic demo workspace.
+    const scope = await staffScopeFor({ config, store, user });
     return {
       user,
-      isStaff: Boolean(user.emailVerifiedAt) && config.staffEmails.includes(user.email),
+      isStaff: Boolean(scope),
+      staffScope: scope ? (scope.global ? 'global' : 'demo_workspace') : null,
+      staffWorkspace: scope && !scope.global ? { id: scope.workspaceId, name: scope.workspaceName } : null,
       workspaces: memberships.map(({ workspace: w, role }) => ({ id: w.id, kind: w.kind, name: w.name, slug: w.slug, role, synthetic: Boolean(w.profile?.synthetic) })),
       joinRequests: requests.filter((r) => r.status === 'pending').map((r) => ({ id: r.id, workspaceId: r.workspaceId, workspaceName: r.workspaceName, status: r.status })),
     };

@@ -699,10 +699,12 @@ export function createPostgresStore(options) {
         return projectRow(row);
       });
     },
-    async listReviews({ status = 'pending' } = {}) {
+    // workspaceId narrows the queue to one workspace (demo-scoped staff); null keeps the whole queue.
+    async listReviews({ status = 'pending', workspaceId = null } = {}) {
+      if (workspaceId != null && !isId(workspaceId)) return [];
       return (await query(`SELECT r.*, p.name AS project_name, w.name AS workspace_name
         FROM reviews r JOIN projects p ON p.id = r.project_id JOIN workspaces w ON w.id = r.workspace_id
-        WHERE r.status = $1 ORDER BY r.created_at, r.id`, [status])).rows.map(row => ({ ...reviewRow(row), projectName: row.project_name, workspaceName: row.workspace_name }));
+        WHERE r.status = $1 AND ($2::uuid IS NULL OR r.workspace_id = $2) ORDER BY r.created_at, r.id`, [status, workspaceId])).rows.map(row => ({ ...reviewRow(row), projectName: row.project_name, workspaceName: row.workspace_name }));
     },
     async getReview(reviewId) {
       if (!isId(reviewId)) return null;
@@ -1196,11 +1198,13 @@ export function createPostgresStore(options) {
 
     // Staff queue across workspaces: only what was sent for review, as frozen in each submission. Live titles,
     // drafts, evidence and credit records changed since are never returned here.
-    async listCapitalCasesForReview({ status = 'submitted' } = {}) {
+    // workspaceId narrows the queue to one workspace (demo-scoped staff); null keeps the whole queue.
+    async listCapitalCasesForReview({ status = 'submitted', workspaceId = null } = {}) {
+      if (workspaceId != null && !isId(workspaceId)) return [];
       return (await query(`SELECT c.id, c.workspace_id, c.status, c.revision, c.submitted_revision, c.created_at, c.updated_at, w.name AS workspace_name, to_jsonb(s) AS latest
         FROM capital_cases c JOIN workspaces w ON w.id = c.workspace_id
         LEFT JOIN LATERAL (SELECT * FROM capital_submissions WHERE case_id = c.id ORDER BY revision DESC LIMIT 1) s ON true
-        WHERE c.status = $1 ORDER BY c.updated_at, c.id`, [status])).rows.map((r) => ({ ...caseMetaRow(r), workspaceName: r.workspace_name, latestSubmission: submissionRow(r.latest) }));
+        WHERE c.status = $1 AND ($2::uuid IS NULL OR c.workspace_id = $2) ORDER BY c.updated_at, c.id`, [status, workspaceId])).rows.map((r) => ({ ...caseMetaRow(r), workspaceName: r.workspace_name, latestSubmission: submissionRow(r.latest) }));
     },
     async getCapitalCaseForReview(caseId) {
       if (!isId(caseId)) return null;

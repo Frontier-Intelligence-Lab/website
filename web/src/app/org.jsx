@@ -15,8 +15,10 @@ export async function startLoader() {
 }
 
 export function Start() {
-  // isStaff is decided by the server (STAFF_EMAILS plus a confirmed email); nothing here infers it.
-  const { user, workspaces, joinRequests, isStaff } = useLoaderData();
+  // isStaff and its scope are decided by the server (STAFF_EMAILS or DEMO_STAFF_EMAILS plus a confirmed email, and
+  // for demo scope the pinned synthetic workspace re-checked on every request); nothing here infers them.
+  const { user, workspaces, joinRequests, isStaff, staffScope, staffWorkspace } = useLoaderData();
+  const demoOnly = staffScope === 'demo_workspace';
   const navigate = useNavigate();
   const [signOutState, setSignOutState] = useState('idle');
   const work = !PERSONAL.includes(domainOf(user.email));
@@ -43,8 +45,13 @@ export function Start() {
         ))}
         {isStaff && (
           <section className="ob-card" aria-labelledby="staff-review-title">
-            <h2 id="staff-review-title">Valcairn staff review</h2>
-            <p className="ob-muted">Your account is on the staff list, so the review queues are open to you without a workspace of your own. Reviews must stay independent: you cannot decide on a workspace you belong to.</p>
+            <h2 id="staff-review-title">{demoOnly ? 'Demo review access' : 'Valcairn staff review'}</h2>
+            <p className="ob-muted">
+              {demoOnly
+                ? <>Your account may review one <strong>synthetic demo workspace only</strong>{staffWorkspace ? <>: {staffWorkspace.name}</> : null}. It is not a Valcairn staff account: the queues below show that workspace and nothing else, and the access ends if the workspace stops being marked synthetic.</>
+                : 'Your account is on the staff list, so the review queues are open to you without a workspace of your own.'}
+              {' '}Reviews must stay independent: you cannot decide on a workspace you belong to.
+            </p>
             <div className="ob-row-actions">
               <Link className="btn-ghost" to="/staff"><Icon name="shield" size={16} />Review queue</Link>
               <Link className="btn-ghost" to="/staff/capital"><Icon name="bank" size={16} />Capital review</Link>

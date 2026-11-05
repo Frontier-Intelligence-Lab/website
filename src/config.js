@@ -4,6 +4,7 @@ import { isIP } from 'node:net';
 import { parseReviewers } from './lib/reviewers.js';
 import { parseModelCatalog } from './lib/models.js';
 import { parseCatalog } from './lib/devices.js';
+import { isEmail } from './lib/onboarding.js';
 
 const truthy = (value, fallback) =>
   value == null || value === '' ? fallback : ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -114,6 +115,13 @@ export function loadConfig(env = process.env) {
   if (demoWorkspaceId && !UUID.test(demoWorkspaceId)) {
     throw new Error('DEMO_WORKSPACE_ID must be the UUID of the synthetic demo workspace (printed by scripts/seed-demo.js), or unset');
   }
+  // Demo-scoped staff (src/lib/staff-scope.js): confirmed accounts that may review only the workspace DEMO_WORKSPACE_ID
+  // names, and only while it is synthetic. Each entry must be an email address, a non-empty list needs the pinned
+  // workspace, and an address is never on both lists, so it cannot carry global staff authority by accident. No default.
+  const demoStaffEmails = String(env.DEMO_STAFF_EMAILS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!demoStaffEmails.every(isEmail)) throw new Error('DEMO_STAFF_EMAILS must be a comma-separated list of email addresses');
+  if (demoStaffEmails.length && !demoWorkspaceId) throw new Error('DEMO_STAFF_EMAILS requires DEMO_WORKSPACE_ID: demo staff are scoped to that one synthetic workspace');
+  if (demoStaffEmails.some((e) => staffEmails.includes(e))) throw new Error('DEMO_STAFF_EMAILS must not repeat a STAFF_EMAILS entry: an address is either global staff or demo-scoped staff');
 
   // The open-weight model catalog is deployment data (docs/model-catalog.example.json), checked once here.
   // Unset leaves it empty: Models pages have nothing to pull and new enhance plans are refused, while pulls and
@@ -156,6 +164,7 @@ export function loadConfig(env = process.env) {
       projectMaxBytes: Number(env.PROJECT_MAX_BYTES ?? 20 * 1024 ** 3),
     } : null,
     staffEmails,
+    demoStaffEmails,
     localRuntimeOrigins,
     localMemoryOrigins,
     localModelCatalog,
