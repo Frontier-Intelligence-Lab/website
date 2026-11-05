@@ -18,6 +18,7 @@ New web configuration (all as runtime secrets or Coolify environment, never buil
 | `INGEST_PUBLIC_URL`, `INGEST_SHARED_SECRET` | Turns uploads on. The secret must match ingest's. |
 | `INGEST_INTERNAL_URL` | Optional private address of ingest for commit/delete calls. |
 | `STAFF_EMAILS` | Valcairn staff who may use `/staff`. Must not include external reviewers. |
+| `DEMO_WORKSPACE_ID`, `DEMO_STAFF_EMAILS` | Optional pair for a live synthetic demo: the pinned synthetic workspace, and confirmed accounts allowed to review that one workspace only while it stays `profile.synthetic = true`. `DEMO_STAFF_EMAILS` without the id, a non-email entry, or an address also in `STAFF_EMAILS` stops startup. Never put a demo reviewer in `STAFF_EMAILS`. |
 | `ACCOUNT_SIGNUP` | Leave unset (off) in production until public sign-up is approved. Invited users still need accounts, so decide this before launch. |
 | `PROJECT_MAX_FILES`, `PROJECT_MAX_BYTES` | Optional sample quotas. |
 | `MODEL_CATALOG_FILE` | Path of the read-only model catalog JSON mounted into the web container (`docs/model-catalog.example.json` shows the format). Optional; see Models below. |

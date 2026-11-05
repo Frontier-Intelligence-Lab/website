@@ -3,6 +3,7 @@ import { StoreError } from './store/index.js';
 import { signToken, verifyToken } from './lib/tokens.js';
 import { createIngestClient } from './lib/ingest-client.js';
 import { countInvalid, detectKind, kindOf, previewType } from './lib/dataset.js';
+import { scopeAllows, staffScopeFor } from './lib/staff-scope.js';
 
 const GRANT_TTL_S = 10 * 60;
 const DOWNLOAD_TTL_S = 5 * 60;
@@ -32,8 +33,17 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
   const uploadsOn = async (request, reply) => {
     if (!ingest) return problem(reply, 503, 'Sample uploads are not configured on this server.');
   };
+  // Valcairn staff: global (STAFF_EMAILS) or scoped to the one synthetic demo workspace (DEMO_STAFF_EMAILS), decided
+  // afresh on every request. Everyone else gets 404, as if the queue did not exist.
   const staff = async (request, reply) => {
-    if (!config.staffEmails.includes(request.user.email)) return problem(reply, 404, 'Not found.');
+    request.staffScope = await staffScopeFor({ config, store, user: request.user });
+    if (!request.staffScope) return problem(reply, 404, 'Not found.');
+  };
+  // A review outside the reviewer's scope does not exist for them: no detail, no decision, no download or preview link.
+  const loadReview = async (request, reply) => {
+    const review = await store.getReview(request.params.reviewId);
+    if (!review || !scopeAllows(request.staffScope, review.workspaceId)) return problem(reply, 404, 'Not found.');
+    request.review = review;
   };
   const approver = member('manageMembers');
   const locked = (reply) => problem(reply, 409, 'This project is locked while it is in review or approved. Withdraw or reopen it to make changes.', { code: 'project_locked' });
@@ -135,15 +145,15 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
     }
   });
 
-  // Internal review queue for Valcairn staff (STAFF_EMAILS). Others get 404, as if it did not exist.
+  // Internal review queue. Scoped staff get only their workspace's rows, filtered in the store before anything leaves it;
+  // nothing in the query can widen that.
   app.get('/api/staff/reviews', get([signedIn, verified, staff]), async (request) => {
     const status = ['pending', 'approved', 'changes_requested'].includes(request.query?.status) ? request.query.status : 'pending';
-    return { reviews: await store.listReviews({ status }) };
+    return { reviews: await store.listReviews({ status, workspaceId: request.staffScope.global ? null : request.staffScope.workspaceId }) };
   });
 
-  app.get('/api/staff/reviews/:reviewId', get([signedIn, verified, staff]), async (request, reply) => {
-    const review = await store.getReview(request.params.reviewId);
-    if (!review) return problem(reply, 404, 'Not found.');
+  app.get('/api/staff/reviews/:reviewId', get([signedIn, verified, staff, loadReview]), async (request) => {
+    const { review } = request;
     const where = { workspaceId: review.workspaceId, projectId: review.projectId };
     const [project, workspace, uploads] = await Promise.all([store.getProject(where), store.getWorkspace(review.workspaceId), store.listUploads(where)]);
     await store.recordAudit({ workspaceId: review.workspaceId, actorId: request.user.id, action: 'review.opened', targetType: 'project', targetId: review.projectId, metadata: { reviewId: review.id } });
@@ -182,7 +192,7 @@ export function registerDatasetRoutes(app, { config, store, helpers, guards, ing
     if (decision === 'changes_requested' && !notes) return problem(reply, 400, 'Tell the customer what to change.', { errors: { notes: 'Required when requesting changes.' } });
     if (decision === 'approved' && !CHECKS.every((c) => checks[c])) return problem(reply, 400, 'Every check must pass before approval.', { errors: { checks: 'Tick every check you confirmed.' } });
     const review = await store.getReview(request.params.reviewId);
-    if (!review) return problem(reply, 404, 'Not found.');
+    if (!review || !scopeAllows(request.staffScope, review.workspaceId)) return problem(reply, 404, 'Not found.');
     // Reviews must be independent: staff cannot decide on a workspace they belong to.
     if (await store.getMembership(review.workspaceId, request.user.id)) return problem(reply, 403, 'You belong to this workspace, so another reviewer must decide.', { code: 'conflict_of_interest' });
     try {

@@ -4,7 +4,8 @@
 //
 // Creates (or reuses) two accounts with confirmed emails and freshly generated passwords, shown once:
 //   - the demo owner of "Northwind Packaging (synthetic demo)"
-//   - a Valcairn staff reviewer with no membership in that workspace (add its email to STAFF_EMAILS)
+//   - a demo staff reviewer with no membership in that workspace (add its email to DEMO_STAFF_EMAILS with
+//     DEMO_WORKSPACE_ID set to the workspace id printed below; never to the global STAFF_EMAILS)
 // Nothing here is real customer data. Refuses to run with NODE_ENV=production unless --allow-production is given.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -106,7 +107,7 @@ try {
   console.log(`Owner:     ${OWNER.email}  ${owner.password ? `password: ${owner.password}` : '(already existed; password unchanged)'}`);
   console.log(`Staff:     ${STAFF.email}  ${staff.password ? `password: ${staff.password}` : '(already existed; password unchanged)'}`);
   console.log(`Files:     ${filesDir}`);
-  if (!config.staffEmails.includes(STAFF.email)) console.log(`Add ${STAFF.email} to STAFF_EMAILS so it can use the review queue.`);
+  if (!config.demoStaffEmails.includes(STAFF.email) || config.demoWorkspaceId !== workspace.id) console.log(`Set DEMO_WORKSPACE_ID=${workspace.id} and add ${STAFF.email} to DEMO_STAFF_EMAILS so it can review this workspace only (never STAFF_EMAILS).`);
   console.log('Passwords are shown only now. Keep them outside Git.');
 } finally {
   await store.close();

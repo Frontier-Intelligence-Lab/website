@@ -430,8 +430,9 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
       audit.push({ id: audit.length + 1, workspaceId, actorId, action: 'project.reopened', targetType: 'project', targetId: projectId, metadata: { from }, createdAt: stamp() });
       return copy(project);
     },
-    async listReviews({ status = 'pending' } = {}) {
-      return reviews.filter((r) => r.status === status).map((r) => {
+    // workspaceId narrows the queue to one workspace (demo-scoped staff); null keeps the whole queue.
+    async listReviews({ status = 'pending', workspaceId = null } = {}) {
+      return reviews.filter((r) => r.status === status && (workspaceId == null || r.workspaceId === workspaceId)).map((r) => {
         const p = projects.get(r.projectId);
         return { ...copy(r), projectName: p.name, workspaceName: workspaces.get(r.workspaceId).name };
       });
@@ -827,8 +828,9 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
 
     // Staff queue across workspaces: only what was sent for review, as frozen in each submission. Live titles,
     // drafts, evidence and credit records changed since are never returned here.
-    async listCapitalCasesForReview({ status = 'submitted' } = {}) {
-      return capitalCases.filter((c) => c.status === status).map((c) => ({ ...caseMeta(c), workspaceName: workspaces.get(c.workspaceId).name, latestSubmission: latestSubmission(c.id) }));
+    // workspaceId narrows the queue to one workspace (demo-scoped staff); null keeps the whole queue.
+    async listCapitalCasesForReview({ status = 'submitted', workspaceId = null } = {}) {
+      return capitalCases.filter((c) => c.status === status && (workspaceId == null || c.workspaceId === workspaceId)).map((c) => ({ ...caseMeta(c), workspaceName: workspaces.get(c.workspaceId).name, latestSubmission: latestSubmission(c.id) }));
     },
     async getCapitalCaseForReview(caseId) {
       const c = capitalCases.find((x) => x.id === caseId);

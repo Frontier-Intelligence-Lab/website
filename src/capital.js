@@ -1,6 +1,7 @@
 import { StoreError } from './store/index.js';
 import { CASE_DECISIONS, COST_BASES, COST_CATEGORIES, COST_PERIODS, CREDIT_STATUSES, EVIDENCE_KINDS, LENDER_STAGES, MAX_AMOUNT_CENTS, MAX_COST_ITEMS, PLANNED, REFERENCE_KINDS, buildEvidencePackage, capitalSnapshot, emptyDraft, totalsByBasis, validateCapitalDraft, validateCaseFields, validateCreditRecord, validateEvidence } from './lib/capital.js';
 import { isHash, snapshotHash } from './lib/capital-hash.js';
+import { scopeAllows, staffScopeFor } from './lib/staff-scope.js';
 
 const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
 const CONSTANTS = { categories: COST_CATEGORIES, periods: COST_PERIODS, bases: COST_BASES, creditStatuses: CREDIT_STATUSES, evidenceKinds: EVIDENCE_KINDS, referenceKinds: REFERENCE_KINDS, lenderStages: LENDER_STAGES, maxAmountCents: MAX_AMOUNT_CENTS, maxCostItems: MAX_COST_ITEMS, planned: PLANNED };
@@ -26,9 +27,11 @@ export function registerCapitalRoutes(app, { config, store, helpers, guards }) {
   const reader = [signedIn, member('readCapital'), organization];
   const writer = [signedIn, member('writeCapital'), organization];
   const sender = [signedIn, member('manageMembers'), organization];
-  // Valcairn staff (STAFF_EMAILS) with a confirmed email. Everyone else, demo reviewer accounts included, gets 404.
+  // Valcairn staff with a confirmed email: global (STAFF_EMAILS) or scoped to the one synthetic demo workspace
+  // (DEMO_STAFF_EMAILS), decided afresh on every request. Everyone else, demo reviewer accounts included, gets 404.
   const staff = async (request, reply) => {
-    if (!config.staffEmails.includes(request.user.email)) return problem(reply, 404, 'Not found.');
+    request.staffScope = await staffScopeFor({ config, store, user: request.user });
+    if (!request.staffScope) return problem(reply, 404, 'Not found.');
   };
   const staffOnly = [signedIn, verified, staff];
   const loadCase = async (request, reply) => {
@@ -208,9 +211,10 @@ export function registerCapitalRoutes(app, { config, store, helpers, guards }) {
     title: c.latestSubmission?.snapshot.title ?? null, requestedAmountCents: c.latestSubmission?.snapshot.draft.requestedAmountCents ?? null,
     latestSubmission: c.latestSubmission ? withoutSnapshot(c.latestSubmission) : null,
   });
+  // A case outside the reviewer's scope does not exist for them, before anything about it is looked at.
   const loadForReview = async (request, reply) => {
     const found = await store.getCapitalCaseForReview(request.params.caseId);
-    if (!found || found.case.status === 'draft' || !found.submission) return problem(reply, 404, 'Not found.');
+    if (!found || !scopeAllows(request.staffScope, found.workspace.id) || found.case.status === 'draft' || !found.submission) return problem(reply, 404, 'Not found.');
     request.review = found;
   };
   // Reviews must be independent: staff cannot decide on a workspace they belong to.
@@ -224,9 +228,10 @@ export function registerCapitalRoutes(app, { config, store, helpers, guards }) {
     return storeFail(reply, err);
   };
 
+  // Scoped staff get only their workspace's rows, filtered in the store before anything leaves it.
   app.get('/api/staff/capital', get(staffOnly), async (request) => {
     const status = STAFF_STATUSES.includes(request.query?.status) ? request.query.status : 'submitted';
-    return { cases: (await store.listCapitalCasesForReview({ status })).map(staffSummary) };
+    return { cases: (await store.listCapitalCasesForReview({ status, workspaceId: request.staffScope.global ? null : request.staffScope.workspaceId })).map(staffSummary) };
   });
 
   app.get('/api/staff/capital/:caseId', get([...staffOnly, loadForReview]), async (request) => {

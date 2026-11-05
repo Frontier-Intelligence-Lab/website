@@ -157,6 +157,10 @@ export function runStoreContract(test, makeStore, label) {
     const queue = await store.listReviews({ status: 'pending' });
     assert.equal(queue.length, 1);
     assert.equal(queue[0].workspaceName, 'Acme');
+    // A workspace-scoped queue (demo-scoped staff) holds that workspace's rows and nothing else.
+    assert.deepEqual((await store.listReviews({ status: 'pending', workspaceId: ws.id })).map((r) => r.id), [review.id]);
+    assert.deepEqual(await store.listReviews({ status: 'pending', workspaceId: other.id }), []);
+    assert.deepEqual(await store.listReviews({ status: 'pending', workspaceId: 'not-an-id' }), []);
 
     await store.decideReview({ reviewId: review.id, reviewerId: staff.id, decision: 'changes_requested', notes: 'Labels missing', checks: { rights: true, labels: false } });
     assert.equal((await store.getProject({ workspaceId: ws.id, projectId: p.id })).status, 'changes_requested');
@@ -589,6 +593,10 @@ export function runStoreContract(test, makeStore, label) {
     const queued = await store.listCapitalCasesForReview({ status: 'submitted' });
     assert.equal(queued.length, 1);
     assert.deepEqual([queued[0].title, queued[0].draft, queued[0].latestSubmission.id], [undefined, undefined, sub.id]);
+    // A workspace-scoped queue (demo-scoped staff) holds that workspace's rows and nothing else.
+    assert.deepEqual((await store.listCapitalCasesForReview({ status: 'submitted', workspaceId: ws.id })).map((c) => c.id), [kase.id]);
+    assert.deepEqual(await store.listCapitalCasesForReview({ status: 'submitted', workspaceId: other.id }), []);
+    assert.deepEqual(await store.listCapitalCasesForReview({ status: 'submitted', workspaceId: 'not-an-id' }), []);
     const found = await store.getCapitalCaseForReview(kase.id);
     assert.equal(found.workspace.name, 'Acme');
     assert.equal(found.submission.id, sub.id);

@@ -12,7 +12,7 @@ Invited external reviewers (`/demo`) see the same workspace read-only on `/demo/
    node --env-file-if-exists=.env scripts/seed-demo.js
    ```
    This prints the demo owner and staff-reviewer passwords once; keep them outside Git. It also writes synthetic files to `.local/demo-files/`: 6 box images, `labels.csv` and `line2-box-001-copy.png`, an exact copy for the duplicate check.
-3. **Local rehearsal only:** on a disposable local development stack you may add `demo.reviewer@valcairn.example` to `STAFF_EMAILS` and restart web so that seeded account can open `/staff`. `STAFF_EMAILS` is global staff authority over every workspace on that server, not a demo-workspace restriction, so never apply this to production. A production demonstration uses approved, existing staff access for the review step; a server-enforced staff policy scoped to the demo workspace does not exist yet and would have to be implemented and reviewed separately before anything else is promised.
+3. **Give the demo reviewer scoped access, never global:** set `DEMO_WORKSPACE_ID` to the workspace id the seed printed and add `demo.reviewer@valcairn.example` to `DEMO_STAFF_EMAILS`, then restart web. That account can then open `/staff` and `/staff/capital` for this one workspace only, and only while the workspace exists with `profile.synthetic = true`, which the server re-checks on every request; it never sees another workspace's reviews, files or Capital submissions. Do not add it to `STAFF_EMAILS`: that is global staff authority over every workspace on the server, the server refuses an address that is on both lists, and a production demonstration must use either this scoped pair or an existing approved staff account.
 4. Use two browser profiles: profile A for the demo owner, profile B for the staff reviewer. Staff approval is separate from the external YC/Speedrun reviewer accounts, which only see `/demo`.
 
 ## The walkthrough
@@ -86,5 +86,5 @@ That deletes all local data, including local reviewer accounts. Re-provision the
 ## If something fails live
 
 - **Upload says the service could not be reached:** ingest isn't running, or `INGEST_PUBLIC_URL`/CORS is wrong. Check `curl <ingest>/healthz`.
-- **`/staff` returns to Start:** the staff account's email isn't in `STAFF_EMAILS` (on a local rehearsal stack only; see step 3 of "Before the demo"), its email isn't confirmed, or the web server wasn't restarted after the change. In production, use an existing approved staff account; do not edit `STAFF_EMAILS` for a demo.
+- **`/staff` returns to Start:** the demo reviewer's email isn't in `DEMO_STAFF_EMAILS` with `DEMO_WORKSPACE_ID` set to this workspace (see step 3 of "Before the demo"), the workspace is no longer marked synthetic, the email isn't confirmed, or the web server wasn't restarted after the change. Do not edit `STAFF_EMAILS` for a demo.
 - **The reviewer can't decide:** reviewers cannot decide on a workspace they belong to. Use the separate staff account.

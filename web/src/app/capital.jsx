@@ -699,9 +699,9 @@ async function requireStaff() {
   return account;
 }
 export async function staffCapitalLoader({ request }) {
-  await requireStaff();
+  const account = await requireStaff();
   const status = new URL(request.url).searchParams.get('status') ?? 'submitted';
-  return { status, ...(await api.staffCapital(status)) };
+  return { status, staffScope: account.staffScope, staffWorkspace: account.staffWorkspace, ...(await api.staffCapital(status)) };
 }
 export async function staffCapitalCaseLoader({ params }) {
   await requireStaff();
@@ -709,14 +709,14 @@ export async function staffCapitalCaseLoader({ params }) {
 }
 
 export function StaffCapitalQueue() {
-  const { status, cases } = useLoaderData();
+  const { status, cases, staffScope, staffWorkspace } = useLoaderData();
   const [, setParams] = useSearchParams();
   return (
     <SetupShell tone="green" context="Capital review" status={null} exit={{ to: '/staff', label: 'Review queue' }}>
       <title>Capital review — Valcairn</title>
       <main className="ob-main ob-main--narrow" style={{ maxWidth: 960 }}>
         <div className="ob-intro">
-          <span className="ob-eyebrow">Valcairn staff</span>
+          <span className="ob-eyebrow">{staffScope === 'demo_workspace' ? `Demo review · ${staffWorkspace?.name ?? 'synthetic workspace'} only` : 'Valcairn staff'}</span>
           <h1 className="ob-h1">Capital review</h1>
           <p className="ob-lede">Financing requests customers chose to send. You check the planning evidence and either request changes or mark it reviewed. This is not a credit decision, and no lender or provider is involved.</p>
         </div>
