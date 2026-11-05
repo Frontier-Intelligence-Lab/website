@@ -331,8 +331,13 @@ class SourcePaths(unittest.TestCase):
 
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
-FEATURE_NUMBERS = ("011", "012", "013")
+FEATURE_NUMBERS = ("011", "012", "013", "014", "015")
+# Registered ahead of their files: each is read from migrations/ once it lands there, or until then from a private
+# directory named by RELEASE_GUARDS_TEST_MIGRATIONS holding the exact reviewed blobs (never committed here).
+PENDING = {"014": "014_jobs.sql", "015": "015_evaluation.sql"}
+PENDING_DIRECTORY = os.environ.get("RELEASE_GUARDS_TEST_MIGRATIONS", "")
 ALL_PRIVILEGES = deploy.TABLE_PRIVILEGES + ("MAINTAIN",)
+JOBS, EVALUATION = deploy.TABLE_GROUPS["014"], deploy.TABLE_GROUPS["015"]
 
 
 def tables_through(number):
@@ -345,6 +350,14 @@ def ledger_through(number):
     return sorted(file.name for file in MIGRATIONS.glob("*.sql") if file.name[:3] <= number)
 
 
+def migration_file(name):
+    """The migration file to apply for `name`: the repository's own once it exists, else the private pending blob."""
+    for directory in (MIGRATIONS, Path(PENDING_DIRECTORY) if PENDING_DIRECTORY else None):
+        if directory and (directory / name).is_file():
+            return directory / name
+    return None
+
+
 class FeatureGuards(unittest.TestCase):
     """Production may sit anywhere from the documented 001-006 baseline to the Capital schema; the ledger decides."""
 
@@ -353,6 +366,10 @@ class FeatureGuards(unittest.TestCase):
         for file in sorted(MIGRATIONS.glob("*.sql")):
             created[file.name[:3]] = set(re.findall(r"^CREATE TABLE (?:IF NOT EXISTS )?([a-z_]+)", file.read_text(), re.MULTILINE))
         self.assertLessEqual({"%03d" % n for n in range(1, 11)}, set(created))
+        # The pending 014 and 015 files are checked the same way whenever their exact blobs are supplied.
+        for number, name in PENDING.items():
+            if number not in created and migration_file(name):
+                created[number] = set(re.findall(r"^CREATE TABLE (?:IF NOT EXISTS )?([a-z_]+)", migration_file(name).read_text(), re.MULTILINE))
         # Every migration file present must agree with its group: an unknown new table or a renamed one fails here,
         # whether the branch carries 001-010 only or, once synced with master, 011 and 012 as well.
         for number, tables in created.items():
@@ -372,8 +389,35 @@ class FeatureGuards(unittest.TestCase):
         verified, absent = deploy.verify_tables(ledger_through("010"), tables_through("010"))
         self.assertIn("annotations", verified)
         self.assertEqual(absent, sorted(sum((deploy.TABLE_GROUPS[n] for n in FEATURE_NUMBERS), ())))
-        later = ledger_through("010") + ["011_models.sql", "012_devices.sql", "013_capital.sql"]
+        later = ledger_through("010") + ["011_models.sql", "012_devices.sql", "013_capital.sql", "014_jobs.sql", "015_evaluation.sql"]
         self.assertEqual(deploy.verify_tables(later, deploy.KNOWN_TABLES), (sorted(deploy.KNOWN_TABLES), []))
+
+    def test_jobs_and_evaluation_groups_are_independent_and_each_optional(self):
+        """Production at 013 (4 November 2026) may later receive 014, 015 or both, in either order; the ledger decides per group."""
+        thirteen, base = ledger_through("013"), tables_through("013")
+        self.assertEqual(len(thirteen), 13)
+        self.assertEqual((JOBS, len(EVALUATION), len(deploy.KNOWN_TABLES)), (("runners", "jobs", "job_events"), 9, 39))
+        self.assertTrue(all(name.startswith("eval_") for name in EVALUATION))
+        accepted = (("013 only", thirteen, base, JOBS + EVALUATION),
+                    ("014 without 015", thirteen + ["014_jobs.sql"], base + JOBS, EVALUATION),
+                    ("015 without 014", thirteen + ["015_evaluation.sql"], base + EVALUATION, JOBS),
+                    ("015 applied before 014", thirteen + ["015_evaluation.sql", "014_jobs.sql"], base + EVALUATION + JOBS, ()),
+                    ("both", thirteen + ["014_jobs.sql", "015_evaluation.sql"], base + JOBS + EVALUATION, ()))
+        for name, ledger, present, absent in accepted:
+            with self.subTest(case=name):
+                self.assertEqual(deploy.verify_tables(ledger, present), (sorted(present), sorted(absent)))
+        refused = (("015 listed but its tables missing", thirteen + ["015_evaluation.sql"], base),
+                   ("partial 015 group", thirteen + ["015_evaluation.sql"], base + EVALUATION[:4]),
+                   ("015 tables without their ledger entry", thirteen, base + EVALUATION),
+                   ("014 listed but its tables missing", thirteen + ["014_jobs.sql"], base),
+                   ("014 tables without their ledger entry", thirteen + ["015_evaluation.sql"], base + EVALUATION + JOBS),
+                   ("015 tables without their ledger entry beside 014", thirteen + ["014_jobs.sql"], base + JOBS + EVALUATION),
+                   ("one evaluation table on a legacy database", thirteen, base + ("eval_reports",)))
+        for name, ledger, present in refused:
+            with self.subTest(case=name), self.assertRaises(deploy.ReleaseError):
+                deploy.verify_tables(ledger, present)
+        self.assertIn("FROM eval_reports t", deploy.manifest_sql(base + EVALUATION))
+        self.assertIn("FROM job_events t", deploy.manifest_sql(base + JOBS))
 
     def test_ledger_and_tables_must_agree_from_the_baseline_up(self):
         six, ten = ledger_through("006"), ledger_through("010")
@@ -392,12 +436,66 @@ class FeatureGuards(unittest.TestCase):
 
     def test_grant_contract_is_explicit_and_never_deletes_immutable_records(self):
         self.assertEqual(set(deploy.GRANTS) - set(deploy.KNOWN_TABLES), set())
-        for table in ("enhance_runs", "device_reports", "execution_runs", "capital_submissions", "credit_records", "capital_review_marks"):
+        for table in ("enhance_runs", "device_reports", "execution_runs", "capital_submissions", "credit_records", "capital_review_marks",
+                      "runners", "jobs", "job_events", "eval_sets", "eval_set_versions", "eval_batches", "eval_predictions", "eval_comparisons", "eval_judgments", "eval_reports"):
             self.assertNotIn("DELETE", deploy.GRANTS[table], table)
-        for table in ("credit_records", "capital_review_marks", "device_reports", "execution_runs", "model_pulls"):
+        for table in ("credit_records", "capital_review_marks", "device_reports", "execution_runs", "model_pulls", "job_events", "eval_batches", "eval_predictions", "eval_reports"):
             self.assertNotIn("UPDATE", deploy.GRANTS[table], table)
         self.assertEqual(deploy.GRANTS["capital_evidence"], ("SELECT", "INSERT", "DELETE"))
         self.assertFalse(any(set(required) & {"TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"} for required in deploy.GRANTS.values()))
+        self.assertTrue(all("SELECT" in required for required in deploy.GRANTS.values()))
+
+    def test_evaluation_grants_follow_the_store_statements_and_keep_frozen_rows_insert_only(self):
+        """Exactly what eval-postgres.js issues: no DELETE beyond draft cases and notes, UPDATE on a version only for its row lock."""
+        self.assertEqual({table: deploy.GRANTS[table] for table in EVALUATION}, {
+            "eval_sets": ("SELECT", "INSERT", "UPDATE"), "eval_cases": deploy.ROW_PRIVILEGES, "eval_issue_notes": deploy.ROW_PRIVILEGES,
+            "eval_set_versions": ("SELECT", "INSERT", "UPDATE"), "eval_batches": ("SELECT", "INSERT"), "eval_predictions": ("SELECT", "INSERT"),
+            "eval_comparisons": ("SELECT", "INSERT", "UPDATE"), "eval_judgments": ("SELECT", "INSERT", "UPDATE"), "eval_reports": ("SELECT", "INSERT")})
+        self.assertEqual({table: deploy.GRANTS[table] for table in JOBS}, {"runners": ("SELECT", "INSERT", "UPDATE"), "jobs": ("SELECT", "INSERT", "UPDATE"), "job_events": ("SELECT", "INSERT")})
+        self.assertFalse(set(EVALUATION) & set(deploy.SEQUENCE_GRANTS))
+        # A database at 013 plus 015 only: every evaluation table is granted exactly once, nothing on 014, no sequence.
+        release = self.grant_release({table: {"held": set()} for table in EVALUATION})
+        release.ensure_grants()
+        grants = [code for code in release.programs if "GRANT " in code]
+        self.assertEqual(len(grants), len(EVALUATION))
+        for table in EVALUATION:
+            self.assertEqual(release.receipt["grants"]["tables"][table], list(deploy.GRANTS[table]))
+            self.assertTrue(any("GRANT " + ",".join(sorted(deploy.GRANTS[table])) + " ON TABLE " + table + " TO" in code for code in grants), table)
+        for table in JOBS:
+            self.assertEqual(release.receipt["grants"]["tables"][table], "absent")
+        self.assertEqual(release.receipt["grants"]["sequences"], {})
+        self.assertFalse(any("ON SEQUENCE" in code or "ALL" in code for code in grants))
+        self.assertFalse(any("DELETE" in code for code in grants if "ON TABLE eval_cases" not in code and "ON TABLE eval_issue_notes" not in code))
+        # Held beyond the contract on a frozen table: refused before any grant, as the runbook's stale all-CRUD line would cause.
+        for table, extra in (("eval_reports", "DELETE"), ("eval_batches", "UPDATE"), ("eval_predictions", "DELETE"), ("eval_set_versions", "DELETE"),
+                             ("eval_comparisons", "DELETE"), ("eval_judgments", "TRUNCATE"), ("eval_sets", "DELETE")):
+            release = self.grant_release({table: {"held": set(deploy.GRANTS[table]) | {extra}}})
+            with self.subTest(table=table, extra=extra), self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("beyond the release contract", str(failure.exception))
+            self.assertFalse(any("GRANT " in code for code in release.programs))
+        release = self.grant_release({"eval_reports": {"held": {"SELECT", "INSERT"}, "sequences": [{"name": "eval_reports_id_seq"}], "seq_held": {"eval_reports_id_seq": set()}}})
+        with self.assertRaises(deploy.ReleaseError):
+            release.ensure_grants()
+        for table, privileges in (("eval_reports", ["UPDATE"]), ("eval_set_versions", ["DELETE"]), ("eval_batches", ["UPDATE"]), ("eval_predictions", ["DELETE"])):
+            with self.subTest(table=table, privileges=privileges), self.assertRaises(deploy.ReleaseError):
+                deploy.grant_program("app", table, privileges)
+
+    def test_evaluation_frozen_records_and_identities_are_digested_by_their_protected_columns(self):
+        for table in ("eval_set_versions", "eval_batches", "eval_predictions", "eval_comparisons", "eval_judgments", "eval_reports"):
+            self.assertRegex(deploy.FROZEN_QUERIES[table], r"^SELECT id::text,md5\(jsonb_build_object\((?:'[a-zA-Z]+',[a-z_]+,?)+\)::text\) AS digest FROM " + table + r" ORDER BY id$")
+        for table in ("eval_sets", "eval_cases", "eval_issue_notes", "runners", "jobs", "job_events"):
+            self.assertNotIn(table, deploy.FROZEN_QUERIES)
+        columns = lambda table: set(re.findall(r"'[a-zA-Z]+',([a-z_]+)", deploy.FROZEN_QUERIES[table]))
+        self.assertLessEqual({"manifest", "content_hash", "number", "revision", "set_id", "created_at"}, columns("eval_set_versions"))
+        self.assertLessEqual({"content_hash", "provenance", "claimed_system", "claimed_scorer", "role", "label", "version_id"}, columns("eval_batches"))
+        self.assertEqual(columns("eval_predictions"), {"batch_id", "case_key", "status", "output", "error_code"})
+        self.assertEqual(columns("eval_comparisons"), {"workspace_id", "set_id", "version_id", "baseline_batch_id", "candidate_batch_id", "acceptance", "created_by", "created_at"})
+        self.assertEqual(columns("eval_judgments"), {"comparison_id", "workspace_id", "case_key"})
+        self.assertLessEqual({"snapshot", "content_hash", "decision", "revision", "comparison_id", "approved_at"}, columns("eval_reports"))
+        # Review state that legitimately moves (blind assignment, revisions, decisions, notes) is not part of a frozen identity.
+        self.assertFalse({"blind", "revision", "updated_at"} & columns("eval_comparisons"))
+        self.assertFalse({"baseline_decision", "candidate_decision", "note", "reviewer_id", "updated_at"} & columns("eval_judgments"))
 
     def test_grant_programs_are_bounded_to_the_contract(self):
         check = deploy.grant_check_program("app", "annotations")
@@ -444,12 +542,17 @@ class FeatureGuards(unittest.TestCase):
             if granted:
                 present[granted.group(2)]["held"] |= set(granted.group(1).split(","))
                 return {"granted": True}
+            granted = re.search(r"GRANT ([A-Z,]+) ON SEQUENCE ([a-z_]+) TO", code)
+            if granted:
+                next(t for t in present.values() if granted.group(2) in t.get("seq_held", {}))["seq_held"][granted.group(2)] |= set(granted.group(1).split(","))
+                return {"granted": True}
             table = re.search(r'table="([a-z_]+)"', code).group(1)
             if table not in present:
                 return {"present": False}
             state = present[table]
             return {"present": True, "sequences": state.get("sequences", []), "owner": state.get("owner", False), "superuser": state.get("superuser", False),
-                    "rows": [{"privilege": p, "ok": p in state["held"]} for p in ALL_PRIVILEGES]}
+                    "rows": [{"privilege": p, "ok": p in state["held"]} for p in ALL_PRIVILEGES],
+                    "sequenceRows": {name: [{"privilege": p, "ok": p in held} for p in deploy.SEQUENCE_PRIVILEGES] for name, held in state.get("seq_held", {}).items()}}
         release.node = node
         return release
 
@@ -491,6 +594,36 @@ class FeatureGuards(unittest.TestCase):
         release = self.grant_release({"devices": {"held": {"SELECT", "INSERT", "UPDATE"}, "sequences": [{"name": "devices_id_seq"}]}})
         with self.assertRaises(deploy.ReleaseError):
             release.ensure_grants()
+
+    def test_job_events_get_usage_on_their_one_sequence_and_nothing_more(self):
+        self.assertEqual(deploy.GRANTS["job_events"], ("SELECT", "INSERT"))
+        self.assertEqual(deploy.SEQUENCE_GRANTS, {"job_events": {"job_events_id_seq": ("USAGE",)}})
+        seq = [{"name": "job_events_id_seq"}]
+        release = self.grant_release({"job_events": {"held": {"SELECT", "INSERT"}, "sequences": seq, "seq_held": {"job_events_id_seq": set()}}})
+        release.ensure_grants()
+        grants = [code for code in release.programs if "GRANT " in code]
+        self.assertEqual(len(grants), 1)
+        self.assertIn("GRANT USAGE ON SEQUENCE job_events_id_seq TO", grants[0])
+        self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
+        # SELECT or UPDATE (setval) on the sequence is excess; another sequence, or one on another table, is refused.
+        for extra in ("SELECT", "UPDATE"):
+            release = self.grant_release({"job_events": {"held": {"SELECT", "INSERT"}, "sequences": seq, "seq_held": {"job_events_id_seq": {"USAGE", extra}}}})
+            with self.subTest(extra=extra), self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("beyond the release contract", str(failure.exception))
+            self.assertFalse(any("GRANT " in code for code in release.programs))
+        for state in ({"held": {"SELECT", "INSERT"}, "sequences": [{"name": "other_seq"}], "seq_held": {"other_seq": set()}},
+                      {"held": {"SELECT", "INSERT"}, "sequences": []}):
+            release = self.grant_release({"job_events": state})
+            with self.assertRaises(deploy.ReleaseError):
+                release.ensure_grants()
+        release = self.grant_release({"jobs": {"held": {"SELECT", "INSERT", "UPDATE"}, "sequences": seq, "seq_held": {"job_events_id_seq": set()}}})
+        with self.assertRaises(deploy.ReleaseError):
+            release.ensure_grants()
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.sequence_grant_program("app", "job_events", "job_events_id_seq", ["UPDATE"])
+        with self.assertRaises(deploy.ReleaseError):
+            deploy.sequence_grant_program("app", "jobs", "job_events_id_seq", ["USAGE"])
 
     def test_frozen_feature_records_are_digested_only_when_present_and_never_recorded(self):
         release = object.__new__(deploy.Release)
@@ -904,6 +1037,12 @@ class PostgresSemantics(unittest.TestCase):
             password = secrets.token_hex(16)
             cls.node(cls.admin, "const s=(await pool.query(\"SELECT format('CREATE ROLE %I LOGIN PASSWORD %L',$1::text,$2::text) AS s\",[" + json.dumps(role) + "," + json.dumps(password) + "])).rows[0].s;await pool.query(s);console.log('{}');")
             cls.urls[name] = urlunsplit(url._replace(netloc=role + ":" + password + "@" + url.hostname + ":" + str(url.port or 5432)))
+        cls.reset_schema()
+
+    @classmethod
+    def reset_schema(cls):
+        """An empty public schema in the throwaway database, owned as before; every proof starts here, whatever ran first."""
+        cls.statement(cls.admin, "DROP SCHEMA public CASCADE; CREATE SCHEMA public")
         cls.statement(cls.admin, "GRANT ALL ON SCHEMA public TO " + cls.roles["migrator"] + "; GRANT USAGE ON SCHEMA public TO " + cls.roles["app"])
 
     @classmethod
@@ -936,12 +1075,22 @@ class PostgresSemantics(unittest.TestCase):
     def statement(cls, url, sql):
         return cls.node(url, "await pool.query(" + json.dumps(sql) + ");console.log('{}');")
 
-    def migrate(self, number):
+    def migrate(self, number, *pending):
+        """Apply the repository's migrations through `number` plus the named pending files (014/015 blobs), as the migrator would."""
         with tempfile.TemporaryDirectory() as directory:
-            for name in ledger_through(number):
-                (Path(directory) / name).write_bytes((MIGRATIONS / name).read_bytes())
+            for name in ledger_through(number) + [PENDING[p] for p in pending]:
+                (Path(directory) / name).write_bytes(migration_file(name).read_bytes())
             program = "import {applyMigrations} from './scripts/migrate.js';\nconsole.log(JSON.stringify({files:await applyMigrations({connectionString:process.env.DATABASE_URL,ssl:'disable',directory:" + json.dumps(directory) + "})}));\n"
             return self.run_node(self.urls["migrator"], program)["files"]
+
+    def pending_or_skip(self, *numbers):
+        missing = [PENDING[n] for n in numbers if not migration_file(PENDING[n])]
+        if missing:
+            self.skipTest("set RELEASE_GUARDS_TEST_MIGRATIONS to a private directory holding the exact reviewed " + ", ".join(missing) + " until they land in migrations/")
+
+    def denied(self, sql):
+        """True when the application role is refused `sql` for lack of privilege (42501), never for any other reason."""
+        return self.node(self.urls["app"], "await pool.query(" + json.dumps(sql) + ");console.log('{}');", allow_error=True) == {"error": "42501"}
 
     def snapshot(self, url):
         record = self.run_node(url, deploy.snapshot_program(), stdin=b"release\n")
@@ -961,21 +1110,114 @@ class PostgresSemantics(unittest.TestCase):
         return release
 
     def landed_feature_schema(self, app):
-        """With 011-013 applied as on master: every contract table exists, is granted for real, fingerprinted and frozen-checked."""
+        """With 011-013 applied as on master (production, 4 November 2026): every landed contract table exists, is granted for
+        real, fingerprinted and frozen-checked, while the pending 014 and 015 groups are reported absent, not required."""
         self.assertEqual(self.migrate("013"), [name for name in ledger_through("013") if name[:3] > "010"])
+        record = self.snapshot(self.urls["migrator"])
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("013")), sorted(JOBS + EVALUATION)))
+        release = self.release_as(app)
+        release.ensure_grants()
+        self.assertEqual(set(release.receipt["grants"]["tables"]), set(deploy.GRANTS))
+        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(JOBS + EVALUATION))
+        self.assertEqual(sum("GRANT " in code for code in release.programs), len(set(deploy.GRANTS) & set(tables_through("013"))) - 2)
+        self.assertEqual(release.receipt["grants"]["sequences"], {})
+        # The frozen-record queries run as the app role against the landed schema, so every column they name must exist.
+        release = self.release_as(app, via=self.urls["app"])
+        before = release.protected_snapshot()
+        self.assertEqual(set(before), {"reviewers", "reviews", "versions", "frozen_projects"} | (set(deploy.FROZEN_QUERIES) - set(EVALUATION)))
+        self.assertEqual(release.receipt["protected_records"], {table: 0 for table in before})
+        deploy.verify_protected_records(before, release.protected_snapshot())
+
+    def test_evaluation_schema_alone_then_with_jobs_against_a_real_database(self):
+        """015 without 014, then both: presence, exact grants, lock-only UPDATE on versions, frozen digests across the 014 migration."""
+        self.pending_or_skip("014", "015")
+        app, migrator = self.roles["app"], self.roles["migrator"]
+        self.reset_schema()
+        self.assertEqual(self.migrate("013", "015"), ledger_through("013") + ["015_evaluation.sql"])
+        self.statement(self.admin, "GRANT SELECT ON reviewer_accounts, reviews, dataset_versions, projects TO " + app)
+        record = self.snapshot(self.urls["migrator"])
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("013") + EVALUATION), sorted(JOBS)))
+        self.assertEqual({table: record["manifest"][table]["count"] for table in EVALUATION}, {table: 0 for table in EVALUATION})
+        # Nothing on the evaluation tables yet, then exactly the contract: no sequence, no DELETE on frozen rows.
+        for table in EVALUATION:
+            state = self.node(self.urls["migrator"], deploy.grant_check_program(app, table))
+            self.assertEqual((state["present"], state["owner"], state["sequences"], state["sequenceRows"]), (True, False, [], {}), table)
+            self.assertEqual(deploy.privilege_gap(state["rows"], deploy.GRANTS[table]), (sorted(deploy.GRANTS[table]), []), table)
+        self.assertEqual(self.node(self.urls["migrator"], deploy.grant_check_program(app, "job_events")), {"present": False})
+        release = self.release_as(app)
+        release.ensure_grants()
+        self.assertEqual({t: v for t, v in release.receipt["grants"]["tables"].items() if t in EVALUATION}, {t: list(deploy.GRANTS[t]) for t in EVALUATION})
+        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(JOBS))
+        self.assertEqual(release.receipt["grants"]["sequences"], {})
+        self.assertEqual(sum("GRANT " in code for code in release.programs), len(set(deploy.GRANTS) & set(tables_through("013") + EVALUATION)))
+        self.assertFalse(any("ON SEQUENCE" in code for code in release.programs))
+        # The store's row lock on a frozen version needs UPDATE; the append-only trigger, not the ACL, refuses a rewrite, and
+        # DELETE is never granted. Insert-only tables refuse UPDATE and DELETE outright; draft rows may be removed.
+        self.assertEqual(self.node(self.urls["app"], "await pool.query('SELECT 1 FROM eval_set_versions FOR UPDATE');console.log('{}');"), {})
+        for sql in ("DELETE FROM eval_set_versions", "UPDATE eval_batches SET label=label", "DELETE FROM eval_batches", "UPDATE eval_predictions SET status=status",
+                    "DELETE FROM eval_predictions", "UPDATE eval_reports SET decision=decision", "DELETE FROM eval_reports", "DELETE FROM eval_comparisons",
+                    "DELETE FROM eval_judgments", "DELETE FROM eval_sets", "TRUNCATE eval_cases"):
+            self.assertTrue(self.denied(sql), sql)
+        self.assertEqual(self.node(self.urls["app"], "await pool.query('DELETE FROM eval_cases');await pool.query('DELETE FROM eval_issue_notes');console.log('{}');"), {})
+        triggers = self.node(self.urls["migrator"], "console.log(JSON.stringify((await pool.query(\"SELECT c.relname AS t FROM pg_trigger g JOIN pg_class c ON c.oid=g.tgrelid JOIN pg_proc p ON p.oid=g.tgfoid WHERE p.proname='eval_append_only' AND g.tgenabled<>'D' ORDER BY 1\")).rows.map(r=>r.t)));")
+        self.assertEqual(triggers, ["eval_batches", "eval_predictions", "eval_reports", "eval_set_versions"])
+        # Frozen digests run as the app role: every column each query names exists in the real 015 schema.
+        release = self.release_as(app, via=self.urls["app"])
+        before = release.protected_snapshot()
+        self.assertLessEqual(set(deploy.FROZEN_QUERIES), set(before))
+        self.assertEqual({table: release.receipt["protected_records"][table] for table in EVALUATION if table in before}, {t: 0 for t in set(EVALUATION) & set(before)})
+        # Now 014 lands on top (a database that applied 015 first): the jobs group, its exact grants and the one USAGE-only sequence.
+        self.assertEqual(self.migrate("013", "015", "014"), ["014_jobs.sql"])
         record = self.snapshot(self.urls["migrator"])
         self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(deploy.KNOWN_TABLES), []))
         release = self.release_as(app)
         release.ensure_grants()
-        self.assertEqual(set(release.receipt["grants"]["tables"]), set(deploy.GRANTS))
         self.assertNotIn("absent", release.receipt["grants"]["tables"].values())
-        self.assertEqual(sum("GRANT " in code for code in release.programs), len(deploy.GRANTS) - 2)
-        # The frozen-record queries run as the app role against the landed schema, so every column they name must exist.
-        release = self.release_as(app, via=self.urls["app"])
-        before = release.protected_snapshot()
-        self.assertLessEqual(set(deploy.FROZEN_QUERIES), set(before))
-        self.assertEqual(release.receipt["protected_records"], {table: 0 for table in before})
-        deploy.verify_protected_records(before, release.protected_snapshot())
+        self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
+        self.assertEqual(sum("GRANT " in code and "ON TABLE" in code for code in release.programs), len(JOBS))
+        self.assertEqual(sum("GRANT USAGE ON SEQUENCE job_events_id_seq TO" in code for code in release.programs), 1)
+        self.assertEqual(self.node(self.urls["app"], "console.log(JSON.stringify({n:(await pool.query(\"SELECT nextval('job_events_id_seq')::int AS n\")).rows[0].n}));"), {"n": 1})
+        for sql in ("SELECT last_value FROM job_events_id_seq", "SELECT setval('job_events_id_seq', 1)", "DELETE FROM job_events", "UPDATE job_events SET seq=seq", "DELETE FROM jobs"):
+            self.assertTrue(self.denied(sql), sql)
+        deploy.verify_protected_records(before, self.release_as(app, via=self.urls["app"]).protected_snapshot())
+
+    def test_jobs_schema_without_evaluation_under_the_production_sequence_default_against_a_real_database(self):
+        """014 without 015 on a database whose default privileges give the app SELECT, USAGE on new sequences (as production does):
+        the release stops on the excess SELECT without granting or revoking; the documented operator correction makes it pass."""
+        self.pending_or_skip("014")
+        app, migrator = self.roles["app"], self.roles["migrator"]
+        self.reset_schema()
+        self.statement(self.urls["migrator"], "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, USAGE ON SEQUENCES TO " + app)
+        try:
+            self.assertEqual(self.migrate("013", "014"), ledger_through("013") + ["014_jobs.sql"])
+            self.statement(self.admin, "GRANT SELECT ON reviewer_accounts, reviews, dataset_versions, projects TO " + app)
+            record = self.snapshot(self.urls["migrator"])
+            self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("014")), sorted(EVALUATION)))
+            state = self.node(self.urls["migrator"], deploy.grant_check_program(app, "job_events"))
+            self.assertEqual(state["sequences"], [{"name": "job_events_id_seq"}])
+            self.assertEqual(deploy.sequence_gap(state["sequenceRows"]["job_events_id_seq"], ("USAGE",)), ([], ["SELECT"]))
+            release = self.release_as(app)
+            with self.assertRaises(deploy.ReleaseError) as failure:
+                release.ensure_grants()
+            self.assertIn("beyond the release contract", str(failure.exception))
+            self.assertFalse(any("ON SEQUENCE" in code or "REVOKE" in code for code in release.programs))
+            self.assertEqual(release.receipt, {})
+            # docs/RELEASE.md prerequisite, run by the operator as the sequence owner: existing ACLs and data stay, only SELECT goes.
+            self.statement(self.urls["migrator"], "REVOKE SELECT ON SEQUENCE job_events_id_seq FROM " + app + "; ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON SEQUENCES FROM " + app)
+            release = self.release_as(app)
+            release.ensure_grants()
+            self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
+            self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(EVALUATION))
+            self.assertFalse(any("ON SEQUENCE" in code for code in release.programs))
+            self.assertEqual(self.node(self.urls["app"], "console.log(JSON.stringify({n:(await pool.query(\"SELECT nextval('job_events_id_seq')::int AS n\")).rows[0].n}));"), {"n": 1})
+            self.assertTrue(self.denied("SELECT last_value FROM job_events_id_seq"))
+            release = self.release_as(app, via=self.urls["app"])
+            before = release.protected_snapshot()
+            self.assertFalse(set(EVALUATION) & set(before))
+            deploy.verify_protected_records(before, release.protected_snapshot())
+        finally:
+            self.statement(self.urls["migrator"], "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM " + app)
+        self.assertEqual(self.node(self.admin, "console.log(JSON.stringify({n:(await pool.query('SELECT count(*)::int AS n FROM pg_default_acl d JOIN pg_roles r ON r.oid=d.defaclrole WHERE r.rolname=$1',[" + json.dumps(migrator) + "])).rows[0].n}));"), {"n": 0})
 
     def role_contract(self, app, migrator):
         admin = urlsplit(self.admin).username
@@ -1103,6 +1345,7 @@ class PostgresSemantics(unittest.TestCase):
 
     def test_ledger_presence_fingerprints_and_privileges_against_a_real_database(self):
         app, migrator = self.roles["app"], self.roles["migrator"]
+        self.reset_schema()
         self.assertEqual(self.migrate("006"), ledger_through("006"))
         self.statement(self.admin, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO " + app)
         record = self.snapshot(self.urls["app"])
