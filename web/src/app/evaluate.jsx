@@ -5,6 +5,7 @@ import { requireWorkspace } from './ui.jsx';
 import { WorkspaceShell } from './shell.jsx';
 import { PLANNED, SYNTHETIC_CASES, SYNTHETIC_PREDICTIONS } from '../../../src/lib/eval-shared.js';
 import { ImportTriage, RunPair } from './triage.jsx';
+import { CaseForm, caseEditForScope } from './eval-case-form.jsx';
 
 const TABS = [['cases', 'Cases'], ['quality', 'Quality'], ['comparisons', 'Comparisons']];
 const PURPOSES = [['development', 'Development'], ['final_assessment', 'Final assessment']];
@@ -174,9 +175,10 @@ export function EvalHome() {
   );
 }
 
-function Tabs({ tab, onTab, openIssues }) {
+function Tabs({ tab, onTab, openIssues, disabled = false }) {
   const refs = useRef([]);
   function move(event) {
+    if (disabled) return;
     const index = TABS.findIndex(([id]) => id === tab);
     if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
     event.preventDefault();
@@ -187,7 +189,7 @@ function Tabs({ tab, onTab, openIssues }) {
   return (
     <div className="eval-tabs" role="tablist" aria-label="Evaluation sections" onKeyDown={move}>
       {TABS.map(([id, label], index) => (
-        <button key={id} type="button" role="tab" id={`eval-tab-${id}`} aria-selected={tab === id} aria-controls={`eval-panel-${id}`} tabIndex={tab === id ? 0 : -1} ref={(node) => { refs.current[index] = node; }} onClick={() => onTab(id)}>
+        <button key={id} type="button" role="tab" id={`eval-tab-${id}`} aria-selected={tab === id} aria-controls={`eval-panel-${id}`} tabIndex={tab === id ? 0 : -1} disabled={disabled} ref={(node) => { refs.current[index] = node; }} onClick={() => onTab(id)}>
           {label}{id === 'quality' && openIssues > 0 ? ` (${openIssues} open)` : ''}
         </button>
       ))}
@@ -206,6 +208,7 @@ export function EvalSet() {
   const [error, setError] = useState(null);
   const [jsonl, setJsonl] = useState('');
   const [predictions, setPredictions] = useState('');
+  const [editing, setEditing] = useState(null);
   const openIssues = issues.filter((issue) => issue.open).length;
   const draft = set.status === 'draft';
   const base = `/w/${entry.slug}/projects/${project.id}/evaluate/${set.id}`;
@@ -213,6 +216,10 @@ export function EvalSet() {
   // A rule edit must wait while a save is pending or the loader is refreshing: the rule form is keyed by set.revision,
   // so a newer revision remounts it and would discard anything typed in between.
   const busy = pending || revalidator.state !== 'idle';
+  const activeEditing = caseEditForScope(editing, { workspaceId: entry.id, projectId: project.id, setId: set.id, canWrite, draft });
+  // Reset an invalid selection during render: no old row reaches a new route's first paint or revives on return.
+  if (editing && !activeEditing) setEditing(null);
+  const otherActionBusy = busy || Boolean(activeEditing);
 
   async function act(fn, pendingLabel, doneLabel) {
     setPending(true); setError(null); setStatus(pendingLabel);
@@ -224,6 +231,16 @@ export function EvalSet() {
     return res.data;
   }
   const setTab = (id) => setParams({ tab: id });
+  function editCase(row) {
+    if (!canWrite || !draft || otherActionBusy) return;
+    setEditing({ workspaceId: entry.id, projectId: project.id, setId: set.id, row, revision: set.revision });
+    setTab('cases');
+  }
+  function fixIssue(issue) {
+    const row = issue.caseKeys.length === 1 ? cases.find((item) => item.caseKey === issue.caseKeys[0]) : null;
+    if (row && canWrite && draft) editCase(row);
+    else setTab('cases');
+  }
 
   return (
     <WorkspaceShell account={account} entry={entry} role={entry.role} title={set.name} project={project} current="evaluate">
@@ -234,7 +251,7 @@ export function EvalSet() {
       </div>
       <Banner status={status} error={error} onRetry={() => revalidator.revalidate()} />
       {!canWrite && <p className="ob-alert ob-alert--info">You can view this set. Your role cannot change it.</p>}
-      <Tabs tab={tab} onTab={setTab} openIssues={openIssues} />
+      <Tabs tab={tab} onTab={setTab} openIssues={openIssues} disabled={otherActionBusy} />
 
       {tab === 'cases' && (
         <div role="tabpanel" id="eval-panel-cases" aria-labelledby="eval-tab-cases" className="eval-stack">
@@ -248,27 +265,30 @@ export function EvalSet() {
                   <span>{row.input}</span>
                   <span className="ob-muted">Expected: {row.expectedAnswer ?? 'none'} · Criteria: {row.reviewCriteria ?? 'none'}</span>
                 </div>
-                {canWrite && draft && <button type="button" className="btn-text" disabled={pending} onClick={() => act(() => api.deleteEvalCase(entry.id, project.id, set.id, row.id, set.revision), 'Removing the case…', 'Case removed.')}>Delete</button>}
+                {canWrite && draft && <div className="ob-row-actions">
+                  <button type="button" className="btn-text" disabled={otherActionBusy} onClick={() => editCase(row)} aria-label={`Edit case ${row.caseKey}`}>Edit</button>
+                  <button type="button" className="btn-text" disabled={otherActionBusy} onClick={() => act(() => api.deleteEvalCase(entry.id, project.id, set.id, row.id, set.revision), 'Removing the case…', 'Case removed.')}>Delete</button>
+                </div>}
               </li>
             ))}
           </ul>
-          {canWrite && draft && <CaseForm entry={entry} project={project} set={set} sources={testingSources} pending={pending} act={act} />}
+          {canWrite && draft && <CaseForm key={`${set.id}:${activeEditing?.row.id ?? 'new'}`} entry={entry} project={project} set={set} sources={testingSources} row={activeEditing?.row} expectedRevision={activeEditing?.revision ?? set.revision} pending={busy} act={act} onDone={() => setEditing(null)} />}
           {canWrite && draft && (
             <form className="ob-card" onSubmit={(event) => { event.preventDefault(); act(() => api.importEvalCases(entry.id, project.id, set.id, set.revision, jsonl), 'Checking the import…', 'Import saved.'); }}>
               <h2>Import JSONL</h2>
               <label htmlFor="case-jsonl">Cases, one JSON object per line</label>
-              <textarea id="case-jsonl" value={jsonl} onChange={(e) => setJsonl(e.target.value)} rows={6} spellCheck="false" />
+              <textarea id="case-jsonl" value={jsonl} disabled={otherActionBusy} onChange={(e) => setJsonl(e.target.value)} rows={6} spellCheck="false" />
               <details>
                 <summary>Synthetic example (not evidence of a real model)</summary>
                 <pre className="eval-pre">{SYNTHETIC_CASES}</pre>
                 <p className="ob-muted">The source ids are placeholders. Replace them with a frozen version that allows testing, or the quality check will reject the sources. Nothing in this example was produced by a customer model.</p>
               </details>
-              <button className="btn-app" type="submit" disabled={pending || !jsonl.trim()}>{pending ? 'Saving…' : 'Import cases'}</button>
+              <button className="btn-app" type="submit" disabled={otherActionBusy || !jsonl.trim()}>{pending ? 'Saving…' : 'Import cases'}</button>
             </form>
           )}
-          <Acceptance key={set.revision} rule={set.acceptance} locked={!canWrite || !draft} pending={pending} busy={busy} onSave={(acceptance) => act(() => api.updateEvaluation(entry.id, project.id, set.id, { expectedRevision: set.revision, acceptance }), 'Saving the rule…', 'Rule saved.')} />
+          <Acceptance key={set.revision} rule={set.acceptance} locked={!canWrite || !draft || Boolean(activeEditing)} pending={pending} busy={busy} onSave={(acceptance) => act(() => api.updateEvaluation(entry.id, project.id, set.id, { expectedRevision: set.revision, acceptance }), 'Saving the rule…', 'Rule saved.')} />
           <div className="ob-row-actions">
-            {canApprove && draft && <button type="button" className="btn-app" disabled={pending} onClick={() => act(() => api.freezeEvaluation(entry.id, project.id, set.id, set.revision), 'Freezing this revision…', 'Set frozen.')}>Freeze this revision</button>}
+            {canApprove && draft && <button type="button" className="btn-app" disabled={otherActionBusy} onClick={() => act(() => api.freezeEvaluation(entry.id, project.id, set.id, set.revision), 'Freezing this revision…', 'Set frozen.')}>Freeze this revision</button>}
             {canWrite && !draft && <button type="button" className="btn-ghost" disabled={pending} onClick={() => act(() => api.reopenEvaluation(entry.id, project.id, set.id), 'Starting a new draft…', 'New draft started. The frozen version was not changed.')}>Start a new draft</button>}
             {!canApprove && draft && <p className="ob-muted">An owner or admin freezes the set. Freezing copies this revision; it does not change older versions.</p>}
           </div>
@@ -287,7 +307,7 @@ export function EvalSet() {
                   <span>{issue.detail}</span>
                   <span className="ob-muted">{issue.open ? 'Open' : 'Acknowledged'} · {issue.caseKeys.join(', ')}</span>
                   {issue.note && <span className="ob-muted">Note: {issue.note}</span>}
-                  <button type="button" className="btn-text" onClick={() => setTab('cases')}>{issue.fix.label}</button>
+                  <button type="button" className="btn-text" disabled={otherActionBusy} onClick={() => fixIssue(issue)}>{issue.fix.label}</button>
                 </div>
                 {canWrite && draft && issue.acknowledgeable && issue.open && <Ack entry={entry} project={project} set={set} issue={issue} act={act} pending={pending} />}
               </li>
@@ -328,69 +348,6 @@ export function EvalSet() {
         </div>
       )}
     </WorkspaceShell>
-  );
-}
-
-function CaseForm({ entry, project, set, sources, pending, act }) {
-  const [caseKey, setCaseKey] = useState('');
-  const [input, setInput] = useState('');
-  const [expectedAnswer, setExpectedAnswer] = useState('');
-  const [reviewCriteria, setReviewCriteria] = useState('');
-  const [category, setCategory] = useState('');
-  const [severity, setSeverity] = useState('');
-  const [versionId, setVersionId] = useState(sources[0]?.versionId ?? '');
-  const source = sources.find((item) => item.versionId === versionId);
-  const [fileId, setFileId] = useState('');
-  // Every control is disabled while the save is pending: a success clears the submitted fields, so text typed during
-  // the wait would otherwise be lost. A refusal re-enables the form with its content intact.
-  async function submit(event) {
-    event.preventDefault();
-    const saved = await act(() => api.saveEvalCase(entry.id, project.id, set.id, {
-      expectedRevision: set.revision,
-      case: {
-        id: caseKey, input, expectedAnswer, reviewCriteria, category, severity: severity || null,
-        sources: source ? [{ projectId: source.projectId, versionId: source.versionId, fileId: fileId || null }] : [],
-      },
-    }), 'Saving the case…', 'Case saved.');
-    if (saved) { setCaseKey(''); setInput(''); setExpectedAnswer(''); setReviewCriteria(''); }
-  }
-  return (
-    <form className="ob-card" onSubmit={submit} aria-busy={pending}>
-      <h2>Add a case</h2>
-      {sources.length === 0 && <p className="ob-alert">No frozen dataset version in this workspace allows testing. You can save a case, and the quality check will keep it blocked until you cite one.</p>}
-      <div className="eval-grid">
-        <div className="ob-field"><label htmlFor="case-id">Case id</label><input id="case-id" value={caseKey} required disabled={pending} onChange={(e) => setCaseKey(e.target.value)} /></div>
-        <div className="ob-field"><label htmlFor="case-category">Category</label><input id="case-category" value={category} disabled={pending} onChange={(e) => setCategory(e.target.value)} /></div>
-      </div>
-      <div className="ob-field"><label htmlFor="case-input">Question</label><textarea id="case-input" value={input} required rows={3} disabled={pending} onChange={(e) => setInput(e.target.value)} /></div>
-      <div className="ob-field"><label htmlFor="case-expected">Expected answer</label><textarea id="case-expected" value={expectedAnswer} rows={2} disabled={pending} onChange={(e) => setExpectedAnswer(e.target.value)} /></div>
-      <div className="ob-field"><label htmlFor="case-criteria">Review criteria</label><textarea id="case-criteria" value={reviewCriteria} rows={2} disabled={pending} onChange={(e) => setReviewCriteria(e.target.value)} /></div>
-      <div className="eval-grid">
-        <div className="ob-field">
-          <label htmlFor="case-severity">Severity</label>
-          <select id="case-severity" value={severity} disabled={pending} onChange={(e) => setSeverity(e.target.value)}>
-            <option value="">Not set</option><option value="critical">Critical</option><option value="major">Major</option><option value="minor">Minor</option>
-          </select>
-        </div>
-        <div className="ob-field">
-          <label htmlFor="case-source">Frozen source</label>
-          <select id="case-source" value={versionId} disabled={pending} onChange={(e) => { setVersionId(e.target.value); setFileId(''); }}>
-            <option value="">None</option>
-            {sources.map((item) => <option key={item.versionId} value={item.versionId}>{item.projectName} version {item.number}</option>)}
-          </select>
-        </div>
-      </div>
-      {source?.files?.length > 0 && (
-        <div className="ob-field">
-          <label htmlFor="case-file">File in that version</label>
-          <select id="case-file" value={fileId} disabled={pending} onChange={(e) => setFileId(e.target.value)}>
-            <option value="">Whole version</option>
-            {source.files.map((file) => <option key={file.id} value={file.id}>{file.filename}</option>)}
-          </select>
-        </div>
-      )}
-      <button className="btn-app" type="submit" disabled={pending}>{pending ? 'Saving…' : 'Save case'}</button>
-    </form>
   );
 }
 
