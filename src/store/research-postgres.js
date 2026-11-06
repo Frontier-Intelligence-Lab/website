@@ -1,9 +1,9 @@
 import { StoreError } from './errors.js';
-import { planImport, qualityReport } from '../lib/research.js';
+import { planImport, qualityReport, researchProjectPatch } from '../lib/research.js';
 
 const iso = (value) => value == null ? null : new Date(value).toISOString();
 const projectRow = (r) => r ? { id: r.id, workspaceId: r.workspace_id, createdBy: r.created_by, template: r.template, name: r.name, brief: r.brief, question: r.question, checklist: r.checklist, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at) } : null;
-const sourceRow = (r) => r ? { id: r.id, workspaceId: r.workspace_id, url: r.url, publisher: r.publisher, title: r.title, publishedAt: iso(r.published_at), retrievedAt: iso(r.retrieved_at), status: r.status, failure: r.failure, contentSha256: r.content_sha256, excerpt: r.excerpt, httpStatus: r.http_status, createdAt: iso(r.created_at) } : null;
+const sourceRow = (r) => r ? { id: r.id, workspaceId: r.workspace_id, url: r.url, versionKey: r.version_key, publisher: r.publisher, title: r.title, publishedAt: iso(r.published_at), retrievedAt: iso(r.retrieved_at), status: r.status, failure: r.failure, contentSha256: r.content_sha256, excerpt: r.excerpt, httpStatus: r.http_status, createdAt: iso(r.created_at) } : null;
 const entityRow = (r) => r ? { id: r.id, workspaceId: r.workspace_id, kind: r.kind, name: r.name, externalKey: r.external_key, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at) } : null;
 const claimRow = (r) => r ? { id: r.id, workspaceId: r.workspace_id, entityId: r.entity_id, field: r.field, value: r.value_text, status: r.status, sourceId: r.source_id, excerpt: r.excerpt, extractionMethod: r.extraction_method, observedAt: iso(r.observed_at), retrievedAt: iso(r.retrieved_at), contentFingerprint: r.content_fingerprint, createdAt: iso(r.created_at) } : null;
 const runRow = (r) => r ? { id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, createdBy: r.created_by, question: r.question, scope: r.scope, limits: r.limits, permissions: r.permissions, status: r.status, output: r.output, error: r.error, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at), finishedAt: iso(r.finished_at) } : null;
@@ -46,8 +46,13 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
       if (!isId(projectId)) throw new StoreError('not_found');
       return transaction(async (client) => {
         await requireWorkspace(client, workspaceId);
+        const current = projectRow((await query('SELECT * FROM research_projects WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [projectId, workspaceId], client)).rows[0]);
+        if (!current) throw new StoreError('not_found');
+        const changes = researchProjectPatch(current, patch);
+        if (!changes) throw new StoreError('invalid_state', 'Change only editable project fields and known checklist booleans.');
+        const next = { ...current, ...changes };
         const row = projectRow((await query(`UPDATE research_projects SET name = $3, brief = $4, question = $5, checklist = $6::jsonb, updated_at = clock_timestamp()
-          WHERE id = $1 AND workspace_id = $2 RETURNING *`, [projectId, workspaceId, patch.name, patch.brief, patch.question, JSON.stringify(patch.checklist)], client)).rows[0]);
+          WHERE id = $1 AND workspace_id = $2 RETURNING *`, [projectId, workspaceId, next.name, next.brief, next.question, JSON.stringify(next.checklist)], client)).rows[0]);
         if (!row) throw new StoreError('not_found');
         return row;
       });
@@ -60,23 +65,18 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
         if (!project) throw new StoreError('not_found');
         const sourceRows = (await query('SELECT * FROM research_sources WHERE workspace_id = $1', [workspaceId], client)).rows.map(sourceRow);
         const entityRows = (await query('SELECT * FROM research_entities WHERE workspace_id = $1', [workspaceId], client)).rows.map(entityRow);
-        const claimRows = (await query(`SELECT c.*, e.external_key, s.url AS source_url FROM research_claims c
+        const claimRows = (await query(`SELECT c.*, e.external_key, s.url AS source_url, s.version_key AS source_version_key FROM research_claims c
           JOIN research_entities e ON e.id = c.entity_id LEFT JOIN research_sources s ON s.id = c.source_id
-          WHERE c.workspace_id = $1`, [workspaceId], client)).rows.map((r) => ({ ...claimRow(r), entityKey: r.external_key, sourceUrl: r.source_url }));
+          WHERE c.workspace_id = $1`, [workspaceId], client)).rows.map((r) => ({ ...claimRow(r), entityKey: r.external_key, sourceUrl: r.source_url, sourceVersionKey: r.source_version_key }));
         const plan = planImport({ sources: sourceRows, entities: entityRows, claims: claimRows }, records);
         if (dryRun) return plan.summary;
-        const sourceByUrl = new Map(sourceRows.map((row) => [row.url, row]));
+        const sourceKey = (url, versionKey) => JSON.stringify([url, versionKey]);
+        const sourceByVersion = new Map(sourceRows.map((row) => [sourceKey(row.url, row.versionKey), row]));
         for (const source of plan.ops.sources) {
-          const inserted = sourceRow((await query(`INSERT INTO research_sources (workspace_id, url, publisher, title, retrieved_at, status, failure, content_sha256, excerpt)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (workspace_id, url) DO UPDATE SET url = EXCLUDED.url RETURNING *`,
-          [workspaceId, source.url, source.publisher, source.title, source.retrievedAt, source.status, source.failure, source.sha256, source.excerpt], client)).rows[0]);
-          sourceByUrl.set(inserted.url, inserted);
-        }
-        for (const update of plan.ops.sourceUpdates) {
-          const updated = sourceRow((await query(`UPDATE research_sources SET status = 'retrieved', excerpt = $3, content_sha256 = $4, retrieved_at = $5, failure = NULL, publisher = $6, title = $7
-            WHERE workspace_id = $1 AND url = $2 AND status <> 'retrieved' RETURNING *`,
-          [workspaceId, update.url, update.excerpt, update.sha256, update.retrievedAt, update.publisher, update.title], client)).rows[0]);
-          if (updated) sourceByUrl.set(updated.url, updated);
+          const inserted = sourceRow((await query(`INSERT INTO research_sources (workspace_id, url, version_key, publisher, title, retrieved_at, status, failure, content_sha256, excerpt)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+          [workspaceId, source.url, source.versionKey, source.publisher, source.title, source.retrievedAt, source.status, source.failure, source.sha256, source.excerpt], client)).rows[0]);
+          sourceByVersion.set(sourceKey(inserted.url, inserted.versionKey), inserted);
         }
         const entityByKey = new Map(entityRows.map((row) => [row.externalKey, row]));
         for (const entity of plan.ops.entities) {
@@ -87,7 +87,7 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
         }
         for (const claim of plan.ops.claims) {
           const entity = entityByKey.get(claim.entityKey);
-          const source = sourceByUrl.get(claim.sourceUrl);
+          const source = sourceByVersion.get(sourceKey(claim.sourceUrl, claim.sourceVersionKey));
           await query(`INSERT INTO research_claims (workspace_id, entity_id, field, value_text, status, source_id, excerpt, extraction_method, observed_at, retrieved_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp())
             ON CONFLICT (entity_id, field, value_text, source_id) WHERE source_id IS NOT NULL DO NOTHING`,
@@ -115,21 +115,28 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
         return plan.summary;
       });
     },
-    async listResearchDirectory({ workspaceId, projectId, directory, q = '', sort = 'name', page = 1, pageSize = 20 }) {
+    async listResearchDirectory({ workspaceId, projectId, directory, listId, q = '', sort = 'name', page = 1, pageSize = 20 }) {
       if (!isId(workspaceId) || !isId(projectId)) return null;
       const project = (await query('SELECT id FROM research_projects WHERE id = $1 AND workspace_id = $2', [projectId, workspaceId])).rows[0];
       if (!project) return null;
-      const order = sort === 'updated' ? 'e.updated_at DESC' : 'e.name ASC';
+      if (listId != null) {
+        if (!isId(listId)) return null;
+        const list = (await query('SELECT id FROM research_lists WHERE id = $1 AND workspace_id = $2 AND project_id = $3', [listId, workspaceId, projectId])).rows[0];
+        if (!list) return null;
+      }
+      const filter = listId != null ? 'EXISTS (SELECT 1 FROM research_list_items li WHERE li.entity_id = e.id AND li.list_id = $2)' : 'm.directory = $2';
+      const selection = listId ?? directory;
+      const order = sort === 'updated' ? 'e.updated_at DESC, e.id ASC' : 'e.name ASC, e.id ASC';
       const offset = (page - 1) * pageSize;
       const needle = q.trim().toLowerCase().replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
-      const total = Number((await query(`SELECT count(*)::int AS n FROM research_memberships m JOIN research_entities e ON e.id = m.entity_id
-        WHERE m.project_id = $1 AND m.directory = $2 AND e.workspace_id = $3 AND ($4 = '' OR lower(e.name) LIKE '%' || $4 || '%' ESCAPE '\\')`,
-      [projectId, directory, workspaceId, needle])).rows[0].n);
-      const rows = (await query(`SELECT e.*, (SELECT count(*)::int FROM research_claims c WHERE c.entity_id = e.id) AS claim_count,
+      const total = Number((await query(`SELECT count(DISTINCT e.id)::int AS n FROM research_memberships m JOIN research_entities e ON e.id = m.entity_id
+        WHERE m.project_id = $1 AND ${filter} AND e.workspace_id = $3 AND ($4 = '' OR lower(e.name) LIKE '%' || $4 || '%' ESCAPE '\\')`,
+      [projectId, selection, workspaceId, needle])).rows[0].n);
+      const rows = (await query(`SELECT DISTINCT e.*, (SELECT count(*)::int FROM research_claims c WHERE c.entity_id = e.id) AS claim_count,
           (SELECT count(*)::int FROM research_claims c WHERE c.entity_id = e.id AND c.status = 'conflicting') AS conflicting
         FROM research_memberships m JOIN research_entities e ON e.id = m.entity_id
-        WHERE m.project_id = $1 AND m.directory = $2 AND e.workspace_id = $3 AND ($4 = '' OR lower(e.name) LIKE '%' || $4 || '%' ESCAPE '\\')
-        ORDER BY ${order} LIMIT $5 OFFSET $6`, [projectId, directory, workspaceId, needle, pageSize, offset])).rows
+        WHERE m.project_id = $1 AND ${filter} AND e.workspace_id = $3 AND ($4 = '' OR lower(e.name) LIKE '%' || $4 || '%' ESCAPE '\\')
+        ORDER BY ${order} LIMIT $5 OFFSET $6`, [projectId, selection, workspaceId, needle, pageSize, offset])).rows
         .map((r) => ({ entity: entityRow(r), claimCount: r.claim_count, conflicting: r.conflicting }));
       return { total, page, pageSize, rows };
     },
@@ -137,11 +144,11 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
       if (!isId(workspaceId) || !isId(entityId)) return null;
       const entity = entityRow((await query('SELECT * FROM research_entities WHERE id = $1 AND workspace_id = $2', [entityId, workspaceId])).rows[0]);
       if (!entity) return null;
-      const claimRows = (await query(`SELECT c.*, s.url AS source_url, s.status AS source_status, s.publisher, s.title AS source_title, s.excerpt AS source_excerpt, s.retrieved_at AS source_retrieved_at
+      const claimRows = (await query(`SELECT c.*, s.url AS source_url, s.version_key AS source_version_key, s.content_sha256 AS source_content_sha256, s.status AS source_status, s.publisher, s.title AS source_title, s.excerpt AS source_excerpt, s.retrieved_at AS source_retrieved_at
         FROM research_claims c LEFT JOIN research_sources s ON s.id = c.source_id WHERE c.entity_id = $1 AND c.workspace_id = $2 ORDER BY c.created_at`, [entityId, workspaceId])).rows;
       return {
         entity,
-        claims: claimRows.map((r) => ({ ...claimRow(r), source: r.source_id ? { id: r.source_id, url: r.source_url, status: r.source_status, publisher: r.publisher, title: r.source_title, excerpt: r.source_excerpt, retrievedAt: iso(r.source_retrieved_at) } : null })),
+        claims: claimRows.map((r) => ({ ...claimRow(r), source: r.source_id ? { id: r.source_id, url: r.source_url, versionKey: r.source_version_key, contentSha256: r.source_content_sha256, status: r.source_status, publisher: r.publisher, title: r.source_title, excerpt: r.source_excerpt, retrievedAt: iso(r.source_retrieved_at) } : null })),
         relationships: (await query('SELECT * FROM research_relationships WHERE workspace_id = $1 AND (from_entity_id = $2 OR to_entity_id = $2)', [workspaceId, entityId])).rows.map((r) => ({ id: r.id, workspaceId: r.workspace_id, fromEntityId: r.from_entity_id, toEntityId: r.to_entity_id, kind: r.kind, startedOn: r.started_on, endedOn: r.ended_on, claimId: r.claim_id, note: r.note, createdAt: iso(r.created_at) })),
         directories: (await query('SELECT * FROM research_memberships WHERE entity_id = $1', [entityId])).rows.map((r) => ({ projectId: r.project_id, entityId: r.entity_id, directory: r.directory, createdAt: iso(r.created_at) })),
         duplicates: (await query('SELECT * FROM research_duplicate_candidates WHERE workspace_id = $1 AND (left_entity_id = $2 OR right_entity_id = $2)', [workspaceId, entityId])).rows.map((r) => ({ id: r.id, workspaceId: r.workspace_id, leftEntityId: r.left_entity_id, rightEntityId: r.right_entity_id, reason: r.reason, status: r.status, createdAt: iso(r.created_at) })),
@@ -200,7 +207,7 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
       if (!isId(workspaceId) || !isId(projectId)) return null;
       const project = projectRow((await query('SELECT * FROM research_projects WHERE id = $1 AND workspace_id = $2', [projectId, workspaceId])).rows[0]);
       if (!project) return null;
-      const entities = (await query(`SELECT e.* FROM research_entities e JOIN research_memberships m ON m.entity_id = e.id WHERE m.project_id = $1 AND e.workspace_id = $2`, [projectId, workspaceId])).rows.map(entityRow);
+      const entities = (await query(`SELECT DISTINCT e.* FROM research_entities e JOIN research_memberships m ON m.entity_id = e.id WHERE m.project_id = $1 AND e.workspace_id = $2`, [projectId, workspaceId])).rows.map(entityRow);
       const ids = entities.map((row) => row.id);
       const claims = ids.length ? (await query('SELECT * FROM research_claims WHERE workspace_id = $1 AND entity_id = ANY($2::uuid[])', [workspaceId, ids])).rows.map(claimRow) : [];
       const sources = (await query('SELECT * FROM research_sources WHERE workspace_id = $1', [workspaceId])).rows.map(sourceRow);
@@ -259,13 +266,15 @@ export function researchPostgresMethods({ query, transaction, isId, addAudit }) 
     },
     async finishResearchRun({ workspaceId, runId, status, output, error }) {
       if (!isId(runId)) throw new StoreError('not_found');
-      if (status === 'completed' && (output == null || !Array.isArray(output.citations))) throw new StoreError('invalid_state', 'A completed run needs a stored report.');
-      if (status === 'failed' && output != null) throw new StoreError('invalid_state', 'A failed run cannot store a successful report.');
       return transaction(async (client) => {
         const current = (await query('SELECT status FROM research_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [runId, workspaceId], client)).rows[0];
         if (!current) throw new StoreError('not_found');
         if (current.status === 'cancelled') return runRow((await query('SELECT * FROM research_runs WHERE id = $1', [runId], client)).rows[0]);
         if (current.status !== 'running' && current.status !== 'proposed') throw new StoreError('invalid_state', 'This run has already finished.');
+        if (status === 'completed' && current.status !== 'running') throw new StoreError('invalid_state', 'Only a running run can complete.');
+        if (status === 'completed' && (!output || typeof output !== 'object' || Array.isArray(output) || !Array.isArray(output.citations))) throw new StoreError('invalid_state', 'A completed run needs a stored report object with citations.');
+        if (status === 'failed' && output != null) throw new StoreError('invalid_state', 'A failed run cannot store a successful report.');
+        if (!['completed', 'failed', 'cancelled'].includes(status)) throw new StoreError('invalid_state', 'Finish with a terminal run status.');
         const row = runRow((await query(`UPDATE research_runs SET status = $3, output = $4::jsonb, error = $5, finished_at = clock_timestamp(), updated_at = clock_timestamp()
           WHERE id = $1 AND workspace_id = $2 RETURNING *`, [runId, workspaceId, status, status === 'completed' ? JSON.stringify(output) : null, error ? String(error).slice(0, 500) : null], client)).rows[0]);
         await query(`INSERT INTO research_run_events (run_id, kind, message) VALUES ($1, $2, $3)`, [runId, status === 'completed' ? 'output' : 'failure', row.error || 'Report stored.'], client);

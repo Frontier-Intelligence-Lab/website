@@ -69,6 +69,45 @@ export function checklistPatch(value) {
   return next;
 }
 
+/** Apply only editable fields to the latest locked project, not a caller's stale full row. */
+export function researchProjectPatch(current, patch) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !Object.keys(patch).length) return null;
+  if (Object.keys(patch).some((key) => !['name', 'brief', 'question', 'checklist'].includes(key))) return null;
+  const next = {};
+  for (const [key, max] of [['name', 160], ['brief', 8000], ['question', 2000]]) {
+    if (!Object.hasOwn(patch, key)) continue;
+    if (typeof patch[key] !== 'string' || patch[key].length > max || (key !== 'brief' && !patch[key].trim())) return null;
+    next[key] = patch[key];
+  }
+  if (Object.hasOwn(patch, 'checklist')) {
+    const value = patch.checklist;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (Object.entries(value).some(([key, checked]) => !CHECKLIST_KEYS.includes(key) || typeof checked !== 'boolean')) return null;
+    next.checklist = { ...current.checklist, ...value };
+  }
+  return next;
+}
+
+const timestamp = (value) => value == null ? null : new Date(value).toISOString();
+function validTimestamp(value) {
+  if (value == null) return true;
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))?$/.exec(value);
+  if (!match || Number(match[1]) < 1 || !Number.isFinite(Date.parse(value))) return false;
+  if (match[4] && (Number(match[4]) > 23 || Number(match[5]) > 59 || Number(match[6]) > 59)) return false;
+  return new Date(`${match[1]}-${match[2]}-${match[3]}T00:00:00Z`).toISOString().slice(0, 10) === `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+/** A URL can have many immutable retrieval snapshots; repeated identical imports are idempotent. */
+function sourceSnapshot(value) {
+  const snapshot = {
+    url: value.url, publisher: clip(value.publisher, 300), title: clip(value.title, 500), status: value.status,
+    excerpt: clip(value.excerpt, 8000), sha256: value.sha256 ?? null,
+    failure: value.failure ? clip(value.failure, 500) : null, retrievedAt: timestamp(value.retrievedAt),
+  };
+  return { ...snapshot, versionKey: sha256Text(JSON.stringify(snapshot)) };
+}
+
 const httpsUrl = (value) => {
   if (typeof value !== 'string' || value.length > 2000) return false;
   try {
@@ -86,10 +125,13 @@ export function validateRecord(record) {
   if (record.directory === 'prospects' && record.curated !== true) return 'Prospects are added by a person. A catalog import cannot fill that directory.';
   const source = record.source;
   if (!source || typeof source !== 'object') return 'Each record needs a source.';
+  if (typeof source.url !== 'string' || source.url.length > 2000) return 'A source URL must be within 2000 characters.';
   const catalog = typeof source.url === 'string' && source.url.startsWith('catalog://');
   if (!catalog && !httpsUrl(source.url)) return 'A source URL must be https, or a catalog:// reference to an existing collection.';
   if (!['retrieved', 'failed', 'inaccessible', 'catalog'].includes(source.status)) return 'Source status is not recognized.';
+  if (source.sha256 != null && (typeof source.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(source.sha256))) return 'A source hash must be a SHA-256.';
   if (source.status === 'retrieved' && !/^[0-9a-f]{64}$/.test(source.sha256 ?? '')) return 'A retrieved source needs a SHA-256 of the text that was kept.';
+  if (!validTimestamp(source.retrievedAt)) return 'A source retrieval date must be an ISO date or timestamp.';
   if (!Array.isArray(record.claims) || record.claims.length < 1 || record.claims.length > 40) return 'Each record needs between 1 and 40 claims.';
   for (const claim of record.claims) {
     if (!claim || typeof claim.field !== 'string' || !/^[a-z0-9_]{1,80}$/.test(claim.field)) return 'A claim field must be a short lowercase name.';
@@ -98,6 +140,7 @@ export function validateRecord(record) {
     if (typeof claim.method !== 'string' || !claim.method.trim() || claim.method.length > 80) return 'Each claim needs an extraction method.';
     if (['extracted', 'supported', 'corroborated', 'reviewed'].includes(claim.status) && (typeof claim.excerpt !== 'string' || !claim.excerpt.trim())) return 'A claim that is more than unknown needs an excerpt from its source.';
     if (claim.excerpt && claim.excerpt.length > TEXT_LIMIT) return 'An excerpt must be 2000 characters or fewer.';
+    if (!validTimestamp(claim.observedAt)) return 'A claim observation date must be an ISO date or timestamp.';
   }
   if (record.relationships && !Array.isArray(record.relationships)) return 'Relationships must be a list.';
   return null;
@@ -137,27 +180,16 @@ export function planImport(graph, records) {
   const entities = graph.entities.map((row) => ({ ...row }));
   const claims = graph.claims.map((row) => ({ ...row }));
   const summary = { importedEntities: 0, importedClaims: 0, skippedEntities: 0, skippedClaims: 0, failed: 0, duplicates: 0, conflicts: 0, errors: [] };
-  const ops = { sources: [], sourceUpdates: [], entities: [], claims: [], memberships: [], relationships: [], conflictClaimIds: [], duplicates: [] };
+  const ops = { sources: [], entities: [], claims: [], memberships: [], relationships: [], conflictClaimIds: [], duplicates: [] };
   for (const record of records) {
     const error = validateRecord(record);
     if (error) { summary.failed += 1; summary.errors.push(error); continue; }
-    let source = sources.find((row) => row.url === record.source.url);
+    const snapshot = sourceSnapshot(record.source);
+    let source = sources.find((row) => row.url === snapshot.url && row.versionKey === snapshot.versionKey);
     if (!source) {
-      source = { id: null, url: record.source.url, publisher: clip(record.source.publisher, 300), title: clip(record.source.title, 500), status: record.source.status, excerpt: clip(record.source.excerpt, 8000), sha256: record.source.sha256 ?? null, failure: record.source.failure ? clip(record.source.failure, 500) : null, retrievedAt: record.source.retrievedAt ?? null };
+      source = { id: null, ...snapshot };
       sources.push(source);
       ops.sources.push(source);
-    } else if (source.status !== 'retrieved' && record.source.status === 'retrieved') {
-      const next = {
-        url: source.url, status: 'retrieved',
-        excerpt: clip(record.source.excerpt, 8000) || source.excerpt || '',
-        sha256: record.source.sha256 ?? source.sha256 ?? source.contentSha256 ?? null,
-        retrievedAt: record.source.retrievedAt ?? source.retrievedAt ?? null,
-        failure: null,
-        publisher: clip(record.source.publisher, 300) || source.publisher,
-        title: clip(record.source.title, 500) || source.title,
-      };
-      Object.assign(source, next, { contentSha256: next.sha256 });
-      ops.sourceUpdates.push(next);
     }
     let entity = entities.find((row) => row.externalKey === record.externalKey);
     if (!entity) {
@@ -179,10 +211,10 @@ export function planImport(graph, records) {
     for (const claim of record.claims) {
       const value = claim.value.trim();
       const prior = claims.filter((row) => row.entityKey === entity.externalKey && row.field === claim.field);
-      if (prior.some((row) => row.value === value && row.sourceUrl === source.url)) { summary.skippedClaims += 1; continue; }
+      if (prior.some((row) => row.value === value && row.sourceUrl === source.url && row.sourceVersionKey === source.versionKey)) { summary.skippedClaims += 1; continue; }
       const differ = prior.filter((row) => row.value !== value && row.status !== 'unknown');
       const status = differ.length ? 'conflicting' : claim.status;
-      const row = { entityKey: entity.externalKey, field: claim.field, value, status, sourceUrl: source.url, excerpt: clip(claim.excerpt, TEXT_LIMIT), method: claim.method.trim(), observedAt: claim.observedAt ?? null };
+      const row = { entityKey: entity.externalKey, field: claim.field, value, status, sourceUrl: source.url, sourceVersionKey: source.versionKey, excerpt: clip(claim.excerpt, TEXT_LIMIT), method: claim.method.trim(), observedAt: timestamp(claim.observedAt) };
       claims.push(row);
       ops.claims.push(row);
       summary.importedClaims += 1;
@@ -199,18 +231,23 @@ export function planImport(graph, records) {
 }
 
 export function qualityReport({ entities, claims, sources, duplicates, runs }, now = Date.now()) {
+  const matchesCitation = (source, citation) => source.url === citation.url
+    && (!citation.sha256 || source.contentSha256 === citation.sha256)
+    && (!citation.retrievedAt || Date.parse(source.retrievedAt) === Date.parse(citation.retrievedAt));
+  const sourceIds = new Set(claims.map((claim) => claim.sourceId).filter(Boolean));
+  const citations = runs.flatMap((run) => run.output?.citations ?? []);
+  // Sources are workspace-level snapshots, but this report describes only this project's claims and runs.
+  sources = sources.filter((source) => sourceIds.has(source.id) || citations.some((citation) => matchesCitation(source, citation)));
   const claimList = claims;
   const withSource = claimList.filter((claim) => claim.sourceId || claim.sourceUrl);
   const conflicting = claimList.filter((claim) => claim.status === 'conflicting');
   const unsupported = claimList.filter((claim) => !['supported', 'corroborated', 'reviewed'].includes(claim.status));
   const stale = sources.filter((source) => source.retrievedAt && now - Date.parse(source.retrievedAt) > STALE_MS);
   const failed = sources.filter((source) => source.status === 'failed' || source.status === 'inaccessible');
-  const cited = new Set();
   let citationGaps = 0;
   for (const run of runs) {
     for (const citation of run.output?.citations ?? []) {
-      cited.add(citation.url);
-      if (!sources.some((source) => source.url === citation.url && source.status === 'retrieved')) citationGaps += 1;
+      if (!sources.some((source) => source.status === 'retrieved' && matchesCitation(source, citation))) citationGaps += 1;
     }
   }
   return {

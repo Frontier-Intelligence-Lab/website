@@ -45,6 +45,9 @@ TABLE_GROUPS = {
     "014": ("runners", "jobs", "job_events"),
     "015": ("eval_sets", "eval_cases", "eval_issue_notes", "eval_set_versions", "eval_batches", "eval_predictions",
             "eval_comparisons", "eval_judgments", "eval_reports"),
+    "017": ("research_projects", "research_sources", "research_entities", "research_claims", "research_relationships",
+            "research_memberships", "research_lists", "research_list_items", "research_runs", "research_run_events",
+            "research_revisions", "research_duplicate_candidates"),
 }
 LEDGER_TABLE, BASELINE = "schema_migrations", "006"
 KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
@@ -53,7 +56,7 @@ KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
 ROW_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
 # Exactly the statements the application store issues per table (row locks need UPDATE). Append-only and
-# frozen records never get DELETE. New tables use uuid defaults; the one sequence in the contract is listed in
+# frozen records never get DELETE. UUID defaults need no sequence; the two event sequences are listed in
 # SEQUENCE_GRANTS, and any other sequence on a contract table stops the release.
 GRANTS = {
     "annotations": ROW_PRIVILEGES, "issue_notes": ROW_PRIVILEGES,
@@ -71,11 +74,20 @@ GRANTS = {
     "eval_sets": ("SELECT", "INSERT", "UPDATE"), "eval_cases": ROW_PRIVILEGES, "eval_issue_notes": ROW_PRIVILEGES,
     "eval_set_versions": ("SELECT", "INSERT", "UPDATE"), "eval_batches": ("SELECT", "INSERT"), "eval_predictions": ("SELECT", "INSERT"),
     "eval_comparisons": ("SELECT", "INSERT", "UPDATE"), "eval_judgments": ("SELECT", "INSERT", "UPDATE"), "eval_reports": ("SELECT", "INSERT"),
+    # Research (017): sources/revisions/events are append-only; relationships are read-only until a writer exists.
+    "research_projects": ("SELECT", "INSERT", "UPDATE"), "research_sources": ("SELECT", "INSERT"),
+    "research_entities": ("SELECT", "INSERT", "UPDATE"), "research_claims": ("SELECT", "INSERT", "UPDATE"),
+    "research_relationships": ("SELECT",), "research_memberships": ("SELECT", "INSERT"),
+    "research_lists": ("SELECT", "INSERT"), "research_list_items": ("SELECT", "INSERT", "DELETE"),
+    "research_runs": ("SELECT", "INSERT", "UPDATE"), "research_run_events": ("SELECT", "INSERT"),
+    "research_revisions": ("SELECT", "INSERT"), "research_duplicate_candidates": ("SELECT", "INSERT"),
 }
 # job_events.id is a bigserial (event pages are read in id order): inserting needs USAGE on its sequence and
 # nothing more. SELECT or UPDATE on it (setval) is excess and stops the release.
 SEQUENCE_PRIVILEGES = ("USAGE", "SELECT", "UPDATE")
-SEQUENCE_GRANTS = {"job_events": {"job_events_id_seq": ("USAGE",)}}
+# Research uses GENERATED ALWAYS AS IDENTITY: implicit inserts need no sequence privilege (unlike bigserial).
+# Register its sequence with an empty privilege contract, so direct nextval/setval/read access remains excess.
+SEQUENCE_GRANTS = {"job_events": {"job_events_id_seq": ("USAGE",)}, "research_run_events": {"research_run_events_id_seq": ()}}
 # Records a migration must leave byte-for-byte alone, digested per row; digests never leave the controller.
 # Evaluation versions, batches, predictions and reports are append-only in full; a comparison's pair and rule and
 # a judgment's case are frozen identity (the trigger-protected columns), while their review state still moves.
@@ -90,6 +102,10 @@ FROZEN_QUERIES = {
     "eval_comparisons": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'set',set_id,'version',version_id,'baseline',baseline_batch_id,'candidate',candidate_batch_id,'acceptance',acceptance,'by',created_by,'at',created_at)::text) AS digest FROM eval_comparisons ORDER BY id",
     "eval_judgments": "SELECT id::text,md5(jsonb_build_object('comparison',comparison_id,'workspace',workspace_id,'case',case_key)::text) AS digest FROM eval_judgments ORDER BY id",
     "eval_reports": "SELECT id::text,md5(jsonb_build_object('workspace',workspace_id,'comparison',comparison_id,'revision',revision,'snapshot',snapshot,'hash',content_hash,'decision',decision,'by',approved_by,'at',approved_at)::text) AS digest FROM eval_reports ORDER BY id",
+    "research_sources": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_sources t ORDER BY id",
+    "research_revisions": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_revisions t ORDER BY id",
+    "research_run_events": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_run_events t ORDER BY id",
+    "research_runs": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_runs t WHERE status IN ('completed','failed','cancelled') ORDER BY id",
 }
 CATALOG_VARIABLES = ("MODEL_CATALOG_FILE", "LOCAL_MODEL_CATALOG_FILE")
 LOOPBACK_VARIABLES = ("LOCAL_RUNTIME_ORIGINS", "LOCAL_MEMORY_ORIGINS")
@@ -353,8 +369,9 @@ def snapshot_program():
     query += "const names=" + json.dumps(KNOWN_TABLES) + ";const tables=[];for(const t of names)if((await pool.query('SELECT to_regclass($1) AS t',['public.'+t])).rows[0].t)tables.push(t);\n"
     query += "const snapshot=(await pool.query('SELECT pg_export_snapshot() AS id')).rows[0].id;\n"
     query += "const ledger=(await pool.query('SELECT filename FROM schema_migrations ORDER BY filename')).rows.map(r=>r.filename);\n"
-    query += "const parts=tables.map(t=>\"'\"+t+\"',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM \"+t+\" t)\");\n"
-    query += "const manifest=(await pool.query('SELECT json_build_object('+parts.join(',')+') AS m')).rows[0].m;console.log(JSON.stringify({snapshot,tables,ledger,manifest}));await new Promise(r=>process.stdin.once('data',r));await pool.query('ROLLBACK');"
+    # A variadic json_build_object reaches PostgreSQL's 100-argument limit at 51 tables. Aggregate rows instead.
+    query += "const parts=tables.map(t=>\"('\"+t+\"',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM \"+t+\" t))\");\n"
+    query += "const manifest=parts.length?(await pool.query('SELECT json_object_agg(name,print) AS m FROM (VALUES '+parts.join(',')+') AS fingerprints(name,print)')).rows[0].m:{};console.log(JSON.stringify({snapshot,tables,ledger,manifest}));await new Promise(r=>process.stdin.once('data',r));await pool.query('ROLLBACK');"
     return node_program("const client=await pool.connect();try{" + query.replace("pool.query", "client.query") + "}finally{client.release();}").decode()
 
 
@@ -614,9 +631,9 @@ def node_program(code):
 
 def manifest_sql(tables):
     # Table names are only from the fixed allowlist, never from SSH input.
-    return "SELECT json_build_object(" + ",".join(
-        "'" + name + "',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM " + name + " t)"
-        for name in tables if name in KNOWN_TABLES) + ")"
+    rows = ["('" + name + "',(SELECT json_build_object('count',count(*),'digest',md5(coalesce(string_agg(row_to_json(t)::text,chr(10) ORDER BY row_to_json(t)::text),''))) FROM " + name + " t))"
+            for name in tables if name in KNOWN_TABLES]
+    return "SELECT json_object_agg(name,print) FROM (VALUES " + ",".join(rows) + ") AS fingerprints(name,print)" if rows else "SELECT '{}'::json"
 
 
 class Release:

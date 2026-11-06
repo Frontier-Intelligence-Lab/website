@@ -21,7 +21,7 @@ Browser ── HTTPS ──► web (Node/Fastify) ── SQL ──► Postgres 
 
 Workers that run on a customer's own machine (Valcairn Runners, `docs/RUNNERS.md`) do not connect to Postgres. They call `web` over HTTPS with a runner key and lease jobs from the same Postgres queue through it, so tenancy and roles are checked by `web` on every call and the machine needs no inbound port or database credentials.
 
-Public-source research is a separate path (`docs/RESEARCH.md`). The schema, planner, stores, and `services/research` worker are in the repository. The worker is a Python standard-library process. It is not a train job, it does not receive database credentials, and it is not the saved-note Agent. The Fastify route that spawns it, and the Research screens, are a follow-up change. File upload stays on `services/ingest`.
+Public-source research is a separate path (`docs/RESEARCH.md`). The schema, planner, stores and existing company catalog are in this storage unit. The separate Python standard-library fetch worker, its credential-free runtime, the Fastify routes and Research screens follow in coherent units. Research is not a train job or the saved-note Agent. File upload stays on `services/ingest`.
 
 ## Rules that hold across services
 

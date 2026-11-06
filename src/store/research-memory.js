@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
-import { planImport, qualityReport } from '../lib/research.js';
+import { planImport, qualityReport, researchProjectPatch } from '../lib/research.js';
 
 /**
  * Research methods for the in-memory store. One lock per workspace matches the Postgres workspace row lock.
@@ -39,7 +39,7 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
   const graph = (workspaceId) => ({
     sources: sources.filter((row) => row.workspaceId === workspaceId),
     entities: entities.filter((row) => row.workspaceId === workspaceId),
-    claims: claims.filter((row) => row.workspaceId === workspaceId).map((row) => ({ ...row, entityKey: entities.find((entity) => entity.id === row.entityId)?.externalKey, sourceUrl: sources.find((source) => source.id === row.sourceId)?.url ?? null })),
+    claims: claims.filter((row) => row.workspaceId === workspaceId).map((row) => ({ ...row, entityKey: entities.find((entity) => entity.id === row.entityId)?.externalKey, sourceUrl: sources.find((source) => source.id === row.sourceId)?.url ?? null, sourceVersionKey: sources.find((source) => source.id === row.sourceId)?.versionKey ?? null })),
     duplicates: duplicates.filter((row) => row.workspaceId === workspaceId),
   });
 
@@ -67,7 +67,9 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
       return locked(workspaceId, async () => {
         const row = projectOf(workspaceId, projectId);
         if (!row) throw new StoreError('not_found');
-        Object.assign(row, patch, { updatedAt: stamp() });
+        const changes = researchProjectPatch(row, patch);
+        if (!changes) throw new StoreError('invalid_state', 'Change only editable project fields and known checklist booleans.');
+        Object.assign(row, changes, { updatedAt: stamp() });
         return copy(row);
       });
     },
@@ -77,16 +79,13 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
         const plan = planImport(graph(workspaceId), records);
         if (!dryRun) {
           const at = stamp();
-          const sourceByUrl = new Map(sources.filter((row) => row.workspaceId === workspaceId).map((row) => [row.url, row]));
+          const sourceKey = (url, versionKey) => JSON.stringify([url, versionKey]);
+          const sourceByVersion = new Map(sources.filter((row) => row.workspaceId === workspaceId).map((row) => [sourceKey(row.url, row.versionKey), row]));
           for (const source of plan.ops.sources) {
-            const row = { id: randomUUID(), workspaceId, url: source.url, publisher: source.publisher, title: source.title, publishedAt: null, retrievedAt: source.retrievedAt, status: source.status, failure: source.failure, contentSha256: source.sha256, excerpt: source.excerpt, httpStatus: null, createdAt: at };
+            const row = { id: randomUUID(), workspaceId, url: source.url, versionKey: source.versionKey, publisher: source.publisher, title: source.title, publishedAt: null, retrievedAt: source.retrievedAt, status: source.status, failure: source.failure, contentSha256: source.sha256, excerpt: source.excerpt, httpStatus: null, createdAt: at };
             sources.push(row);
-            sourceByUrl.set(row.url, row);
+            sourceByVersion.set(sourceKey(row.url, row.versionKey), row);
             source.id = row.id;
-          }
-          for (const update of plan.ops.sourceUpdates) {
-            const row = sourceByUrl.get(update.url);
-            if (row && row.status !== 'retrieved') Object.assign(row, { status: 'retrieved', excerpt: update.excerpt, contentSha256: update.sha256, retrievedAt: update.retrievedAt, failure: null, publisher: update.publisher, title: update.title });
           }
           const entityByKey = new Map(entities.filter((row) => row.workspaceId === workspaceId).map((row) => [row.externalKey, row]));
           for (const entity of plan.ops.entities) {
@@ -97,7 +96,7 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
           }
           for (const claim of plan.ops.claims) {
             const entity = entityByKey.get(claim.entityKey);
-            const source = sourceByUrl.get(claim.sourceUrl);
+            const source = sourceByVersion.get(sourceKey(claim.sourceUrl, claim.sourceVersionKey));
             claims.push({ id: randomUUID(), workspaceId, entityId: entity.id, field: claim.field, value: claim.value, status: claim.status, sourceId: source?.id ?? null, excerpt: claim.excerpt, extractionMethod: claim.method, observedAt: claim.observedAt, retrievedAt: at, contentFingerprint: null, createdAt: at });
           }
           for (const id of plan.ops.conflictClaimIds) {
@@ -124,14 +123,20 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
         return copy(plan.summary);
       });
     },
-    async listResearchDirectory({ workspaceId, projectId, directory, q = '', sort = 'name', page = 1, pageSize = 20 }) {
+    async listResearchDirectory({ workspaceId, projectId, directory, listId, q = '', sort = 'name', page = 1, pageSize = 20 }) {
       if (!projectOf(workspaceId, projectId)) return null;
+      let listEntities;
+      if (listId != null) {
+        const list = lists.find((row) => row.id === listId && row.workspaceId === workspaceId && row.projectId === projectId);
+        if (!list) return null;
+        listEntities = new Set(listItems.filter((row) => row.listId === list.id).map((row) => row.entityId));
+      }
       const needle = q.trim().toLowerCase();
-      let rows = memberships.filter((row) => row.projectId === projectId && row.directory === directory)
-        .map((row) => entityOf(workspaceId, row.entityId))
+      const ids = new Set(memberships.filter((row) => row.projectId === projectId && (listEntities ? listEntities.has(row.entityId) : row.directory === directory)).map((row) => row.entityId));
+      let rows = [...ids].map((id) => entityOf(workspaceId, id))
         .filter(Boolean);
       if (needle) rows = rows.filter((row) => row.name.toLowerCase().includes(needle));
-      rows.sort((a, b) => sort === 'updated' ? b.updatedAt.localeCompare(a.updatedAt) : a.name.localeCompare(b.name));
+      rows.sort((a, b) => (sort === 'updated' ? b.updatedAt.localeCompare(a.updatedAt) : a.name.localeCompare(b.name)) || a.id.localeCompare(b.id));
       const total = rows.length;
       const start = (page - 1) * pageSize;
       const pageRows = rows.slice(start, start + pageSize).map((entity) => {
@@ -267,7 +272,8 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
         if (!run) throw new StoreError('not_found');
         if (run.status === 'cancelled') return copy(run);
         if (run.status !== 'running' && run.status !== 'proposed') throw new StoreError('invalid_state', 'This run has already finished.');
-        if (status === 'completed' && (output == null || !Array.isArray(output.citations))) throw new StoreError('invalid_state', 'A completed run needs a stored report.');
+        if (status === 'completed' && run.status !== 'running') throw new StoreError('invalid_state', 'Only a running run can complete.');
+        if (status === 'completed' && (!output || typeof output !== 'object' || Array.isArray(output) || !Array.isArray(output.citations))) throw new StoreError('invalid_state', 'A completed run needs a stored report object with citations.');
         if (status === 'failed' && output != null) throw new StoreError('invalid_state', 'A failed run cannot store a successful report.');
         if (!['completed', 'failed', 'cancelled'].includes(status)) throw new StoreError('invalid_state');
         run.status = status;
@@ -304,11 +310,13 @@ export function researchMemoryMethods({ stamp, copy, workspaces, audit }) {
         ids = new Set(memberships.filter((row) => row.projectId === projectId && (!directory || row.directory === directory)).map((row) => row.entityId));
       }
       const rows = [];
-      for (const entity of entities.filter((row) => ids.has(row.id))) {
-        const directoryName = memberships.find((row) => row.projectId === projectId && row.entityId === entity.id)?.directory ?? '';
+      const selected = memberships.filter((row) => row.projectId === projectId && ids.has(row.entityId) && (listId || !directory || row.directory === directory));
+      for (const membership of selected) {
+        const entity = entityOf(workspaceId, membership.entityId);
+        if (!entity) continue;
         for (const claim of claims.filter((row) => row.entityId === entity.id)) {
           const source = sources.find((row) => row.id === claim.sourceId);
-          rows.push({ directory: directoryName, kind: entity.kind, name: entity.name, field: claim.field, value: claim.value, claim_status: claim.status, source_url: source?.url ?? '', source_status: source?.status ?? '', retrieved_at: claim.retrievedAt ?? '', excerpt: claim.excerpt });
+          rows.push({ directory: membership.directory, kind: entity.kind, name: entity.name, field: claim.field, value: claim.value, claim_status: claim.status, source_url: source?.url ?? '', source_status: source?.status ?? '', retrieved_at: claim.retrievedAt ?? '', excerpt: claim.excerpt });
         }
       }
       return rows;

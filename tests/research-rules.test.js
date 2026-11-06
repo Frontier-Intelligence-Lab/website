@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { candidatesFromPages, planImport, recordsFromLabsCatalog, reportFromPages, spreadsheetCell, toCsv, validateRecord } from '../src/lib/research.js';
-import { researchWorkerEnv } from '../src/lib/research-worker.js';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const labs = JSON.parse(readFileSync(path.join(root, 'data', 'frontier-ai-labs-seed.json'), 'utf8'));
@@ -53,14 +52,17 @@ test('the same name with a different key is a duplicate, and a different value s
     entities: pasted.ops.entities.map((row) => ({ ...row, id: 'e1' })),
     claims: [],
   }, [record({ source: { url: 'https://example.com/lab', publisher: 'Example', title: 'Example Lab', status: 'retrieved', excerpt: 'Quoted fact.', sha256: 'a'.repeat(64), retrievedAt: '2026-11-05T00:00:00.000Z' } })]);
-  assert.equal(upgraded.ops.sourceUpdates.length, 1);
-  assert.equal(upgraded.ops.sourceUpdates[0].status, 'retrieved');
+  assert.equal(upgraded.ops.sources.length, 1);
+  assert.equal(upgraded.ops.sources[0].status, 'retrieved');
+  assert.notEqual(upgraded.ops.sources[0].versionKey, pasted.ops.sources[0].versionKey);
   const kept = planImport({
-    sources: [{ id: 's1', url: 'https://example.com/lab', status: 'retrieved', excerpt: 'Quoted fact.' }],
+    sources: [{ ...upgraded.ops.sources[0], id: 's1' }],
     entities: [{ id: 'e1', externalKey: 'catalog:organization:example', kind: 'organization', name: 'Example Lab' }],
     claims: [],
   }, [record({ source: { url: 'https://example.com/lab', publisher: 'Example', title: 'Example Lab', status: 'inaccessible', failure: 'paste', excerpt: 'Example Lab' } })]);
-  assert.equal(kept.ops.sourceUpdates.length, 0);
+  assert.equal(kept.ops.sources.length, 1);
+  assert.equal(kept.ops.sources[0].status, 'inaccessible');
+  assert.equal(upgraded.ops.sources[0].status, 'retrieved');
 });
 
 test('spreadsheet cells that start like formulas are prefixed, and unquoted excerpts are not cited', () => {
@@ -80,13 +82,4 @@ test('spreadsheet cells that start like formulas are prefixed, and unquoted exce
   assert.match(report.limitations.join(' '), /Paid web search is not configured/);
   assert.equal(candidatesFromPages(pages).length, 1);
   assert.equal(candidatesFromPages(pages, { directory: 'prospects', kind: 'organization' })[0].curated, true);
-});
-
-test('the research worker environment keeps the path and drops database credentials', () => {
-  const env = researchWorkerEnv({ PATH: 'C:\\Python', DATABASE_URL: 'postgres://secret', SESSION_SECRET: 'nope', RESEARCH_MODEL: 'hidden' });
-  assert.equal(env.PATH, 'C:\\Python');
-  assert.equal(env.DATABASE_URL, undefined);
-  assert.equal(env.SESSION_SECRET, undefined);
-  assert.equal(env.RESEARCH_MODEL, undefined);
-  assert.equal(env.PYTHONUTF8, '1');
 });

@@ -19,6 +19,7 @@ CREATE TABLE research_sources (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id uuid NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
   url text NOT NULL CHECK (char_length(url) BETWEEN 1 AND 2000),
+  version_key text NOT NULL CHECK (version_key ~ '^[0-9a-f]{64}$'),
   publisher text NOT NULL DEFAULT '' CHECK (char_length(publisher) <= 300),
   title text NOT NULL DEFAULT '' CHECK (char_length(title) <= 500),
   published_at timestamptz,
@@ -29,9 +30,19 @@ CREATE TABLE research_sources (
   excerpt text NOT NULL DEFAULT '' CHECK (char_length(excerpt) <= 8000),
   http_status integer,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  UNIQUE (workspace_id, url)
+  UNIQUE (workspace_id, url, version_key),
+  CHECK (status <> 'retrieved' OR content_sha256 IS NOT NULL)
 );
 CREATE INDEX research_sources_workspace_idx ON research_sources (workspace_id);
+
+-- Claims retain the exact snapshot they cited; a later fetch inserts a new source version.
+CREATE FUNCTION public.research_source_frozen() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'research_source_frozen';
+END;
+$$;
+CREATE TRIGGER research_source_frozen BEFORE UPDATE ON research_sources
+  FOR EACH ROW EXECUTE FUNCTION public.research_source_frozen();
 
 CREATE TABLE research_entities (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -121,8 +132,10 @@ CREATE TABLE research_runs (
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   finished_at timestamptz,
-  CHECK (status <> 'completed' OR output IS NOT NULL),
-  CHECK (status <> 'failed' OR output IS NULL)
+  CHECK (CASE WHEN status = 'completed' THEN output IS NOT NULL
+    AND jsonb_typeof(output) = 'object' AND COALESCE(jsonb_typeof(output -> 'citations') = 'array', false)
+    ELSE output IS NULL END),
+  CHECK ((status IN ('completed', 'failed', 'cancelled')) = (finished_at IS NOT NULL))
 );
 CREATE INDEX research_runs_project_idx ON research_runs (project_id, created_at DESC);
 

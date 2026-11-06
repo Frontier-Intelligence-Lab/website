@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -229,12 +229,10 @@ async function populate(database) {
 
 const FROZEN = ['capital_submissions', 'credit_records', 'capital_review_marks', 'eval_set_versions', 'eval_batches', 'eval_predictions', 'eval_reports'];
 
-test('a backup holding Capital and Evaluation rows restores with the normal pg_restore arguments only once 016 is applied', { skip: !connectionString && 'TEST_DATABASE_URL is not set', timeout: 300_000 }, async (t) => {
-  const base = testDatabase(connectionString);
+async function proofTools(t, admin) {
   const tools = postgresTools();
   const hosted = Boolean(process.env.GITHUB_ACTIONS);
   const versions = Object.fromEntries(await Promise.all(['pg_dump', 'pg_restore'].map(async (tool) => [tool, await tools.version(tool)])));
-  const admin = createPostgresPool({ connectionString: base.url, ssl: 'disable' });
   const serverMajor = Math.floor((await admin.query("SELECT current_setting('server_version_num')::int AS v")).rows[0].v / 10000);
   const majors = Object.values(versions).map((line) => Number(/\(PostgreSQL\) (\d+)/.exec(line ?? '')?.[1]) || 0);
   const unavailable = majors.some((major) => !major) ? 'pg_dump and pg_restore are not available (PATH, PG_BIN or PG_TOOLS_CONTAINER)'
@@ -242,9 +240,18 @@ test('a backup holding Capital and Evaluation rows restores with the normal pg_r
   if (unavailable) {
     await admin.end();
     if (hosted) assert.fail(`${unavailable}; the hosted PostgreSQL job must run the real restore`);
-    return t.skip(unavailable);
+    t.skip(unavailable);
+    return null;
   }
   t.diagnostic(`${process.env.PG_TOOLS_CONTAINER ? 'container' : 'local'} tools: ${versions.pg_dump}; ${versions.pg_restore}; server major ${serverMajor}`);
+  return tools;
+}
+
+test('a backup holding Capital and Evaluation rows restores with the normal pg_restore arguments only once 016 is applied', { skip: !connectionString && 'TEST_DATABASE_URL is not set', timeout: 300_000 }, async (t) => {
+  const base = testDatabase(connectionString);
+  const admin = createPostgresPool({ connectionString: base.url, ssl: 'disable' });
+  const tools = await proofTools(t, admin);
+  if (!tools) return;
   const tag = randomBytes(4).toString('hex');
   const databases = Object.fromEntries(['source', 'before', 'after'].map((role) => [role, sibling(base, `valcairn_restore_test_${tag}_${role}`)]));
   const work = await mkdtemp(join(tmpdir(), 'valcairn-restore-'));
@@ -254,9 +261,14 @@ test('a backup holding Capital and Evaluation rows restores with the normal pg_r
     for (const { name } of Object.values(databases)) await admin.query(`CREATE DATABASE "${name}"`);
     // 1. The schema as released through 015, populated through the store.
     const through015 = join(work, 'through-015');
-    await mkdir(through015);
+    const through016 = join(work, 'through-016');
+    await Promise.all([mkdir(through015), mkdir(through016)]);
     const earlier = (await readdir(MIGRATIONS)).filter((name) => name.endsWith('.sql') && name < REPAIR);
-    for (const name of earlier) await copyFile(new URL(name, MIGRATIONS), join(through015, name));
+    for (const name of earlier) {
+      await copyFile(new URL(name, MIGRATIONS), join(through015, name));
+      await copyFile(new URL(name, MIGRATIONS), join(through016, name));
+    }
+    await copyFile(new URL(REPAIR, MIGRATIONS), join(through016, REPAIR));
     const source = pool(databases.source);
     assert.equal((await applyMigrations({ pool: source, directory: through015 })).length, 15);
     const fixture = await populate(databases.source);
@@ -294,8 +306,8 @@ test('a backup holding Capital and Evaluation rows restores with the normal pg_r
     assert.equal(await attempt("INSERT INTO public.credit_records (workspace_id, provider, status, amount_cents, created_by) VALUES ($1, 'x', 'claimed', 1, $1)", [id]), null, 'plain CHECKs need no function');
 
     // 4. 016 applies once, a rerun applies nothing, and no row changes; exactly three functions change and resolve under any search_path.
-    assert.deepEqual(await applyMigrations({ pool: source }), [REPAIR]);
-    assert.deepEqual(await applyMigrations({ pool: source }), []);
+    assert.deepEqual(await applyMigrations({ pool: source, directory: through016 }), [REPAIR]);
+    assert.deepEqual(await applyMigrations({ pool: source, directory: through016 }), []);
     const sourceAfter = await fingerprint(databases.source);
     const { schema_migrations: ledgerBefore, ...rowsBefore } = sourceBefore.rows;
     const { schema_migrations: ledgerAfter, ...rowsAfter } = sourceAfter.rows;
@@ -345,7 +357,7 @@ test('a backup holding Capital and Evaluation rows restores with the normal pg_r
     await before.query(await read(REPAIR));
     assert.equal((await tools.restore(databases.before, dumpBefore, ['--section=data', '--section=post-data'])).code, 0);
     assert.deepEqual((await fingerprint(databases.before)).rows, sourceBefore.rows, 'every pre-016 row, ledger included');
-    assert.deepEqual(await applyMigrations({ pool: before }), [REPAIR], 'the migrator then records 016 without changing anything');
+    assert.deepEqual(await applyMigrations({ pool: before, directory: through016 }), [REPAIR], 'the migrator then records 016 without changing anything');
     const recovered = await fingerprint(databases.before);
     assert.deepEqual({ ...recovered, rows: without(recovered.rows, 'schema_migrations') }, { ...sourceAfter, rows: without(sourceAfter.rows, 'schema_migrations') }, 'the recovered database matches the repaired source, apart from when 016 was recorded');
     assert.equal(recovered.rows.schema_migrations.count, 16);
@@ -354,5 +366,70 @@ test('a backup holding Capital and Evaluation rows restores with the normal pg_r
     for (const { name } of Object.values(databases)) await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
     await admin.end();
     await rm(work, { recursive: true, force: true });
+  }
+});
+
+test('a latest-schema populated Research backup restores every table, source version, report and event identity normally', { skip: !connectionString && 'TEST_DATABASE_URL is not set', timeout: 300_000 }, async (t) => {
+  const base = testDatabase(connectionString);
+  const admin = createPostgresPool({ connectionString: base.url, ssl: 'disable' });
+  const tools = await proofTools(t, admin);
+  if (!tools) return;
+  const tag = randomBytes(4).toString('hex');
+  const databases = Object.fromEntries(['source', 'target'].map((role) => [role, sibling(base, `valcairn_research_restore_test_${tag}_${role}`)]));
+  const source = createPostgresPool({ connectionString: databases.source.url, ssl: 'disable' });
+  const store = createPostgresStore({ connectionString: databases.source.url, ssl: 'disable' });
+  try {
+    for (const { name } of Object.values(databases)) await admin.query(`CREATE DATABASE "${name}"`);
+    const files = await applyMigrations({ pool: source });
+    assert.equal(files.at(-1), '017_research.sql');
+    assert.deepEqual(await applyMigrations({ pool: source }), []);
+    const previous = await populate(databases.source);
+    const workspaceId = previous.workspaceId;
+    const actorId = (await source.query('SELECT created_by FROM capital_cases WHERE id = $1', [previous.caseId])).rows[0].created_by;
+    const project = await store.createResearchProject({ workspaceId, createdBy: actorId, template: 'collection', name: 'QA ONLY restore', brief: 'Synthetic persistence fixture; no fetch.', question: 'Does the evidence survive?', checklist: {} });
+    const at = { workspaceId, projectId: project.id, actorId };
+    const record = (key, url, excerpt, retrievedAt) => ({ externalKey: key, kind: 'organization', name: 'QA ONLY duplicate name', directory: 'companies',
+      source: { url, publisher: 'Synthetic fixture', title: 'QA ONLY', status: 'retrieved', excerpt, retrievedAt, sha256: createHash('sha256').update(excerpt).digest('hex') },
+      claims: [{ field: 'summary', value: excerpt, status: 'supported', method: 'quoted_fixture', excerpt }] });
+    const first = record('restore:first', 'https://example.test/first', 'QA ONLY First fact', '2026-01-01T00:00:00Z');
+    const second = record('restore:second', 'https://example.test/second', 'QA ONLY Separate fact', '2026-01-01T00:00:00Z');
+    await store.importResearchRecords({ ...at, records: [first, second] });
+    await store.importResearchRecords({ ...at, records: [record(first.externalKey, first.source.url, 'QA ONLY Second fact', '2026-11-01T00:00:00Z')] });
+    const directory = await store.listResearchDirectory({ ...at, directory: 'companies' });
+    const left = directory.rows.find((row) => row.entity.externalKey === first.externalKey).entity;
+    const right = directory.rows.find((row) => row.entity.externalKey === second.externalKey).entity;
+    await store.correctResearchClaim({ workspaceId, actorId, entityId: left.id, field: 'summary', value: 'QA ONLY reviewed fact', excerpt: 'Synthetic correction receipt' });
+    const detail = await store.getResearchEntity({ workspaceId, entityId: left.id });
+    assert.equal(new Set(detail.claims.map((claim) => claim.sourceId).filter(Boolean)).size, 2, 'the old and new retrieved evidence both remain');
+    const list = await store.addResearchList({ ...at, createdBy: actorId, name: 'QA ONLY list', purpose: 'Restore persistence' });
+    await store.addResearchListItem({ workspaceId, listId: list.id, entityId: left.id, note: 'Synthetic fixture' });
+    const run = await store.createResearchRun({ ...at, createdBy: actorId, question: 'QA ONLY fixture, no worker was executed', scope: {}, limits: {}, permissions: {} });
+    await store.markResearchRunRunning({ workspaceId, runId: run.id });
+    const output = { citations: [{ url: first.source.url, excerpt: first.source.excerpt }], findings: ['SYNTHETIC persistence receipt; no actual fetch.'] };
+    await store.finishResearchRun({ workspaceId, runId: run.id, status: 'completed', output });
+    // No relationship writer exists yet: this valid linked row exercises the schema's restore contract explicitly.
+    await source.query("INSERT INTO research_relationships (workspace_id, from_entity_id, to_entity_id, kind, claim_id, note) VALUES ($1,$2,$3,'maintains',$4,'SYNTHETIC restore fixture')", [workspaceId, left.id, right.id, detail.claims[0].id]);
+    const expectedDetail = await store.getResearchEntity({ workspaceId, entityId: left.id });
+    const before = await fingerprint(databases.source);
+    const researchTables = [...(await read('017_research.sql')).matchAll(/^CREATE TABLE (research_[a-z_]+)/gm)].map((match) => match[1]);
+    assert.equal(researchTables.length, 12);
+    for (const table of researchTables) assert.ok(before.rows[table].count > 0, `${table} is genuinely populated`);
+    const dump = await tools.dump(databases.source);
+    const restored = await tools.restore(databases.target, dump);
+    assert.equal(restored.code, 0, restored.stderr);
+    assert.deepEqual(await fingerprint(databases.target), before, 'all rows and functions match after ordinary restore');
+    const reopened = createPostgresStore({ connectionString: databases.target.url, ssl: 'disable' });
+    try {
+      assert.deepEqual(await reopened.getResearchEntity({ workspaceId, entityId: left.id }), expectedDetail);
+      const receipt = await reopened.getResearchRun({ workspaceId, runId: run.id });
+      assert.deepEqual(receipt.run.output, output);
+      const event = await reopened.appendResearchRunEvent({ workspaceId, runId: run.id, kind: 'progress', message: 'QA ONLY post-restore sequence check' });
+      assert.ok(event.id > Math.max(...receipt.events.map((item) => item.id)), 'identity resumes above every restored event');
+    } finally { await reopened.close(); }
+  } finally {
+    await store.close().catch(() => {});
+    await source.end().catch(() => {});
+    for (const { name } of Object.values(databases)) await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
+    await admin.end();
   }
 });
