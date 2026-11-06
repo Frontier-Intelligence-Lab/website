@@ -43,7 +43,7 @@ The report consists of quoted retrieved text, not model-generated synthesis. HTM
 
 | Variable | Effect |
 | --- | --- |
-| `RESEARCH_PYTHON` | Executable used to spawn the worker. Default `python`; the final Docker runtime installs Python 3 and sets `python3`. The migrator does not install Python. |
+| `RESEARCH_PYTHON` | Optional executable override. Default `python`; the Docker runtime installs Python 3 and supplies that command without adding an image environment default. The migrator does not install Python. |
 | `RESEARCH_MODEL` | Optional. Not called by this version. |
 | `RESEARCH_MODEL_BASE_URL` | Optional. Both this and `RESEARCH_MODEL` must be set before the capability is reported as configured. |
 

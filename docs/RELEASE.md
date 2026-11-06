@@ -23,7 +23,7 @@ New web configuration (all as runtime secrets or Coolify environment, never buil
 | `PROJECT_MAX_FILES`, `PROJECT_MAX_BYTES` | Optional sample quotas. |
 | `MODEL_CATALOG_FILE` | Path of the read-only model catalog JSON mounted into the web container (`docs/model-catalog.example.json` shows the format). Optional; see Models below. |
 | `LOCAL_MEMORY_ORIGINS` | Unset means the build's default loopback gateway origins (Memory and Agents pages on); explicitly empty turns both off. Decide before the rollout; see Memory and Agents below. |
-| `RESEARCH_PYTHON` | Executable for the bounded public-source worker. The final web image installs Python 3 and sets `python3`; the migrator does not install Python. |
+| `RESEARCH_PYTHON` | Optional worker executable override. The final web image installs Python 3 and supplies the existing `python` default without adding an image environment variable; the migrator does not install Python. |
 | `RESEARCH_MODEL`, `RESEARCH_MODEL_BASE_URL` | Optional configuration only. Research does not call an LLM in this release; retrieved text is quoted, not model-generated synthesis. |
 
 Ingest needs `INGEST_SHARED_SECRET`, `INGEST_STORAGE=s3://…`, `INGEST_ALLOWED_ORIGINS=https://frontierintelligencelab.com`, `INGEST_BIND=0.0.0.0:4100` and the `AWS_*` storage credentials. Set a bucket lifecycle rule that aborts incomplete multipart uploads after 1 day. Pending uploads that were never committed are swept every hour (`INGEST_PENDING_TTL_SECONDS`, default 24 h).
