@@ -390,7 +390,7 @@ function QualityCard({ quality, canWrite, disabled, onSave }) {
   return (
     <section className="ob-card" aria-labelledby="research-quality-h">
       <h2 id="research-quality-h">Quality</h2>
-      <p>{coverage}. Conflicting claims: {report.conflicting}. Open duplicate candidates: {report.duplicateCandidatesOpen}. Failed or inaccessible sources: {report.failedSources}. Citation gaps: {report.citationGaps}.</p>
+      <p>{coverage}. Conflicting claims: {report.conflicting}. Open duplicate candidates: {report.duplicateCandidatesOpen}. Unfetched or failed page snapshots: {report.failedSources}. Citation gaps: {report.citationGaps}.</p>
       <p>Claims not yet supported or reviewed: {report.unsupported}. This includes extracted claims; it does not mean they are false. Source snapshots retrieved more than {quality.staleAfterDays} days ago: {report.staleSources}. Age alone does not establish that a source is wrong.</p>
       <p className="ob-muted">{report.limitations}</p>
       <form onSubmit={(event) => {
