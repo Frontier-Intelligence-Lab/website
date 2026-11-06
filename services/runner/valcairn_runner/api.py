@@ -12,6 +12,27 @@ from . import __version__
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 
+def _encode_body(body):
+    return json.dumps(body).encode()
+
+
+def case_result_batches(results, lease_token):
+    """Bound the actual wire envelope, including JSON escaping, to the route's 256 KiB limit."""
+    batch = []
+    for row in results:
+        proposed = [*batch, row]
+        if len(proposed) > 20 or len(_encode_body({"leaseToken": lease_token, "results": proposed})) > 256 * 1024:
+            if batch:
+                yield batch
+            batch = [row]
+            if len(_encode_body({"leaseToken": lease_token, "results": batch})) > 256 * 1024:
+                raise ValueError("One case result exceeds the upload limit")
+        else:
+            batch = proposed
+    if batch:
+        yield batch
+
+
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
     """urllib's default handler re-sends the Authorization header to wherever a 3xx points, including another
     origin and plain http. The runner API never redirects, so every redirect is refused and surfaces as an error."""
@@ -61,7 +82,7 @@ class Api:
         self._open = opener or authenticated_opener()
 
     def _call(self, method: str, path: str, body: dict | None = None) -> dict:
-        data = None if body is None else json.dumps(body).encode()
+        data = None if body is None else _encode_body(body)
         req = urllib.request.Request(self.base + path, data=data, method=method, headers={
             "authorization": f"Bearer {self._key}",
             "user-agent": f"valcairn-runner/{__version__}",

@@ -116,14 +116,14 @@ export function acceptPosted(raw) {
   const output = raw.output ?? null;
   if (errorKind && output != null && output !== '') return { error: `${caseKey} is an error and also has answer text. Nothing was saved.` };
   if (!errorKind && (typeof output !== 'string' || !output.trim() || output.length > 8000)) return { error: `${caseKey} needs answer text of at most 8000 characters.` };
-  if (raw.passages != null && (!Array.isArray(raw.passages) || raw.passages.length > 8)) return { error: `${caseKey} has too many retrieved passages.` };
+  if (raw.passages != null && (!Array.isArray(raw.passages) || raw.passages.length > 20)) return { error: `${caseKey} has too many retrieved passages.` };
   const passages = (raw.passages ?? []).map((item) => {
     const text = typeof item?.text === 'string' ? item.text.trim().slice(0, 500) : '';
     const citation = typeof item?.citation === 'string' ? item.citation.trim().slice(0, 80) : '';
     return text ? { text, citation } : null;
   });
   if (passages.some((item) => !item)) return { error: `${caseKey} has a passage that is not text.` };
-  if (raw.citations != null && (!Array.isArray(raw.citations) || raw.citations.length > 8 || raw.citations.some((item) => typeof item !== 'string' || item.length > 80))) {
+  if (raw.citations != null && (!Array.isArray(raw.citations) || raw.citations.length > 20 || raw.citations.some((item) => typeof item !== 'string' || item.length > 80))) {
     return { error: `${caseKey} has a citation that is not a short string.` };
   }
   const latencyMs = raw.latencyMs ?? null;

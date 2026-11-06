@@ -223,11 +223,48 @@ async function populate(database) {
     const judged = await store.recordEvalJudgment({ workspaceId: ws.id, comparisonId: comparison.id, expectedRevision: comparison.revision, caseKey: 'returns', reviewerId: owner.id, patch: { baselineDecision: 'pass', candidateDecision: 'fail', adjudicationBaseline: null, adjudicationCandidate: null, note: 'Wrong window.' } });
     const preview = await store.readEvalComparison({ workspaceId: ws.id, comparisonId: comparison.id });
     const report = await store.approveEvalReport({ workspaceId: ws.id, comparisonId: comparison.id, expectedRevision: judged.comparison.revision, contentHash: preview.contentHash, approvedBy: owner.id });
-    return { ...mine, contentHash, versionId: frozen.id, versionHash: frozen.contentHash, reportId: report.id, reportHash: report.contentHash, notes: issue ? 1 : 0 };
+    return { ...mine, projectId: project.id, contentHash, versionId: frozen.id, versionHash: frozen.contentHash, reportId: report.id, reportHash: report.contentHash, notes: issue ? 1 : 0 };
   } finally { await store.close(); }
 }
 
 const FROZEN = ['capital_submissions', 'credit_records', 'capital_review_marks', 'eval_set_versions', 'eval_batches', 'eval_predictions', 'eval_reports'];
+
+async function populateCaseRuns(store, previous, actorId) {
+  const at = { workspaceId: previous.workspaceId, projectId: previous.projectId };
+  const runner = await store.createRunner({ workspaceId: at.workspaceId, createdBy: actorId, label: 'QA ONLY restore', keyHash: 'a'.repeat(64), keyPrefix: 'vrk_restore' });
+  await store.reportRunner({ runnerId: runner.id, capabilities: { sandbox: { available: true } } });
+  const start = (key) => store.startCaseRun({ ...at, versionId: previous.versionId, runnerId: runner.id, role: 'candidate', recipeVersion: '1', catalog: [], actorId,
+    candidate: { corpus: '30 days', retrievalK: 1, boosts: [], prompt: '' }, idempotencyKey: `restore-case-${key}` });
+  const completed = [];
+  for (const partial of [false, true]) {
+    const run = await start(partial ? 'partial' : 'complete');
+    const leaseHash = 'b'.repeat(64);
+    const lease = await store.leaseJob({ runnerId: runner.id, leaseHash });
+    assert.equal(lease.id, run.jobId);
+    const results = [{ caseKey: 'returns', output: '30 days', citations: ['p1'] },
+      partial ? { caseKey: 'returns-2', errorKind: 'timeout' } : { caseKey: 'returns-2', output: '30 days', citations: ['p1'] }];
+    await store.appendCaseResults({ workspaceId: at.workspaceId, jobId: run.jobId, results });
+    await store.finishJob({ runnerId: runner.id, jobId: run.jobId, leaseHash, outcome: 'succeeded', result: { recipe: 'support-qa', recipeVersion: '1', answered: partial ? 1 : 2, errors: partial ? 1 : 0 } });
+    const settled = await store.getCaseRun({ ...at, runId: run.id });
+    assert.equal(settled.status, partial ? 'partial' : 'complete');
+    assert.equal(settled.results.every((row) => row.scores !== null), !partial, 'normal finalization can write scores atomically once');
+    completed.push(settled);
+  }
+  return { at, completed, open: await start('open') };
+}
+
+async function assertCaseRunFrozen(pool, runs) {
+  for (const run of runs.completed) {
+    for (const [sql, values] of [
+      ['UPDATE eval_case_results SET run_id=$2,output=\'changed\' WHERE run_id=$1', [run.id, runs.open.id]],
+      ['UPDATE eval_case_results SET case_key=case_key || \'-moved\' WHERE run_id=$1', [run.id]],
+      ['UPDATE eval_case_results SET output=\'changed\',scores=NULL WHERE run_id=$1', [run.id]],
+      ['DELETE FROM eval_case_results WHERE run_id=$1', [run.id]],
+      ['UPDATE eval_case_runs SET settings=\'{}\'::jsonb WHERE id=$1', [run.id]],
+      ['DELETE FROM eval_case_runs WHERE id=$1', [run.id]],
+    ]) await assert.rejects(pool.query(sql, values), /eval_case_run_frozen/);
+  }
+}
 
 async function proofTools(t, admin) {
   const tools = postgresTools();
@@ -369,7 +406,7 @@ test('a backup holding Capital and Evaluation rows restores with the normal pg_r
   }
 });
 
-test('a latest-schema populated Research backup restores every table, source version, report and event identity normally', { skip: !connectionString && 'TEST_DATABASE_URL is not set', timeout: 300_000 }, async (t) => {
+test('a latest-schema populated Research and case-run backup restores every table, frozen receipt and event identity normally', { skip: !connectionString && 'TEST_DATABASE_URL is not set', timeout: 300_000 }, async (t) => {
   const base = testDatabase(connectionString);
   const admin = createPostgresPool({ connectionString: base.url, ssl: 'disable' });
   const tools = await proofTools(t, admin);
@@ -381,11 +418,13 @@ test('a latest-schema populated Research backup restores every table, source ver
   try {
     for (const { name } of Object.values(databases)) await admin.query(`CREATE DATABASE "${name}"`);
     const files = await applyMigrations({ pool: source });
-    assert.equal(files.at(-1), '017_research.sql');
+    assert.equal(files.at(-1), '018_case_runs.sql');
     assert.deepEqual(await applyMigrations({ pool: source }), []);
     const previous = await populate(databases.source);
     const workspaceId = previous.workspaceId;
     const actorId = (await source.query('SELECT created_by FROM capital_cases WHERE id = $1', [previous.caseId])).rows[0].created_by;
+    const caseRuns = await populateCaseRuns(store, previous, actorId);
+    await assertCaseRunFrozen(source, caseRuns);
     const project = await store.createResearchProject({ workspaceId, createdBy: actorId, template: 'collection', name: 'QA ONLY restore', brief: 'Synthetic persistence fixture; no fetch.', question: 'Does the evidence survive?', checklist: {} });
     const at = { workspaceId, projectId: project.id, actorId };
     const record = (key, url, excerpt, retrievedAt) => ({ externalKey: key, kind: 'organization', name: 'QA ONLY duplicate name', directory: 'companies',
@@ -414,18 +453,23 @@ test('a latest-schema populated Research backup restores every table, source ver
     const researchTables = [...(await read('017_research.sql')).matchAll(/^CREATE TABLE (research_[a-z_]+)/gm)].map((match) => match[1]);
     assert.equal(researchTables.length, 12);
     for (const table of researchTables) assert.ok(before.rows[table].count > 0, `${table} is genuinely populated`);
+    assert.equal(before.rows.eval_case_runs.count, 3);
+    assert.equal(before.rows.eval_case_results.count, 4);
     const dump = await tools.dump(databases.source);
     const restored = await tools.restore(databases.target, dump);
     assert.equal(restored.code, 0, restored.stderr);
     assert.deepEqual(await fingerprint(databases.target), before, 'all rows and functions match after ordinary restore');
     const reopened = createPostgresStore({ connectionString: databases.target.url, ssl: 'disable' });
+    const target = createPostgresPool({ connectionString: databases.target.url, ssl: 'disable' });
     try {
+      await assertCaseRunFrozen(target, caseRuns);
+      for (const run of caseRuns.completed) assert.deepEqual(await reopened.getCaseRun({ ...caseRuns.at, runId: run.id }), run);
       assert.deepEqual(await reopened.getResearchEntity({ workspaceId, entityId: left.id }), expectedDetail);
       const receipt = await reopened.getResearchRun({ workspaceId, runId: run.id });
       assert.deepEqual(receipt.run.output, output);
       const event = await reopened.appendResearchRunEvent({ workspaceId, runId: run.id, kind: 'progress', message: 'QA ONLY post-restore sequence check' });
       assert.ok(event.id > Math.max(...receipt.events.map((item) => item.id)), 'identity resumes above every restored event');
-    } finally { await reopened.close(); }
+    } finally { await reopened.close(); await target.end(); }
   } finally {
     await store.close().catch(() => {});
     await source.end().catch(() => {});

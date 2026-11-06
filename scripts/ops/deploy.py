@@ -110,6 +110,8 @@ FROZEN_QUERIES = {
     "research_revisions": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_revisions t ORDER BY id",
     "research_run_events": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_run_events t ORDER BY id",
     "research_runs": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM research_runs t WHERE status IN ('completed','failed','cancelled') ORDER BY id",
+    "eval_case_runs": "SELECT id::text,md5(row_to_json(t)::text) AS digest FROM eval_case_runs t WHERE finished_at IS NOT NULL ORDER BY id",
+    "eval_case_results": "SELECT t.run_id::text || ':' || t.case_key AS id,md5(row_to_json(t)::text) AS digest FROM eval_case_results t JOIN eval_case_runs r ON r.id=t.run_id WHERE r.finished_at IS NOT NULL ORDER BY t.run_id,t.case_key",
 }
 CATALOG_VARIABLES = ("MODEL_CATALOG_FILE", "LOCAL_MODEL_CATALOG_FILE")
 LOOPBACK_VARIABLES = ("LOCAL_RUNTIME_ORIGINS", "LOCAL_MEMORY_ORIGINS")

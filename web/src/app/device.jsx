@@ -3,7 +3,8 @@ import { useLoaderData } from 'react-router';
 import { api } from '../api.js';
 import { FieldError, Icon, Tile, requireWorkspace } from './ui.jsx';
 import { WorkspaceShell, plural } from './shell.jsx';
-import { RuntimeError, browserHints, createRuntime } from './runtime.js';
+import { RuntimeError, createRuntime } from './runtime.js';
+import { createConnectionProbe } from './device-probe.js';
 import { ReferencePicker } from './reference.jsx';
 import { referencePrompt } from './memory.js';
 import { passesTask, readyAfterTest } from '../../../src/lib/devices.js';
@@ -56,10 +57,14 @@ export function RunOnDevice() {
   const [selected, setSelected] = useState('');
   const [busy, setBusy] = useState(null); // 'chat' | 'test' while a model operation runs
   const [notice, setNotice] = useState(null);
+  const connectionProbe = useMemo(() => createConnectionProbe(runtime, (snapshot) => {
+    setConn((c) => snapshot.checking ? { ...c, checking: true } : snapshot.status === 'connected' ? snapshot : { models: c.models, running: c.running, version: c.version, ...snapshot });
+  }), [runtime, key]);
 
-  const refreshDetail = useCallback(async (id = deviceId) => {
+  const refreshDetail = useCallback(async (id = deviceId, current = () => true) => {
     if (!id) return null;
     const res = await api.device(entry.id, id).catch(() => null);
+    if (!current()) return null;
     if (res?.status === 404) { writeDeviceId(key, null); setDeviceId(null); setDetail(null); return null; }
     if (res?.ok) setDetail(res.data);
     return res?.ok ? res.data : null;
@@ -74,16 +79,9 @@ export function RunOnDevice() {
 
   /** Reads the runtime, tells Valcairn what it found, and reconciles install records with what is actually installed. */
   const probe = useCallback(async (id = deviceId) => {
-    setConn((c) => ({ ...c, checking: true })); // the last status stays, so a re-check never unmounts a reply or test in progress
-    const hints = await browserHints();
-    let snapshot;
-    try {
-      const [version, models, running] = await Promise.all([runtime.version(), runtime.models(), runtime.running()]);
-      snapshot = { status: 'connected', version, models, running, hints, checkedAt: new Date().toISOString() };
-    } catch (err) {
-      snapshot = { status: 'unreachable', error: err, hints, checkedAt: new Date().toISOString() };
-    }
-    setConn((c) => (snapshot.status === 'connected' ? snapshot : { models: c.models, running: c.running, version: c.version, ...snapshot })); // a failed re-check keeps what Ollama last reported, so nothing in progress is unmounted
+    const result = await connectionProbe.load();
+    if (!result) return null;
+    const { snapshot, current: isCurrent } = result;
     if (!id) return snapshot;
     const connected = snapshot.status === 'connected';
     await api.deviceReport(entry.id, id, {
@@ -91,27 +89,33 @@ export function RunOnDevice() {
       runtimeVersion: connected ? snapshot.version : null,
       models: connected ? snapshot.models : [],
       running: connected ? snapshot.running : [],
-      browser: hints,
+      browser: snapshot.hints,
     }).catch(() => null);
-    const current = await refreshDetail(id);
+    if (!isCurrent()) return snapshot;
+    const current = await refreshDetail(id, isCurrent);
     if (connected && current) {
       const byRef = new Map(current.installs.map((i) => [i.runtimeRef, i]));
       const present = new Set();
       for (const m of snapshot.models.filter((x) => !x.remote)) {
+        if (!isCurrent()) return snapshot;
         present.add(m.name);
         const known = byRef.get(m.name);
         const changed = !known || ['removed', 'downloading', 'failed'].includes(known.state) || known.digest !== m.digest;
         if (changed) await api.saveInstall(entry.id, id, { runtimeRef: m.name, catalogId: local.catalog.find((c) => c.ref === m.name)?.id, digest: m.digest, sizeBytes: m.sizeBytes, details: { format: m.format, family: m.family, parameterSize: m.parameterSize, quantization: m.quantization, capabilities: m.capabilities }, state: 'installed' }).catch(() => null);
       }
       for (const i of current.installs) {
+        if (!isCurrent()) return snapshot;
         if (!present.has(i.runtimeRef) && ['installed', 'verified', 'ready'].includes(i.state)) await api.saveInstall(entry.id, id, { runtimeRef: i.runtimeRef, catalogId: i.catalogId, digest: i.digest, sizeBytes: i.sizeBytes, details: i.details, state: 'removed' }).catch(() => null);
       }
-      await refreshDetail(id);
+      await refreshDetail(id, isCurrent);
     }
     return snapshot;
-  }, [deviceId, entry.id, local.catalog, refreshDetail, runtime]);
+  }, [deviceId, entry.id, local.catalog, refreshDetail, connectionProbe]);
 
-  useEffect(() => { if (deviceId) probe(deviceId); }, [deviceId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (deviceId) probe(deviceId);
+    return () => connectionProbe.cancel();
+  }, [deviceId, probe, connectionProbe]);
 
   async function connect(label) {
     const res = await api.createDevice(entry.id, label).catch(() => null);
@@ -125,7 +129,7 @@ export function RunOnDevice() {
     const res = await api.revokeDevice(entry.id, id).catch(() => null);
     if (!res?.ok) { setNotice({ tone: 'warn', text: res?.data?.error ?? 'That did not work. Try again.' }); return; }
     setDevices((list) => list.map((d) => (d.id === id ? res.data.device : d)));
-    if (id === deviceId) { writeDeviceId(key, null); setDeviceId(null); setDetail(null); setConn({ status: 'idle' }); }
+    if (id === deviceId) { connectionProbe.cancel(); writeDeviceId(key, null); setDeviceId(null); setDetail(null); setConn({ status: 'idle' }); }
     setNotice({ tone: 'ok', text: 'Disconnected. Valcairn keeps this device’s history but records nothing new from it. Models stay installed in Ollama.' });
   }
 
@@ -221,7 +225,7 @@ function ConnectionCard({ ctx, device, onDisconnect }) {
         <div className="cell-stack">
           <h2 id="conn-h">{device?.label ?? 'This device'}</h2>
           <span className="ob-muted" style={{ fontSize: 13 }} aria-live="polite">
-            {conn.checking ? 'Checking Ollama…' : conn.status === 'connected' ? `Connected to Ollama ${conn.version ?? ''} at ${runtime.origin}` : conn.status === 'unreachable' ? (conn.models ? 'Ollama did not answer the last check. Showing what it reported before.' : 'Ollama is not reachable from this page') : 'Not checked yet'}
+            {conn.checking ? 'Checking Ollama…' : conn.status === 'connected' ? `Connected to Ollama ${conn.version ?? ''} at ${runtime.origin}` : conn.status === 'unreachable' ? (conn.models ? 'Ollama did not answer the last check. Showing what it reported before.' : conn.error?.kind === 'timeout' ? 'The connection check timed out. Try again.' : 'Ollama is not reachable from this page') : 'Not checked yet'}
           </span>
         </div>
         <div className="row-wrap gap-10">
@@ -241,7 +245,7 @@ function ConnectionCard({ ctx, device, onDisconnect }) {
         <Facts title="Reported by your browser" note="Hints only. Browsers round, cap or hide these values.">
           <Fact label="CPU threads" value={num(hints?.hardwareConcurrency)} />
           <Fact label="Memory hint" value={hints?.deviceMemoryGb ? `≥ ${hints.deviceMemoryGb} GB (capped by the browser)` : 'Not shared'} />
-          <Fact label="WebGPU" value={hints ? (hints.webgpu ? 'Available' : 'Not available') : '—'} />
+          <Fact label="WebGPU" value={hints?.webgpu == null ? 'Not shared' : hints.webgpu ? 'Available' : 'Not available'} />
           <Fact label="GPU" value={hints?.gpu ? [hints.gpu.vendor, hints.gpu.architecture].filter(Boolean).join(' · ') || 'Not shared' : 'Not shared'} />
         </Facts>
         <Facts title="Reported by Ollama" note="What the runtime says about itself and its loaded models. Not the computer’s full memory.">

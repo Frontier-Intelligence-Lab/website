@@ -612,7 +612,7 @@ export function EvalReview() {
         <p>Revision {comparison.revision}. {hidden ? 'System names are hidden on this screen. The saved left and right assignment is stored and shown again on the approved report.' : 'System names are visible.'} Normalized exact match is not semantic correctness.</p>
       </div>
       <Banner status={status} error={error} onRetry={() => revalidator.revalidate()} />
-      <ImportTriage review={review} summary={summary} baseline={baseline} candidate={candidate} version={version} />
+      <ImportTriage review={review} summary={summary} baseline={baseline} candidate={candidate} version={version} acceptance={comparison.acceptance} />
       <Summary summary={summary} />
       {canWrite && (
         <div className="ob-row-actions">

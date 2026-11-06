@@ -57,9 +57,9 @@ export function caseRunPostgresMethods({ query, transaction, isId, iso, addAudit
       return transaction(async (client) => {
         const version = (await query('SELECT project_id FROM eval_set_versions WHERE id = $1 AND workspace_id = $2 FOR SHARE', [versionId, workspaceId], client)).rows[0];
         if (!version || version.project_id !== projectId) throw new StoreError('not_found');
-        const runner = (await query('SELECT status, last_seen_at FROM runners WHERE id = $1 AND workspace_id = $2 FOR SHARE', [runnerId, workspaceId], client)).rows[0];
+        const runner = (await query('SELECT status, last_seen_at, clock_timestamp() AS observed_at FROM runners WHERE id = $1 AND workspace_id = $2 FOR SHARE', [runnerId, workspaceId], client)).rows[0];
         if (!runner || runner.status !== 'active') throw new StoreError('not_found');
-        if (!runnerFresh(iso(runner.last_seen_at), Date.now())) throw invalid('This runner has not reported in the last minute. Open Compute and confirm it is online.');
+        if (!runnerFresh(iso(runner.last_seen_at), Date.parse(iso(runner.observed_at)))) throw invalid('This runner has not reported in the last minute. Open Compute and confirm it is online.');
         const same = (row) => row.kind === 'case_eval' && row.runner_id === runnerId && row.enhance_run_id == null && stableJson(row.spec) === stableJson(spec);
         const prior = (await query('SELECT * FROM jobs WHERE workspace_id = $1 AND idempotency_key = $2', [workspaceId, idempotencyKey], client)).rows[0];
         let job = prior;

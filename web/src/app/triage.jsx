@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { countChanges, importRows, runnerRows, sideLabel } from '../../../src/lib/eval-shared.js';
+import { filterTriageRows, importedScoringLabel, loadRunPair, runnerFacts, runPairKey, visibleRunPair } from './triage-state.js';
 
 function tallyComplete(tally, eligible) {
   return eligible > 0 && tally.submitted === eligible && tally.missing === 0 && tally.failed === 0 && tally.abstained === 0;
@@ -104,21 +105,15 @@ function CaseTable({ rows, baselineTitle, candidateTitle, selected, onSelect }) 
 }
 
 function useFilters(rows) {
-  const [change, setChange] = useState(null);
-  const [chip, setChip] = useState('attention');
+  const [filter, setFilter] = useState('attention');
   const [selected, setSelected] = useState(null);
   const counts = countChanges(rows);
-  const shown = rows.filter((row) => {
-    if (change && row.change !== change) return false;
-    if (chip === 'critical') return row.severity === 'critical';
-    if (chip === 'judgment') return row.needsJudgment;
-    if (chip === 'attention') return row.attention;
-    return true;
-  });
-  return { change, setChange, chip, setChip, selected, setSelected, counts, shown };
+  const change = ['kept', 'fixed', 'regressed', 'still'].includes(filter) ? filter : null;
+  const shown = filterTriageRows(rows, filter);
+  return { change, setChange: (next) => setFilter(next ?? 'all'), chip: change ? null : filter, setChip: setFilter, selected, setSelected, counts, shown };
 }
 
-export function ImportTriage({ review, summary, baseline, candidate, version }) {
+export function ImportTriage({ review, summary, baseline, candidate, version, acceptance }) {
   const rows = importRows(review);
   const filters = useFilters(rows ?? []);
   if (!rows) {
@@ -131,6 +126,7 @@ export function ImportTriage({ review, summary, baseline, candidate, version }) 
   const candComplete = tallyComplete(candTally, eligible);
   const passes = (outcome, status) => rows.filter((row) => row[outcome] === 'pass' && row[status] !== 'error').length;
   const hash = version?.contentHash ? `${version.contentHash.slice(0, 8)}…` : 'not loaded';
+  const scoringRule = importedScoringLabel(acceptance?.scoreBasis);
   function select(caseKey) {
     filters.setSelected(caseKey);
     document.getElementById(`review-${caseKey}`)?.scrollIntoView({ block: 'start' });
@@ -154,7 +150,7 @@ export function ImportTriage({ review, summary, baseline, candidate, version }) 
           missing={baseTally.missing}
           failed={baseTally.failed}
           abstained={baseTally.abstained}
-          facts={[['Claim', baseline?.claimedSystem?.identity ?? 'No system name claimed'], ['Scorer', 'Normalized exact match']]}
+          facts={[['Claim', baseline?.claimedSystem?.identity ?? 'No system name claimed'], ['Scoring rule', scoringRule]]}
         />
         <p className="eval-vs" aria-hidden="true">→</p>
         <RunCard
@@ -167,7 +163,7 @@ export function ImportTriage({ review, summary, baseline, candidate, version }) 
           missing={candTally.missing}
           failed={candTally.failed}
           abstained={candTally.abstained}
-          facts={[['Claim', candidate?.claimedSystem?.identity ?? 'No system name claimed'], ['Scorer', 'Normalized exact match']]}
+          facts={[['Claim', candidate?.claimedSystem?.identity ?? 'No system name claimed'], ['Scoring rule', scoringRule]]}
         />
         <Matrix counts={filters.counts} change={filters.change} onChange={filters.setChange} />
       </div>
@@ -184,16 +180,6 @@ export function ImportTriage({ review, summary, baseline, candidate, version }) 
 }
 
 const STATUS_WORD = { queued: 'Queued', running: 'Running', complete: 'Complete', partial: 'Partial', failed: 'Failed', cancelled: 'Cancelled' };
-
-function runnerFacts(run) {
-  if (!run) return [['Recipe', 'No run chosen'], ['Settings', 'Not recorded']];
-  const settings = run.settings ?? {};
-  const model = run.runtime?.modelId ? `catalog model ${run.runtime.modelId}` : 'extractive recipe, no model';
-  return [
-    ['Recipe', `${run.recipeId} ${run.recipeVersion}`.trim()],
-    ['Settings', `retrieval k ${settings.retrievalK ?? 'not recorded'} · ${settings.prompt ? 'prompt recorded' : 'no prompt'} · ${model}`],
-  ];
-}
 
 function runOption(run) {
   const stamp = run.finishedAt || run.createdAt;
@@ -232,38 +218,17 @@ export function RunPair({ entry, project, set, version, runs }) {
   const [candidateId, setCandidateId] = useState(candidates.at(-1)?.id ?? '');
   const baselinePick = baselineId === '' || baselines.some((run) => run.id === baselineId) ? baselineId : (baselines.at(-1)?.id ?? '');
   const candidatePick = candidateId === '' || candidates.some((run) => run.id === candidateId) ? candidateId : (candidates.at(-1)?.id ?? '');
-  const [detail, setDetail] = useState(null);
-  const [error, setError] = useState('');
+  const [pairState, setPairState] = useState(null);
   const baseline = baselines.find((run) => run.id === baselinePick) ?? null;
   const candidate = candidates.find((run) => run.id === candidatePick) ?? null;
   const pairReady = Boolean(baseline && candidate && baseline.id !== candidate.id && baseline.scored === true && baseline.status === 'complete' && candidate.scored === true && candidate.status === 'complete');
+  const scope = { workspaceId: entry.id, projectId: project.id, setId: set.id, versionId: version.id, baselineId: baseline?.id, candidateId: candidate?.id };
+  const currentPair = visibleRunPair(pairState, runPairKey(scope), pairReady);
+  const detail = currentPair?.detail ?? null;
+  const error = currentPair?.error ?? '';
   useEffect(() => {
-    if (!pairReady) { setDetail(null); return undefined; }
-    let live = true;
-    setDetail(null);
-    setError('');
-    Promise.all([
-      api.caseRun(entry.id, project.id, set.id, version.id, baseline.id),
-      api.caseRun(entry.id, project.id, set.id, version.id, candidate.id),
-    ]).then(([left, right]) => {
-      if (!live) return;
-      const samePair = left.run?.id === baseline.id && right.run?.id === candidate.id;
-      const sameVersion = left.run?.versionId === version.id && right.run?.versionId === version.id;
-      const bothScored = left.run?.scored === true && left.run?.status === 'complete' && right.run?.scored === true && right.run?.status === 'complete';
-      if (!samePair || !sameVersion || !bothScored) {
-        setDetail(null);
-        setError(sameVersion
-          ? 'Those runs are not both complete and scored, so nothing from the previous pair is shown.'
-          : 'Those runs are not on this frozen version, so they are not compared.');
-        return;
-      }
-      setDetail({ baseline: left.run, candidate: right.run });
-    }).catch(() => {
-      if (!live) return;
-      setDetail(null);
-      setError('The run could not be loaded. Nothing from the previous pair is shown.');
-    });
-    return () => { live = false; };
+    if (!pairReady) { setPairState(null); return undefined; }
+    return loadRunPair(scope, (runId) => api.caseRun(entry.id, project.id, set.id, version.id, runId), setPairState);
   }, [pairReady, baseline?.id, candidate?.id, entry.id, project.id, set.id, version.id]);
   const rows = detail ? runnerRows(version.cases, detail.baseline.results, detail.candidate.results) : [];
   const filters = useFilters(rows);

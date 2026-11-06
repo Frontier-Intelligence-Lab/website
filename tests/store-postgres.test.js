@@ -1257,6 +1257,41 @@ withStore('capital: references are settled on the locked row: a cited record can
   await assert.rejects(store.submitCapitalCase({ ...mine, submittedBy: owner.id, expectedRevision: 2, contentHash: await capitalHash(store, mine) }), { code: 'missing_reference' });
 });
 
+withStore('case runs: database heartbeat freshness is independent of a drifted app clock, and cold, stale and future reports still fail', async (store, pool) => {
+  const owner = await user(store, 'case-clock@example.test');
+  const ws = await workspace(store, owner.id);
+  const project = await store.createProject({ workspaceId: ws.id, createdBy: owner.id, name: 'Policy', task: 'QA ONLY clock regression', modalities: ['Text'], startingPoint: 'model' });
+  const at = { workspaceId: ws.id, projectId: project.id };
+  await store.updateProject({ ...at, patch: { success: { measure: 'exact', target: 'Policy' }, dataSource: { mode: 'upload', provenance: 'ours', allowedUses: ['testing'] } } });
+  const review = await store.submitForReview({ ...at, submittedBy: owner.id });
+  await store.decideReview({ reviewId: review.id, reviewerId: owner.id, decision: 'approved', checks: {} });
+  const dataset = await store.createDatasetVersion({ ...at, createdBy: owner.id });
+  const set = await store.createEvalSet({ ...at, createdBy: owner.id, name: 'Policy', purpose: 'development' });
+  await store.saveEvalCase({ ...at, setId: set.id, expectedRevision: 1, input: { id: 'a', input: 'Window?', expectedAnswer: '30 days', sources: [{ projectId: project.id, versionId: dataset.id, fileId: null }] } });
+  const detail = await store.getEvalSet({ ...at, setId: set.id });
+  const frozen = await store.freezeEvalSet({ ...at, setId: set.id, expectedRevision: detail.set.revision, actorId: owner.id });
+  const runner = await store.createRunner({ workspaceId: ws.id, createdBy: owner.id, label: 'QA ONLY', keyHash: 'a'.repeat(64), keyPrefix: 'vrk_clock' });
+  const start = (key) => store.startCaseRun({ ...at, versionId: frozen.id, runnerId: runner.id, role: 'candidate', recipeVersion: '1', actorId: owner.id, idempotencyKey: `case-clock-${key}`, candidate: { corpus: '30 days', retrievalK: 1 } });
+  await assert.rejects(start('cold'), { code: 'invalid_state' });
+  await store.reportRunner({ runnerId: runner.id, capabilities: { sandbox: { available: true } } });
+  const realNow = Date.now;
+  let appNow = realNow();
+  Date.now = () => appNow;
+  try {
+    for (const drift of [-86_400_000, 86_400_000]) {
+      appNow = realNow() + drift;
+      assert.equal((await start(`fresh-${drift < 0 ? 'behind' : 'ahead'}`)).status, 'queued');
+    }
+    for (const [key, offset] of [['stale', '-61 seconds'], ['future', '60 seconds']]) {
+      const reported = (await pool.query('UPDATE runners SET last_seen_at=clock_timestamp()+$2::interval WHERE id=$1 RETURNING last_seen_at', [runner.id, offset])).rows[0].last_seen_at;
+      appNow = reported.getTime() + 1; // The drifted app clock would consider either report fresh.
+      await assert.rejects(start(key), { code: 'invalid_state' });
+    }
+    await pool.query('UPDATE runners SET last_seen_at=NULL WHERE id=$1', [runner.id]);
+    await assert.rejects(start('cold-after-drift'), { code: 'invalid_state' });
+  } finally { Date.now = realNow; }
+});
+
 withStore('evaluation: direct SQL cannot change frozen cases, versions, imports or reports, and deleting the workspace fails closed', async (store, pool) => {
   const owner = await user(store, 'eval-sql@example.test');
   const ws = await workspace(store, owner.id, { slug: 'eval-sql', name: 'Eval SQL' });

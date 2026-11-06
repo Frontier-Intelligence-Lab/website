@@ -995,3 +995,9 @@ th:has(> .sr-only) { position: relative; }
   .eval-runs { grid-template-columns: 1fr; }
   .eval-vs, .eval-hide-sm { display: none; }
 }
+
+/* Research evidence and actions keep their full reading width on phones. */
+@media (max-width: 720px) {
+  .research-list > li { flex-direction: column; align-items: stretch; gap: 6px; }
+  .research-list > li > * { min-width: 0; max-width: 100%; }
+}

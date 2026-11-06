@@ -152,7 +152,7 @@ Both stores implement the same methods. Rules live in `src/lib/eval.js` and `doc
 
 ## Executed case runs
 
-Both stores implement the same methods. Rules live in `src/lib/case-run.js`. Postgres additionally enforces them in `018_case_runs.sql`. A score is written only after the run is `complete`. Partial, failed, and cancelled runs keep posted outputs and error explanations and store no score. Runner-supplied scores are dropped. `caseRunInputs` returns `{ caseKey, input }` only.
+Both stores implement the same methods. Rules live in `src/lib/case-run.js`. Postgres additionally enforces them in `018_case_runs.sql`. A score is written only after the run is `complete`, once, in the finalization transaction. Result run/case identity never changes. Terminal runs and their results reject later updates and deletes; this also blocks deleting their workspace. Partial, failed, and cancelled runs keep posted outputs and error explanations and store no score. Runner-supplied scores are dropped. `caseRunInputs` returns `{ caseKey, input }` only.
 
 | Method | Returns / throws |
 | --- | --- |
