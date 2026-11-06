@@ -138,6 +138,10 @@ export function loadConfig(env = process.env) {
   // The open-weight model catalog is deployment data (docs/model-catalog.example.json), checked once here.
   // Unset leaves it empty: Models pages have nothing to pull and new enhance plans are refused, while pulls and
   // runs already recorded stay readable. An unreadable or invalid file stops startup with the reason.
+  // The vetted support-qa recipe's recorded version. It is not a model id, and the server does not call a model.
+  const evalRecipeVersion = env.EVAL_RECIPE_VERSION ?? '1';
+  if (!/^[A-Za-z0-9._-]{1,20}$/.test(evalRecipeVersion)) throw new Error('EVAL_RECIPE_VERSION must be 1 to 20 letters, digits, dots, underscores or dashes');
+
   let modelCatalog = [];
   if (env.MODEL_CATALOG_FILE) {
     try { modelCatalog = parseModelCatalog(readFileSync(env.MODEL_CATALOG_FILE, 'utf8')); }
@@ -161,6 +165,7 @@ export function loadConfig(env = process.env) {
     reviewers,
     demoWorkspaceId,
     modelCatalog,
+    evalRecipeVersion,
     signinLogFile: env.SIGNIN_LOG_FILE || null,
     databaseUrl,
     databaseSsl,

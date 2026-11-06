@@ -99,5 +99,8 @@ class Api:
     def inputs(self, job_id: str, token: str) -> dict:
         return self._call("POST", f"/api/runner/jobs/{urllib.parse.quote(job_id)}/inputs", {"leaseToken": token})
 
+    def case_results(self, job_id: str, token: str, results: list[dict]) -> dict:
+        return self._call("POST", f"/api/runner/jobs/{urllib.parse.quote(job_id)}/case-results", {"leaseToken": token, "results": results})
+
     def finish(self, job_id: str, token: str, **outcome) -> dict:
         return self._call("POST", f"/api/runner/jobs/{urllib.parse.quote(job_id)}/finish", {"leaseToken": token, **outcome})["job"]

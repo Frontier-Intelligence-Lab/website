@@ -48,6 +48,7 @@ TABLE_GROUPS = {
     "017": ("research_projects", "research_sources", "research_entities", "research_claims", "research_relationships",
             "research_memberships", "research_lists", "research_list_items", "research_runs", "research_run_events",
             "research_revisions", "research_duplicate_candidates"),
+    "018": ("eval_case_runs", "eval_case_results"),
 }
 LEDGER_TABLE, BASELINE = "schema_migrations", "006"
 KNOWN_TABLES = (LEDGER_TABLE,) + sum(TABLE_GROUPS.values(), ())
@@ -74,6 +75,9 @@ GRANTS = {
     "eval_sets": ("SELECT", "INSERT", "UPDATE"), "eval_cases": ROW_PRIVILEGES, "eval_issue_notes": ROW_PRIVILEGES,
     "eval_set_versions": ("SELECT", "INSERT", "UPDATE"), "eval_batches": ("SELECT", "INSERT"), "eval_predictions": ("SELECT", "INSERT"),
     "eval_comparisons": ("SELECT", "INSERT", "UPDATE"), "eval_judgments": ("SELECT", "INSERT", "UPDATE"), "eval_reports": ("SELECT", "INSERT"),
+    # Executed case runs (018): both tables are updated in place until the run finishes; the trigger, not a missing
+    # UPDATE grant, freezes them. Nothing deletes a run except the workspace cascade, which the app role does not issue.
+    "eval_case_runs": ("SELECT", "INSERT", "UPDATE"), "eval_case_results": ("SELECT", "INSERT", "UPDATE"),
     # Research (017): sources/revisions/events are append-only; relationships are read-only until a writer exists.
     "research_projects": ("SELECT", "INSERT", "UPDATE"), "research_sources": ("SELECT", "INSERT"),
     "research_entities": ("SELECT", "INSERT", "UPDATE"), "research_claims": ("SELECT", "INSERT", "UPDATE"),

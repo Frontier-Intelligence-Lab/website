@@ -408,7 +408,7 @@ test('mutations outside the allowlist are refused by registered route, whatever 
     }
   }
   assert.equal(passed, DEMO_ALLOWED_MUTATIONS.length, 'every allowlisted pattern is a registered route the gate lets through');
-  assert.equal(denied, 23, 'the denied set covers account, workspace, team, runner, job, plan approval, Capital send, credit and staff routes');
+  assert.equal(denied, 24, 'the denied set covers account, workspace, team, runner, job, case-run start, plan approval, Capital send, credit and staff routes');
 
   for (const url of ['/api/workspaces/slug-available?slug=x', '/api/staff/reviews', '/api/staff/capital', `/api/staff/reviews/${randomUUID()}`, `/api/staff/capital/${randomUUID()}`]) {
     const res = await c.get(url);

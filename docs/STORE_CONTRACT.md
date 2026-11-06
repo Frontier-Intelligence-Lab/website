@@ -150,7 +150,20 @@ Both stores implement the same methods. Rules live in `src/lib/eval.js` and `doc
 | `createEvalComparison` / `setEvalBlind` / `recordEvalJudgment` / `readEvalComparison` | the comparison; blind changes are refused after the first judgment |
 | `approveEvalReport` / `getEvalReport` / `listEvalReports` | the frozen report, or null |
 
+## Executed case runs
+
+Both stores implement the same methods. Rules live in `src/lib/case-run.js`. Postgres additionally enforces them in `018_case_runs.sql`. A score is written only after the run is `complete`. Partial, failed, and cancelled runs keep posted outputs and error explanations and store no score. Runner-supplied scores are dropped. `caseRunInputs` returns `{ caseKey, input }` only.
+
+| Method | Returns / throws |
+| --- | --- |
+| `startCaseRun` | the run · `not_found`, `invalid_state` (stale runner, bad candidate, idempotency conflict) |
+| `appendCaseResults` | the run · `invalid_state` (nothing saved on a bad batch or a job that is not held) |
+| `settleCaseRun` | the terminal run; repeating it returns the same row |
+| `caseRunInputs` / `getCaseRun` / `listCaseRuns` | inputs without expected answers; one run; runs for a version without passages or results |
+
 ## Changelog
+
+- **v18:** Executed case runs (`018_case_runs.sql`). `eval_case_runs` and `eval_case_results` belong to one frozen evaluation version and one `case_eval` job. The job kind `evaluate` stays the post-training metric. A run stores scores only when every case was answered and the job succeeded. The app role gets `SELECT, INSERT, UPDATE` and no `DELETE`. A finished run rejects later output changes. See `docs/EVALUATION.md` and `docs/RUNNERS.md`.
 
 - **v17:** Research projects and evidence (`017_research.sql`). Separate from dataset projects: a research row never enters the review or approval state machine. Tables cover projects, sources, entities, claims, relationships, directory membership, lists, runs, run events, revisions and duplicate candidates. Both stores share `planImport` in `src/lib/research.js`. Source snapshots are immutable and versioned. Project updates are atomic partial patches; list reads validate their project/workspace and return distinct members. A completed run requires a running predecessor and a stored object report with a citations array; failed or cancelled runs cannot store output. Claims that disagree stay `conflicting`. Same name and kind with a different external key is a duplicate candidate, not a merge. Workspace id is required on every research read and write.
 

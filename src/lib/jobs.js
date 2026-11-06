@@ -4,7 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
  * Valcairn Runners and jobs: key handling and validation of everything a runner sends. A runner is untrusted
  * input like any client, so every field is bounded and typed here before it reaches the store.
  */
-export const JOB_KINDS = ['probe', 'train', 'evaluate', 'export'];
+export const JOB_KINDS = ['probe', 'train', 'evaluate', 'export', 'case_eval'];
 export const EVENT_KINDS = ['log', 'metric', 'stage', 'artifact'];
 // Failure categories a runner may report. Free text from a sandbox can echo data, so only the category is stored.
 export const FAILURES = ['cancelled', 'sandbox_unavailable', 'sandbox_error', 'out_of_memory', 'disk_full', 'dataset_error',
@@ -121,6 +121,8 @@ export function buildJobSpec({ kind, run, catalog, trainJob = null }) {
     if (run) return { errors: { enhanceRunId: 'A sandbox check does not use a plan.' } };
     return { values: { checks: ['gpu', 'sandbox', 'ollama'] } };
   }
+  // case_eval is created only by a frozen evaluation. The public queue must not skip that check.
+  if (kind === 'case_eval') return { errors: { kind: 'Start a case run from the frozen evaluation. This queue is for probe, training, the post-training metric and export.' } };
   if (!run) return { errors: { enhanceRunId: 'Choose an approved enhance plan.' } };
   if (run.status !== 'requested') return { errors: { enhanceRunId: 'Approve this plan before you run it.' } };
   if (run.compute !== 'runner') return { errors: { enhanceRunId: 'This plan is set to run on a GPU provider, not on your runner.' } };
@@ -209,6 +211,8 @@ const RESULT_SCHEMAS = {
     samples: T.arr(sample, 5),
   }, ['gguf']),
   evaluate: T.obj({ evaluation: T.obj({ metric: T.str(200), base: scores, tuned: scores }), samples: T.arr(sample, 5) }),
+  // Counts only. The case rows hold the outputs, and only a complete run stores a score.
+  case_eval: T.obj({ recipe: T.str(40), recipeVersion: T.str(20), answered: T.int, errors: T.int }, ['recipe', 'recipeVersion', 'answered', 'errors']),
 };
 
 /** The result to store for a successful job of this kind, or null if it is malformed. */
