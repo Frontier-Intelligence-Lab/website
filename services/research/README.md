@@ -21,7 +21,7 @@ Write one JSON object to stdin: `question`, `urls`, `search` (`wikimedia` or any
 
 The process refuses hosts that resolve to loopback, private, shared (100.64.0.0/10), link-local, deprecated site-local (fec0::/10), multicast, reserved, unspecified, or non-global addresses, and it refuses `localhost`, `.local`, `.internal` and the cloud metadata name. It connects to the resolved public address with the original name as the TLS server name. Certificate verification and hostname checks stay on. On Windows it also trusts the operating-system root store, because a standalone Python build can ship an older CA list. HTTPS only, port 443, no userinfo, at most 3 redirects, about 150 KB, 8 second timeout.
 
-The final Docker application image installs Python 3 and sets `RESEARCH_PYTHON=python3`; the migrator image does not install Python. Only the three worker package files and the existing company catalog are copied. No Python model packages or API credentials are installed.
+The final Docker application image installs Python 3 and provides a `python` executable for the adapter's existing default, without adding a runtime environment variable. An operator may still explicitly configure `RESEARCH_PYTHON`; the migrator image does not install Python. Only the three worker package files and the existing company catalog are copied. No Python model packages or API credentials are installed.
 
 The Node adapter observes an AbortSignal, kills a canceled/timed-out child, handles stdin errors and decodes split UTF-8 output correctly. Its 2MiB cap counts raw bytes. This is a local process boundary, not a hosted job scheduler. No HTTP cancellation route is introduced by this runtime-only unit.
 

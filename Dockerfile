@@ -27,9 +27,9 @@ USER node
 CMD ["node", "scripts/migrate.js"]
 
 FROM node:24-alpine
-RUN apk add --no-cache python3
+RUN apk add --no-cache python3 \
+    && if ! command -v python >/dev/null 2>&1; then ln -s /usr/bin/python3 /usr/local/bin/python; fi
 ENV NODE_ENV=production
-ENV RESEARCH_PYTHON=python3
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
