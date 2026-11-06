@@ -5,6 +5,7 @@ import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, refer
 import { snapshotHash } from '../lib/capital-hash.js';
 import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
 import { evalMemoryMethods } from './eval-memory.js';
+import { researchMemoryMethods } from './research-memory.js';
 
 // Review-relevant content can change only while a project is editable; submitting freezes it.
 const EDITABLE = ['draft', 'changes_requested'];
@@ -904,5 +905,9 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
 
     async close() {},
   };
-  return Object.assign(store, evalMemoryMethods({ stamp, copy, versions, projects, audit }));
+  return Object.assign(
+    store,
+    evalMemoryMethods({ stamp, copy, versions, projects, audit }),
+    researchMemoryMethods({ stamp, copy, workspaces, audit }),
+  );
 }
