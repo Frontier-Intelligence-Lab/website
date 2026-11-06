@@ -109,6 +109,7 @@ export const DEMO_ALLOWED_MUTATIONS = Object.freeze([
   `${P}/evaluations`, `${P}/evaluations/:setId`, `${P}/evaluations/:setId/cases`, `${P}/evaluations/:setId/cases/:caseId/delete`,
   `${P}/evaluations/:setId/import`, `${P}/evaluations/:setId/issues/note`, `${P}/evaluations/:setId/issues/note/delete`,
   `${P}/evaluations/:setId/freeze`, `${P}/evaluations/:setId/reopen`, `${P}/evaluations/:setId/versions/:versionId/predictions`,
+  `${P}/evaluations/:setId/versions/:versionId/runs`,
   `${P}/evaluations/:setId/comparisons`, `${P}/evaluations/comparisons/:comparisonId/blind`,
   `${P}/evaluations/comparisons/:comparisonId/judgments`, `${P}/evaluations/comparisons/:comparisonId/approve`,
   '/api/workspaces/:workspaceId/models/pulls', '/api/workspaces/:workspaceId/enhance-runs', '/api/workspaces/:workspaceId/enhance-runs/:runId',

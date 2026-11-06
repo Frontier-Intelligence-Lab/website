@@ -152,6 +152,14 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
     if (job.kind === 'probe') return problem(reply, 400, 'A sandbox check has no inputs.');
     // A cancelled job gets no new input grants. Links issued before the cancel stay valid until they expire.
     if (job.status === 'cancel_requested') return cancelled();
+    if (job.kind === 'case_eval') {
+      let payload;
+      try { payload = await store.caseRunInputs({ workspaceId: job.workspaceId, jobId: job.id }); }
+      catch (err) { return jobFail(reply, err); }
+      try { await store.releaseJobInputs({ ...who, versions: 1, files: payload.cases.length }); }
+      catch (err) { return err instanceof StoreError && err.code === 'invalid_state' ? cancelled() : jobFail(reply, err); }
+      return payload;
+    }
     const ingest = config.ingest;
     if (!ingest) return problem(reply, 503, 'File storage is not configured on this server.', { code: 'storage_unavailable' });
     // The complete response, signed links included, is prepared first, outside any lock. Nothing has been granted
@@ -184,7 +192,26 @@ export function registerJobRoutes(app, { config, store, helpers, guards }) {
     if (!held) return problem(reply, 404, 'Not found.');
     const result = validateFinish(request.body, held.kind);
     if (result.errors) return invalid(reply, result.errors);
-    try { return { job: forRunner(await store.finishJob({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body), ...result.values })) }; }
+    try {
+      const finished = await store.finishJob({ runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body), ...result.values });
+      if (held.kind === 'case_eval') await store.settleCaseRun({ workspaceId: held.workspaceId, jobId: held.id });
+      return { job: forRunner(finished) };
+    }
     catch (err) { return jobFail(reply, err); }
+  });
+
+  // Outputs for one case_eval job. The server drops any score the runner sends. A cancel still accepts rows
+  // so the kept answers can be shown, and it never stores a score.
+  app.post('/api/runner/jobs/:jobId/case-results', { ...runnerRoute, bodyLimit: 256 * 1024 }, async (request, reply) => {
+    const who = { runnerId: request.runner.id, jobId: request.params.jobId, leaseHash: lease(request.body) };
+    let job;
+    try { job = await store.touchJob(who); }
+    catch (err) { return jobFail(reply, err); }
+    if (job.kind !== 'case_eval') return problem(reply, 400, 'This job does not take case results.');
+    try { return { run: await store.appendCaseResults({ workspaceId: job.workspaceId, jobId: job.id, results: request.body?.results }) }; }
+    catch (err) {
+      if (err instanceof StoreError && err.code === 'invalid_state') return problem(reply, 409, err.message, { code: 'invalid_state' });
+      return jobFail(reply, err);
+    }
   });
 }

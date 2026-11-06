@@ -4,6 +4,7 @@ import { checkAnnotation, checkKind, computeIssues, kindFitsAnnotations, kindOf,
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
 import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
+import { caseRunMemoryMethods } from './case-run-memory.js';
 import { evalMemoryMethods } from './eval-memory.js';
 import { researchMemoryMethods } from './research-memory.js';
 
@@ -908,6 +909,7 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
   return Object.assign(
     store,
     evalMemoryMethods({ stamp, copy, versions, projects, audit }),
+    caseRunMemoryMethods({ stamp, copy, audit }),
     researchMemoryMethods({ stamp, copy, workspaces, audit }),
   );
 }

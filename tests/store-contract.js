@@ -995,4 +995,96 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal(reports[0].id, reports[1].id);
     assert.equal((await store.listEvalReports({ workspaceId: ctx.ws.id, comparisonId: comparison.id })).length, 1);
   });
+
+  withStore('an executed case run stores a score only when every case is answered', async (store) => {
+    const ctx = await evalReady(store, 'case-run');
+    const where = { workspaceId: ctx.ws.id, projectId: ctx.project.id };
+    const set = await store.createEvalSet({ ...where, createdBy: ctx.owner.id, name: 'Windows', purpose: 'development' });
+    await store.saveEvalCase({ ...where, setId: set.id, expectedRevision: 1, input: evalCase(ctx, 'window', { reviewCriteria: null, expectedAnswer: '30 days' }) });
+    await store.saveEvalCase({ ...where, setId: set.id, expectedRevision: 2, input: evalCase(ctx, 'other', { reviewCriteria: null, expectedAnswer: '30 days', input: 'Anything else?' }) });
+    const detail = await store.getEvalSet({ ...where, setId: set.id });
+    assert.equal(detail.issues.filter((issue) => issue.open).length, 0);
+    const frozen = await store.freezeEvalSet({ ...where, setId: set.id, expectedRevision: detail.set.revision, actorId: ctx.owner.id });
+    const runner = await store.createRunner({ workspaceId: ctx.ws.id, createdBy: ctx.owner.id, label: 'Bench', keyHash: 'c'.repeat(64), keyPrefix: 'vrk_case01' });
+    const cold = await store.createRunner({ workspaceId: ctx.ws.id, createdBy: ctx.owner.id, label: 'Cold', keyHash: 'e'.repeat(64), keyPrefix: 'vrk_case02' });
+    const base = { ...where, versionId: frozen.id, runnerId: runner.id, role: 'candidate', recipeVersion: '1', catalog: [], actorId: ctx.owner.id };
+    const candidate = { corpus: '30 days', prompt: 'Answer from the passage.', retrievalK: 1, boosts: [] };
+    const start = (idempotencyKey, extra = {}) => store.startCaseRun({ ...base, candidate, idempotencyKey, ...extra });
+    await assert.rejects(start('case-run-cold', { runnerId: cold.id }), { code: 'invalid_state' });
+    await assert.rejects(start('case-run-model', { candidate: { ...candidate, modelId: 'not-in-catalog' } }), { code: 'invalid_state' });
+    await store.reportRunner({ runnerId: runner.id, capabilities: { sandbox: { available: true } } });
+    const run = await start('case-run-pass-1');
+    assert.equal((await start('case-run-pass-1')).id, run.id);
+    await assert.rejects(start('case-run-pass-1', { candidate: { ...candidate, corpus: 'a different source' } }), { code: 'invalid_state' });
+    await assert.rejects(start('case-run-pass-1', { role: 'baseline' }), { code: 'invalid_state' });
+    assert.equal(run.settings.promptUsed, false);
+    assert.equal(run.runtime.modelId, null);
+    assert.equal(run.scored, false);
+    const listed = await store.listCaseRuns({ ...where, versionId: frozen.id });
+    assert.equal(listed[0].passages, undefined);
+    assert.equal(listed[0].passageCount, 1);
+    const leaseHash = 'd'.repeat(64);
+    const hold = async (jobId) => {
+      const leased = await store.leaseJob({ runnerId: runner.id, leaseHash });
+      assert.equal(leased.id, jobId);
+      return { runnerId: runner.id, jobId, leaseHash };
+    };
+    const inputs = await store.caseRunInputs({ workspaceId: ctx.ws.id, jobId: run.jobId });
+    assert.deepEqual(Object.keys(inputs.cases[0]).sort(), ['caseKey', 'input']);
+    await hold(run.jobId);
+    await assert.rejects(store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: run.jobId, results: [{ caseKey: 'missing-case', output: '30 days' }, { caseKey: 'window', output: '30 days' }] }), { code: 'invalid_state' });
+    await assert.rejects(store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: run.jobId, results: [{ caseKey: 'window', output: '30 days' }, { caseKey: 'window', output: 'other' }] }), { code: 'invalid_state' });
+    assert.equal((await store.getCaseRun({ ...where, runId: run.id })).results.length, 0);
+    const answer = (caseKey, extra = {}) => ({ caseKey, output: '30 days', citations: ['p1'], latencyMs: 4, scores: { verdict: 'pass' }, ...extra });
+    await store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: run.jobId, results: [answer('window'), answer('other')] });
+    await store.finishJob({ ...(await Promise.resolve({ runnerId: runner.id, jobId: run.jobId, leaseHash })), outcome: 'succeeded', result: { recipe: 'support-qa', recipeVersion: '1', answered: 2, errors: 0 } });
+    const passed = await store.getCaseRun({ ...where, runId: run.id });
+    assert.equal(passed.status, 'complete');
+    assert.equal(passed.scored, true);
+    assert.deepEqual(passed.results.map((row) => row.scores.verdict), ['pass', 'pass']);
+    assert.equal(passed.results.every((row) => !row.explanation.includes('30 days')), true);
+    const again = await store.settleCaseRun({ workspaceId: ctx.ws.id, jobId: run.jobId });
+    assert.equal(again.finishedAt, passed.finishedAt);
+    await assert.rejects(store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: run.jobId, results: [answer('window', { output: 'changed' })] }), { code: 'invalid_state' });
+
+    const partial = await start('case-run-partial');
+    await hold(partial.jobId);
+    await store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: partial.jobId, results: [{ caseKey: 'window', errorKind: 'timeout' }, answer('other')] });
+    await store.finishJob({ runnerId: runner.id, jobId: partial.jobId, leaseHash, outcome: 'succeeded', result: { recipe: 'support-qa', recipeVersion: '1', answered: 1, errors: 1 } });
+    const mixed = await store.settleCaseRun({ workspaceId: ctx.ws.id, jobId: partial.jobId });
+    const timedOut = mixed.results.find((row) => row.caseKey === 'window');
+    const clean = mixed.results.find((row) => row.caseKey === 'other');
+    assert.deepEqual([mixed.status, mixed.scored, timedOut.scores, timedOut.output, clean.scores, clean.explanation, clean.output], ['partial', false, null, null, null, null, '30 days']);
+    assert.match(timedOut.explanation, /not a wrong answer/);
+
+    const cancelled = await start('case-run-cancel');
+    await hold(cancelled.jobId);
+    await store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: cancelled.jobId, results: [answer('window')] });
+    await store.finishJob({ runnerId: runner.id, jobId: cancelled.jobId, leaseHash, outcome: 'failed', failure: 'cancelled' });
+    const stopped = await store.settleCaseRun({ workspaceId: ctx.ws.id, jobId: cancelled.jobId });
+    const kept = stopped.results.find((row) => row.caseKey === 'window');
+    const absent = stopped.results.find((row) => row.caseKey === 'other');
+    assert.equal(stopped.status, 'cancelled');
+    assert.equal(stopped.scored, false);
+    assert.deepEqual([kept.output, kept.scores, kept.explanation, absent.errorKind, absent.scores], ['30 days', null, null, 'missing', null]);
+
+    const empty = await start('case-run-empty', { candidate: { corpus: '', prompt: '', retrievalK: 1, boosts: [] } });
+    await hold(empty.jobId);
+    await store.appendCaseResults({ workspaceId: ctx.ws.id, jobId: empty.jobId, results: [answer('window'), answer('other')] });
+    await store.finishJob({ runnerId: runner.id, jobId: empty.jobId, leaseHash, outcome: 'succeeded', result: { recipe: 'support-qa', recipeVersion: '1', answered: 0, errors: 2 } });
+    const nosource = await store.settleCaseRun({ workspaceId: ctx.ws.id, jobId: empty.jobId });
+    assert.equal(nosource.status, 'failed');
+    assert.equal(nosource.scored, false);
+    assert.deepEqual(nosource.results.map((row) => [row.errorKind, row.output, row.scores]), [['no_source', null, null], ['no_source', null, null]]);
+
+    const imported = await store.importEvalPredictions({ ...where, versionId: frozen.id, role: 'baseline', label: 'imported', claimedSystem: { identity: 'claimed' }, claimedScorer: null, filename: 'answers.jsonl', jsonl: '{"id":"window","status":"answered","output":"30 days"}\n{"id":"other","status":"answered","output":"30 days"}\n', importedBy: ctx.owner.id });
+    const quiet = await start('case-run-list');
+    await hold(quiet.jobId);
+    await store.finishJob({ runnerId: runner.id, jobId: quiet.jobId, leaseHash, outcome: 'failed', failure: 'cancelled' });
+    const fromList = (await store.listCaseRuns({ ...where, versionId: frozen.id })).find((item) => item.id === quiet.id);
+    assert.equal(fromList.status, 'cancelled');
+    assert.equal(fromList.scored, false);
+    assert.equal(imported.batch.label, 'imported');
+    assert.equal((await store.getEvalSet({ ...where, setId: set.id })).comparisons.length, 0);
+  });
 }

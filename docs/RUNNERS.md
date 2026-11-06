@@ -2,7 +2,7 @@
 
 A **runner** is a machine a workspace owns, a workstation or a GPU server, linked to Valcairn so jobs can run on it: sandbox checks now, and training, evaluation and export as those workers land. The web server never connects to a runner. The runner always calls in over HTTPS with its own key, so it works from a laptop behind NAT and needs no open port.
 
-Status: the queue, the runner API and their tests are implemented (`migrations/014_jobs.sql`, `src/jobs.js`, `src/lib/jobs.js`). The runner program and the training, evaluation and export workers are separate increments; until they land, a job waits in the queue and nothing executes it.
+Status: the runner program in `services/runner` handles `probe`, `train`, `export`, and `case_eval` (`migrations/014_jobs.sql`, `migrations/018_case_runs.sql`, `src/jobs.js`, `src/lib/jobs.js`). The job kind `evaluate` remains the post-training base-versus-tuned metric and still has no handler.
 
 ## How it works
 
@@ -17,6 +17,10 @@ Person (browser, session cookie)                  Runner (its machine, bearer ke
 ```
 
 Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `cancelled`. While a runner holds a job it can also be `cancel_requested`.
+
+## Case-set execution
+
+`case_eval` runs the vetted `support-qa` recipe inside the training image with no network. Start it from a frozen evaluation (`POST .../evaluations/:setId/versions/:versionId/runs`), not from `POST /jobs`. The public queue rejects this kind. The runner posts outputs to `POST /api/runner/jobs/:jobId/case-results`. Retrieval depths 1–20 retain up to 20 passage/citation receipts per case. The runner batches at most 20 rows and bounds the actual JSON-encoded envelope to 256 KiB, including escaped Unicode and the lease token; cancellation stops subsequent uploads while preserving accepted partial results. The server scores them and drops any score the runner sends. The start request accepts a corpus of at most 100,000 characters; its body limit is 768 KiB, above the 32 KiB default. A repeated request key with a different role, corpus, or settings is refused. Listing runs settles one whose job has already finished, so a cancelled job is not left looking queued. A partial, failed, or cancelled run is kept and is not scored. The recipe version is `EVAL_RECIPE_VERSION` (default `1`). A model id, when set, must be in the catalog; this server does not call it. An empty corpus is an honest `no_source` failure, not a wrong answer.
 
 ## In the app
 
@@ -59,7 +63,8 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 | `POST /api/runner/jobs/:jobId/heartbeat` | `{ leaseToken }` | `{ job }`; extends the lease. |
 | `POST /api/runner/jobs/:jobId/events` | `{ leaseToken, events: [{ seq, kind, data }] }` (1 to 50) | `{ added, job }`. |
 | `POST /api/runner/jobs/:jobId/inputs` | `{ leaseToken }` | Training, evaluation and export only: `{ baseModel: { id, source, license }, datasets: [{ projectId, version, files: [{ id, filename, sha256, sizeBytes, contentType, url }] }], expiresInSeconds }`. Files come from each frozen version's manifest, with signed download links valid for 15 minutes. Refused with `409 dataset_unavailable` if a version is gone or its rights record no longer allows training, and `503 storage_unavailable` without file storage. The complete response is prepared and signed first, then released under the job row lock: `409 job_cancelled` if a cancel was committed by then, `409 lease_lost` if the lease ran out or a revoke failed the job, and in either case nothing prepared leaves and nothing is recorded. Otherwise recorded as `job.inputs_released` (with the version and file counts of that payload) and returned unchanged. |
-| `POST /api/runner/jobs/:jobId/finish` | `{ leaseToken, outcome: 'succeeded', result }` or `{ leaseToken, outcome: 'failed', failure, retryable? }` | `{ job }`. `result` must match the job kind's schema. After cancel the job ends `cancelled` either way. |
+| `POST /api/runner/jobs/:jobId/finish` | `{ leaseToken, outcome: 'succeeded', result }` or `{ leaseToken, outcome: 'failed', failure, retryable? }` | `{ job }`. `result` must match the job kind's schema. After cancel the job ends `cancelled` either way. A finished `case_eval` job then settles its case run. |
+| `POST /api/runner/jobs/:jobId/case-results` | `{ leaseToken, results }` (1 to 40), body limit 256 KiB | `{ run }` for a held `case_eval` job, including `cancel_requested`. The server ignores runner scores. A duplicate key, an unknown case, or a finished run writes nothing (`409`, and the message says nothing was saved). |
 
 Errors: `401 runner_key_invalid`, `401 runner_owner_inactive`, `404` (another runner's job), `409 lease_lost`, `400 { errors }` for invalid input. The runner API allows 600 requests per minute per address.
 

@@ -5,6 +5,7 @@ import { boxNotStoredForm, frozenBoxViolations } from '../lib/box-sql.js';
 import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, referencesResolve } from '../lib/capital.js';
 import { snapshotHash } from '../lib/capital-hash.js';
 import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
+import { caseRunPostgresMethods } from './case-run-postgres.js';
 import { evalPostgresMethods } from './eval-postgres.js';
 import { researchPostgresMethods } from './research-postgres.js';
 
@@ -64,6 +65,9 @@ function databaseError(error) {
   if (error.code === 'P0001' && ['submission_frozen', 'credit_record_frozen', 'review_mark_frozen'].includes(error.message)) return new StoreError('invalid_state');
   // Raised by migrations/015_evaluation.sql when a frozen evaluation row is rewritten or deleted.
   if (error.code === 'P0001' && error.message === 'eval_frozen') return new StoreError('invalid_state', 'This evaluation record is frozen. Start a new version instead of changing the approved one.');
+  // Raised by migrations/018_case_runs.sql: a score on an unfinished run, or a change after the run finished.
+  if (error.code === 'P0001' && error.message === 'eval_unscored') return new StoreError('invalid_state', 'A run that is not complete has no score.');
+  if (error.code === 'P0001' && error.message === 'eval_case_run_frozen') return new StoreError('invalid_state', 'This case run has finished and can no longer be changed.');
   // PostgreSQL details can contain complete rows, including hashes or private data.
   const safe = new Error('Postgres operation failed');
   if (typeof error.code === 'string') safe.code = error.code;
@@ -1295,6 +1299,7 @@ export function createPostgresStore(options) {
   return Object.assign(
     store,
     evalPostgresMethods({ query, transaction, isId, iso, addAudit }),
+    caseRunPostgresMethods({ query, transaction, isId, iso, addAudit }),
     researchPostgresMethods({ query, transaction, isId, addAudit }),
   );
 }

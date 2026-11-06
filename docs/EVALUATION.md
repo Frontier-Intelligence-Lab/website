@@ -2,7 +2,9 @@
 
 A team that already has a support or document assistant can see which answers fail, tie each failure to the source version they cited, correct the case or the source, and check the next imported answers against a rule they approved.
 
-Training is not part of this loop. A failure may need a better document, a retrieval change, a prompt change, or an abstention. Valcairn does not call a model, run an uploaded scorer, or start a job from these pages.
+Training is not part of the imported-answer comparison loop. A failure may need a better document, a retrieval change, a prompt change, or an abstention. Imported comparisons do not call a model, run an uploaded scorer, or start training. The case-run API can start the extractive sandbox recipe described below; this backend increment does not add a start form.
+
+Executed case runs are a separate record (`migrations/018_case_runs.sql`, `src/lib/case-run.js`). An owner or admin starts one runner job for one frozen version. The `support-qa` recipe extracts the highest-ranked source passage inside the sandbox; it makes no model call. The server scores exact fact, rubric, and citation, and stores token overlap only as a diagnostic labelled "token overlap". Imported batches stay claims. A case run does not create a comparison. A partial, failed, or cancelled run is kept and has no score.
 
 The labels `development` and `final_assessment` say how the team uses the set. Neither label means the set is secret, leakage-free, or representative of later traffic.
 
@@ -94,6 +96,8 @@ A person who is not a member of the workspace gets 404 on every evaluation route
 ## Database
 
 `migrations/015_evaluation.sql` creates the evaluation tables. It does not read or write the jobs tables. `014_jobs.sql` (Runners and jobs) is part of this source and independent of it: 014 sorts first, 015 still applies, and a database that has only one of the two applies the other later as a new file. Do not edit a migration that has already been applied.
+
+`migrations/018_case_runs.sql` adds `eval_case_runs` and `eval_case_results` and widens the jobs checks so `case_eval` may exist with a null enhance plan. Apply 018 before a build that starts case runs. `EVAL_RECIPE_VERSION` defaults to `1` and must match `^[A-Za-z0-9._-]{1,20}$`.
 
 Frozen version rows, batches, predictions, and reports reject `UPDATE` and `DELETE` in Postgres, including direct SQL. Case rows and issue notes reject writes while the set is frozen, and accept them again after it is reopened. Deleting a workspace that still has a frozen evaluation version fails, because those child rows cannot be deleted. Tests clear tables with `TRUNCATE`, which does not run those delete triggers. Do not add a bypass so a workspace can be deleted through the frozen rows.
 

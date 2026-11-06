@@ -20,6 +20,7 @@ import { registerWorkspaceDataRoutes } from './workspace-data.js';
 import { registerModelRoutes } from './models.js';
 import { registerDeviceRoutes } from './devices.js';
 import { registerCapitalRoutes } from './capital.js';
+import { registerCaseRunRoutes } from './case-runs.js';
 import { registerEvalRoutes } from './eval.js';
 import { registerJobRoutes } from './jobs.js';
 import { registerResearchRoutes } from './research.js';
@@ -173,6 +174,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   registerDeviceRoutes(app, { config, store: accountStore, helpers, guards });
   registerCapitalRoutes(app, { config, store: accountStore, helpers, guards });
   registerEvalRoutes(app, { store: accountStore, helpers, guards });
+  registerCaseRunRoutes(app, { config, store: accountStore, helpers, guards });
   registerJobRoutes(app, { config, store: accountStore, helpers, guards });
   registerResearchRoutes(app, { config, store: accountStore, helpers, guards });
   for (const url of DEMO_ALLOWED_MUTATIONS) if (!registeredRoutes.has(`POST ${url}`)) throw new Error(`reviewer demo allowlist names an unregistered route: POST ${url}`);
