@@ -3,6 +3,7 @@ import { Link, redirect, useLoaderData, useLocation, useNavigate } from 'react-r
 import { api } from '../api.js';
 import { ThemeToggle } from '../theme.jsx';
 import { FieldError, Tile, nextPath } from './ui.jsx';
+import { safeNext, signInResult } from '../signin.js';
 
 const PERSONAL = ['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'proton.me', 'protonmail.com', 'aol.com'];
 
@@ -39,8 +40,6 @@ function AuthLayout({ children }) {
   );
 }
 
-// Only same-site paths may be used as a post-sign-in destination.
-const safeNext = (value) => (typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : null);
 const params = (request) => new URL(request.url).searchParams;
 
 export async function signUpLoader({ request }) {
@@ -118,11 +117,10 @@ export function SignIn() {
   async function submit(event) {
     event.preventDefault();
     setPending(true);
-    const res = await api.signin(Object.fromEntries(new FormData(event.currentTarget))).catch(() => null);
+    const result = await signInResult(Object.fromEntries(new FormData(event.currentTarget)), next);
     setPending(false);
-    if (!res?.ok) return setMessage(res?.data.error ?? 'Sign-in failed. Please try again.');
-    const account = await api.account();
-    return navigate(next && account.user.emailVerifiedAt ? next : nextPath(account), { state: { next } });
+    if (result.error) return setMessage(result.error);
+    return navigate(result.to, { state: { next } });
   }
 
   return (
@@ -134,10 +132,9 @@ export function SignIn() {
           <p className="ob-muted">New here? <Link to={next ? `/signup?next=${encodeURIComponent(next)}` : '/signup'}>Create an account</Link></p>
         </div>
         {message && <p className="ob-alert" role="alert">{message}</p>}
-        <div className="ob-field"><label htmlFor="email">Email</label><input id="email" name="email" type="email" autoComplete="email" maxLength={254} defaultValue={email} /></div>
+        <div className="ob-field"><label htmlFor="email">Email or username</label><input id="email" name="email" type="text" autoComplete="username" autoCapitalize="none" spellCheck={false} maxLength={254} defaultValue={email} /></div>
         <div className="ob-field"><label htmlFor="password">Password</label><input id="password" name="password" type="password" autoComplete="current-password" maxLength={256} /></div>
         <button className="btn-app btn-block" type="submit" disabled={pending}>{pending ? 'Signing in…' : 'Sign in'}</button>
-        <p className="ob-muted">Invited reviewers use the <Link to="/demo">demo login</Link> instead.</p>
       </form>
     </AuthLayout>
   );

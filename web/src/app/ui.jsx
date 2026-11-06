@@ -83,13 +83,7 @@ export function FieldError({ id, children }) {
 }
 
 // Where a signed-in person should land, based on what they have set up so far.
-export function nextPath(account) {
-  if (!account?.user) return '/signup';
-  if (!account.user.emailVerifiedAt) return '/verify';
-  if (account.match) return '/setup/match';
-  const first = account.workspaces[0];
-  return first ? `/w/${first.slug}` : '/start';
-}
+export { nextPath } from '../signin.js';
 
 export async function requireVerified() {
   const account = await api.account();
