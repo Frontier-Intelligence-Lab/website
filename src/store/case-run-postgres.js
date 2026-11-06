@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
 import { MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
-import { RECIPE_ID, acceptBatch, decideRun, presentRun, runnerFresh, unscoredRun, validateCandidate } from '../lib/case-run.js';
+import { RECIPE_ID, acceptBatch, decideRun, listRunView, presentRun, runnerFresh, unscoredRun, validateCandidate } from '../lib/case-run.js';
 
 const invalid = (message) => new StoreError('invalid_state', message);
 const KEY = /^[A-Za-z0-9_-]{8,100}$/;
@@ -167,9 +167,7 @@ export function caseRunPostgresMethods({ query, transaction, isId, iso, addAudit
       for (const row of rows) {
         const full = await this.getCaseRun({ workspaceId, projectId, runId: row.id });
         if (!full) continue;
-        delete full.results;
-        delete full.passages;
-        views.push(full);
+        views.push(listRunView(full));
       }
       return views;
     },

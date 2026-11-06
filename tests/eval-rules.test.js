@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { snapshotHash } from '../src/lib/capital-hash.js';
+import { changeKind, changeLabel, importRows, isPass, runnerRows } from '../src/lib/eval-shared.js';
 import {
   MAX_CASES, MAX_IMPORT_BYTES, SYNTHETIC_CASES, SYNTHETIC_PREDICTIONS, buildComparison, buildReportSnapshot, computeEvalIssues,
   defaultAcceptance, mapBlindDecisions, normalizeText, parseCaseJsonl, parsePredictionJsonl, scoreSide, tokenOverlap, validateAcceptance, wilson95,
@@ -201,6 +202,75 @@ test('blind review rejects named decisions, and the report hash ignores the appr
   const reordered = snapshotHash({ limitations: snapshot.limitations, schema: snapshot.schema, ...snapshot });
   assert.equal(snapshotHash(snapshot), reordered);
   assert.notEqual(snapshotHash(snapshot), snapshotHash({ ...snapshot, approvedAt: 'later' }), 'approval time stays on the report row, outside the hashed snapshot');
+});
+
+test('triage keeps a pass only when both sides passed, and an error is not a wrong answer', () => {
+  assert.equal(isPass('fail'), false);
+  assert.equal(isPass('needs_judgment'), false);
+  assert.equal(isPass('error'), false);
+  assert.equal(changeKind('pass', 'pass'), 'kept');
+  assert.equal(changeKind('fail', 'pass'), 'fixed');
+  assert.equal(changeKind('missing', 'pass'), 'fixed');
+  assert.equal(changeKind('pass', 'fail'), 'regressed');
+  assert.equal(changeKind('pass', 'needs_judgment'), 'regressed');
+  assert.equal(changeKind('pass', 'error'), 'regressed');
+  assert.equal(changeKind('fail', 'fail'), 'still');
+  assert.equal(changeKind('missing', 'missing'), 'still');
+  assert.equal(changeKind('error', 'error'), 'still');
+  assert.equal(changeLabel('regressed', 'pass', 'error'), 'Error');
+  assert.equal(changeLabel('still', 'error', 'error'), 'Error');
+  assert.equal(changeLabel('still', 'fail', 'fail'), 'Still failing');
+  assert.equal(changeKind('pass', 'pass', 'answered', 'error'), 'regressed');
+  assert.equal(changeLabel('regressed', 'pass', 'pass', 'answered', 'error'), 'Error');
+  const judgedError = importRows({
+    hidden: false,
+    leftRole: 'baseline',
+    cases: [{
+      caseKey: 'judged-error',
+      severity: 'major',
+      left: { outcome: 'pass', status: 'answered', decision: null, auto: { result: 'pass' } },
+      right: { outcome: 'disagreement', status: 'error', decision: 'fail', auto: { result: 'error' } },
+    }],
+  });
+  assert.equal(judgedError[0].label, 'Error');
+  assert.equal(judgedError[0].change, 'regressed');
+  assert.equal(judgedError[0].candidateOutcome, 'disagreement');
+
+  const hidden = importRows({ hidden: true, cases: [] });
+  assert.equal(hidden, null);
+  const swapped = importRows({
+    hidden: false,
+    leftRole: 'candidate',
+    rightRole: 'baseline',
+    cases: [{ caseKey: 'crit', severity: 'critical', left: { outcome: 'pass', status: 'answered', decision: null, auto: { result: 'pass' } }, right: { outcome: 'fail', status: 'answered', decision: 'fail', auto: { result: 'fail' } } }],
+  });
+  assert.equal(swapped[0].baselineOutcome, 'fail');
+  assert.equal(swapped[0].candidateOutcome, 'pass');
+  assert.equal(swapped[0].change, 'fixed');
+  assert.equal(swapped[0].needsJudgment, true);
+  assert.equal(swapped[0].attention, true);
+  assert.equal(swapped[0].split, null);
+
+  const rows = runnerRows(
+    [{ caseKey: 'kept', severity: 'minor', input: 'one' }, { caseKey: 'miss', severity: 'critical', input: 'two' }],
+    [{ caseKey: 'kept', scores: { verdict: 'pass' } }, { caseKey: 'miss', errorKind: 'timeout', explanation: 'This is an error, not a wrong answer.', scores: null }, { caseKey: 'extra', scores: { verdict: 'fail' } }],
+    [{ caseKey: 'kept', scores: { verdict: 'pass' } }, { caseKey: 'miss', scores: { verdict: 'needs_judgment' } }, { caseKey: 'extra', scores: null }],
+  );
+  const byKey = Object.fromEntries(rows.map((item) => [item.caseKey, item]));
+  assert.equal(byKey.kept.change, 'kept');
+  assert.equal(byKey.kept.needsJudgment, false);
+  assert.equal(byKey.miss.baselineOutcome, 'error');
+  assert.equal(byKey.miss.label, 'Error');
+  assert.equal(byKey.miss.candidateOutcome, 'needs_judgment');
+  assert.equal(byKey.miss.change, 'still');
+  assert.equal(byKey.miss.needsJudgment, true);
+  assert.equal(byKey.extra.candidateOutcome, 'missing');
+  assert.equal(byKey.extra.input, null);
+  assert.equal(byKey.extra.change, 'still');
+  const unscored = runnerRows([{ caseKey: 'kept', severity: 'critical' }], [{ caseKey: 'kept', scores: null }], [{ caseKey: 'kept', scores: { verdict: 'pass' } }]);
+  assert.equal(unscored[0].baselineOutcome, 'missing');
+  assert.equal(unscored[0].change, 'fixed');
+  assert.equal(unscored[0].needsJudgment, true);
 });
 
 test('the documented examples match the synthetic fixtures', () => {

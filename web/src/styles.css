@@ -969,7 +969,32 @@ th:has(> .sr-only) { position: relative; }
 .eval-tabs [role="tab"] { font: inherit; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
 .eval-tabs [role="tab"][aria-selected="true"] { background: var(--solid); color: var(--on-solid); border-color: var(--solid); }
 .eval-pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; }
-@media (max-width: 720px) { .eval-grid { grid-template-columns: 1fr; } }
+.eval-compare-head { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.eval-runs { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: stretch; }
+.eval-runs .eval-matrix { grid-column: 1 / -1; }
+.eval-vs { align-self: center; margin: 0; color: var(--muted); }
+.eval-score { margin: 0; font-size: 28px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.eval-score small { font-size: 14px; font-weight: 500; color: var(--muted); }
+.eval-pills { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; }
+.eval-kv { display: grid; gap: 6px; margin: 0; }
+.eval-kv div { display: grid; grid-template-columns: 88px 1fr; gap: 8px; }
+.eval-kv dt { color: var(--muted); }
+.eval-kv dd { margin: 0; overflow-wrap: anywhere; }
+.eval-matrix { display: grid; grid-template-columns: auto 1fr 1fr; gap: 8px; align-items: stretch; }
+.eval-axis { font-size: 12px; color: var(--muted); align-self: center; }
+.eval-cell, .eval-chip { font: inherit; text-align: left; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 10px; padding: 10px 12px; cursor: pointer; }
+.eval-cell { display: flex; flex-direction: column; gap: 4px; min-height: 64px; }
+.eval-cell b { font-size: 22px; font-variant-numeric: tabular-nums; }
+.eval-cell--regressed { background: var(--warn-bg); }
+.eval-cell[aria-pressed="true"], .eval-chip[aria-pressed="true"] { border-color: var(--text); }
+.eval-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.eval-chip { border-radius: 999px; }
+.eval-inspect { display: flex; flex-direction: column; gap: 8px; }
+@media (max-width: 720px) {
+  .eval-grid { grid-template-columns: 1fr; }
+  .eval-runs { grid-template-columns: 1fr; }
+  .eval-vs, .eval-hide-sm { display: none; }
+}
 
 /* Research evidence and actions keep their full reading width on phones. */
 @media (max-width: 720px) {

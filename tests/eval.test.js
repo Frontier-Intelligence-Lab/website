@@ -218,6 +218,8 @@ test('imports roll back, scores keep the denominator, and the export is the appr
   const hidden = await owner.get(`${base}/comparisons/${comparison.id}`);
   assert.equal(hidden.json().baseline, undefined);
   assert.equal(hidden.json().comparison.baselineBatchId, undefined);
+  assert.equal(typeof hidden.json().version.number, 'number');
+  assert.equal(hidden.json().version.contentHash, frozen.json().version.contentHash);
   const hours = await owner.post(`${base}/comparisons/${comparison.id}/judgments`, {
     expectedRevision: reviewed.json().comparison.revision, caseKey: 'hours', note: 'The exact match missed the Sunday exception.', leftDecision: 'fail', rightDecision: 'pass', leftAdjudication: 'human',
   });

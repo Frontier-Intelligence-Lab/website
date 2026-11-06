@@ -1,12 +1,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptBatch, acceptPosted, decideRun, runnerFresh, validateCandidate } from '../src/lib/case-run.js';
+import { acceptBatch, acceptPosted, decideRun, listRunView, runnerFresh, validateCandidate } from '../src/lib/case-run.js';
 import { buildJobSpec, projectResult } from '../src/lib/jobs.js';
 import { loadConfig } from '../src/config.js';
 
 const cases = [{ caseKey: 'window', input: 'How long?', expectedAnswer: '30 days', reviewCriteria: null }];
 const posted = (extra = {}) => new Map([['window', { caseKey: 'window', output: '30 days', errorKind: null, passages: [], citations: ['p1'], latencyMs: 1, ...extra }]]);
 const corpus = [{ id: 'p1', citation: 'p1', text: '30 days' }];
+
+test('a run list withholds the pass count unless the run is complete and scored', () => {
+  const partial = listRunView({ status: 'partial', scored: false, passages: [{ id: 'p1' }], results: [{ scores: { verdict: 'pass' } }] });
+  assert.equal(partial.passCount, null);
+  assert.equal(partial.caseCount, 1);
+  assert.equal(partial.passages, undefined);
+  assert.equal(partial.results, undefined);
+  const cancelled = listRunView({ status: 'cancelled', scored: false, passages: [], results: [] });
+  assert.equal(cancelled.passCount, null);
+  const failed = listRunView({ status: 'failed', scored: true, passages: [], results: [{ scores: { verdict: 'pass' } }] });
+  assert.equal(failed.passCount, null);
+  const done = listRunView({ status: 'complete', scored: true, passages: [], results: [{ scores: { verdict: 'pass' } }, { scores: { verdict: 'fail' } }, { scores: { verdict: 'needs_judgment' } }] });
+  assert.equal(done.passCount, 1);
+  assert.equal(done.caseCount, 3);
+});
 
 test('runner freshness keeps the exact minute bound and rejects future, absent and invalid reports', () => {
   const now = Date.parse('2026-01-01T00:01:00.000Z');

@@ -189,6 +189,16 @@ export function presentResult(row, scored) {
   return { ...row, scores: null, explanation: row.errorKind ? row.explanation : null };
 }
 
+/** List shape. Passages stay off the list. A pass count exists only for a complete scored run. */
+export function listRunView(full) {
+  const scored = full.scored === true && full.status === 'complete';
+  const results = full.results ?? [];
+  const view = { ...full, caseCount: results.length, passCount: scored ? results.filter((row) => row.scores?.verdict === 'pass').length : null };
+  delete view.results;
+  delete view.passages;
+  return view;
+}
+
 export function presentRun(run, results) {
   const scored = run.scored === true && run.status === 'complete';
   return {
