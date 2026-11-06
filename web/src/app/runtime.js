@@ -42,7 +42,13 @@ export function createRuntime(origin) {
     }
     return res;
   }
-  const json = async (path, opts) => (await call(path, opts)).json();
+  const json = async (path, opts) => {
+    try { return await (await call(path, opts)).json(); }
+    catch (err) {
+      if (err?.name === 'AbortError') throw new RuntimeError('aborted', 'Stopped.');
+      throw err;
+    }
+  };
 
   /** Reads newline-delimited JSON as it streams. Each line can carry an error the runtime hit mid-stream. */
   async function* lines(res) {
@@ -78,7 +84,7 @@ export function createRuntime(origin) {
 
   return {
     origin,
-    version: async () => (await json('/api/version')).version ?? null,
+    version: async ({ signal } = {}) => (await json('/api/version', { signal })).version ?? null,
     async models({ signal } = {}) {
       const { models = [] } = await json('/api/tags', { signal });
       return models.map((m) => ({
@@ -159,20 +165,25 @@ export function createRuntime(origin) {
 const counters = (final) => ({ loadMs: ms(final.load_duration), promptTokens: final.prompt_eval_count ?? null, promptEvalMs: ms(final.prompt_eval_duration), outputTokens: final.eval_count ?? null, evalMs: ms(final.eval_duration) });
 
 /** What this browser says about the machine. Hints only: browsers round, cap or hide these values. */
-export async function browserHints() {
-  const nav = typeof navigator === 'undefined' ? {} : navigator;
-  let gpu = null;
-  let webgpu = false;
+export async function browserHints({ timeoutMs = 1500 } = {}) {
+  const hints = { platform: null, hardwareConcurrency: null, deviceMemoryGb: null, webgpu: null, gpu: null };
+  let timer;
   try {
-    const adapter = nav.gpu ? await nav.gpu.requestAdapter() : null;
-    webgpu = Boolean(adapter);
-    if (adapter?.info) gpu = { vendor: adapter.info.vendor || null, architecture: adapter.info.architecture || null, description: adapter.info.description || null };
-  } catch { webgpu = false; }
-  return {
-    platform: nav.userAgentData?.platform ?? null,
-    hardwareConcurrency: Number.isInteger(nav.hardwareConcurrency) ? nav.hardwareConcurrency : null,
-    deviceMemoryGb: typeof nav.deviceMemory === 'number' ? nav.deviceMemory : null,
-    webgpu,
-    gpu,
-  };
+    const nav = typeof navigator === 'undefined' ? {} : navigator;
+    hints.platform = nav.userAgentData?.platform ?? null;
+    hints.hardwareConcurrency = Number.isInteger(nav.hardwareConcurrency) ? nav.hardwareConcurrency : null;
+    hints.deviceMemoryGb = typeof nav.deviceMemory === 'number' ? nav.deviceMemory : null;
+    if (!nav.gpu) return { ...hints, webgpu: false };
+    // GPU discovery is an optional hint, not a prerequisite for talking to Ollama. If requestAdapter does not
+    // settle, a timeout or denial says unknown, not that this computer has no GPU.
+    const gpu = await Promise.race([
+      nav.gpu.requestAdapter().then((adapter) => ({
+        webgpu: Boolean(adapter),
+        gpu: adapter?.info ? { vendor: adapter.info.vendor || null, architecture: adapter.info.architecture || null, description: adapter.info.description || null } : null,
+      })),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ webgpu: null, gpu: null }), timeoutMs); }),
+    ]);
+    return { ...hints, ...gpu };
+  } catch { return hints; }
+  finally { clearTimeout(timer); }
 }
