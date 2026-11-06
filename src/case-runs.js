@@ -8,6 +8,8 @@ export function registerCaseRunRoutes(app, { config, store, helpers, guards }) {
   const { problem } = helpers;
   const { signedIn, member, post, get, fail } = guards;
   const base = '/api/workspaces/:workspaceId/projects/:projectId/evaluations/:setId/versions/:versionId/runs';
+  // 100,000 characters can expand to six bytes each when the JSON escapes them.
+  const startBody = 768 * 1024;
   const reader = [signedIn, member('readProjects')];
   const starter = [signedIn, member('manageMembers')];
 
@@ -27,7 +29,7 @@ export function registerCaseRunRoutes(app, { config, store, helpers, guards }) {
     return version;
   };
 
-  app.post(base, post(starter), async (request, reply) => {
+  app.post(base, { ...post(starter), bodyLimit: startBody }, async (request, reply) => {
     const version = await versionOf(request, reply);
     if (!version) return;
     const body = request.body ?? {};

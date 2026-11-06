@@ -97,5 +97,10 @@ test('a member cannot start a case run, and a runner score is not the stored ver
   assert.equal((await member.get(`${runs}/${run.id}`)).statusCode, 200);
   assert.equal((await viewer.get(runs)).statusCode, 200);
   assert.equal((await viewer.post(runs, { ...body, idempotencyKey: 'viewer-cannot-start' })).statusCode, 403);
+  const wide = await owner.post(runs, { ...body, idempotencyKey: 'case-run-http-big', candidate: { ...body.candidate, corpus: 'a'.repeat(40_000) } });
+  assert.equal(wide.statusCode, 200, wide.body);
+  const huge = await owner.post(runs, { ...body, idempotencyKey: 'case-run-http-huge', candidate: { ...body.candidate, corpus: 'a'.repeat(100_001) } });
+  assert.equal(huge.statusCode, 409, huge.body);
+  assert.match(huge.json().error, /100,000/);
   await app.close();
 });

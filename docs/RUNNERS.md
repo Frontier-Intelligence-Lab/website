@@ -20,7 +20,7 @@ Job states: `queued` → `leased` → `running` → `succeeded`, `failed` or `ca
 
 ## Case-set execution
 
-`case_eval` runs the vetted `support-qa` recipe inside the training image with no network. Start it from a frozen evaluation (`POST .../evaluations/:setId/versions/:versionId/runs`), not from `POST /jobs`. The public queue rejects this kind. The runner posts outputs to `POST /api/runner/jobs/:jobId/case-results`. The server scores them and drops any score the runner sends. A partial, failed, or cancelled run is kept and is not scored. The recipe version is `EVAL_RECIPE_VERSION` (default `1`). A model id, when set, must be in the catalog; this server does not call it. An empty corpus is an honest `no_source` failure, not a wrong answer.
+`case_eval` runs the vetted `support-qa` recipe inside the training image with no network. Start it from a frozen evaluation (`POST .../evaluations/:setId/versions/:versionId/runs`), not from `POST /jobs`. The public queue rejects this kind. The runner posts outputs to `POST /api/runner/jobs/:jobId/case-results`. The server scores them and drops any score the runner sends. The start request accepts a corpus of at most 100,000 characters; its body limit is 768 KiB, above the 32 KiB default. A repeated request key with a different role, corpus, or settings is refused. Listing runs settles one whose job has already finished, so a cancelled job is not left looking queued. A partial, failed, or cancelled run is kept and is not scored. The recipe version is `EVAL_RECIPE_VERSION` (default `1`). A model id, when set, must be in the catalog; this server does not call it. An empty corpus is an honest `no_source` failure, not a wrong answer.
 
 ## In the app
 

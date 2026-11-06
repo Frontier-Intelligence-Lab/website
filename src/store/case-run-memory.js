@@ -44,8 +44,14 @@ export function caseRunMemoryMethods({ stamp, copy, audit }) {
         const runner = await this.getRunner({ workspaceId, runnerId });
         if (!runner || runner.status !== 'active') throw new StoreError('not_found');
         if (!runnerFresh(runner.lastSeenAt, Date.now())) throw invalid('This runner has not reported in the last minute. Open Compute and confirm it is online.');
-        const spec = { caseEval: { versionId, recipeId: RECIPE_ID, recipeVersion, specHash: checked.specHash } };
-        const job = await this.createJob({ workspaceId, runnerId, kind: 'case_eval', spec, idempotencyKey, createdBy: actorId });
+        const spec = { caseEval: { versionId, recipeId: RECIPE_ID, recipeVersion, role, specHash: checked.specHash } };
+        let job;
+        try {
+          job = await this.createJob({ workspaceId, runnerId, kind: 'case_eval', spec, idempotencyKey, createdBy: actorId });
+        } catch (err) {
+          if (err instanceof StoreError && err.code === 'invalid_state') throw invalid('That request key was already used for a different job.');
+          throw err;
+        }
         const existing = runByJob(workspaceId, job.id);
         if (existing) return show(existing);
         const run = {
@@ -135,12 +141,16 @@ export function caseRunMemoryMethods({ stamp, copy, audit }) {
     },
 
     async listCaseRuns({ workspaceId, projectId, versionId }) {
-      return runs.filter((row) => row.workspaceId === workspaceId && row.projectId === projectId && row.versionId === versionId).map((row) => {
-        const view = show(row);
+      const matched = runs.filter((row) => row.workspaceId === workspaceId && row.projectId === projectId && row.versionId === versionId);
+      const views = [];
+      for (const row of matched) {
+        const full = await this.getCaseRun({ workspaceId, projectId, runId: row.id });
+        const view = { ...full };
         delete view.results;
         delete view.passages;
-        return view;
-      });
+        views.push(view);
+      }
+      return views;
     },
   };
 }

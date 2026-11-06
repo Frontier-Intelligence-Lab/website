@@ -53,7 +53,7 @@ export function caseRunPostgresMethods({ query, transaction, isId, iso, addAudit
       if (!VERSION.test(recipeVersion ?? '')) throw invalid('The recipe version is not configured.');
       const checked = validateCandidate({ candidate, catalog });
       if (checked.error) throw invalid(checked.error);
-      const spec = { caseEval: { versionId, recipeId: RECIPE_ID, recipeVersion, specHash: checked.specHash } };
+      const spec = { caseEval: { versionId, recipeId: RECIPE_ID, recipeVersion, role, specHash: checked.specHash } };
       return transaction(async (client) => {
         const version = (await query('SELECT project_id FROM eval_set_versions WHERE id = $1 AND workspace_id = $2 FOR SHARE', [versionId, workspaceId], client)).rows[0];
         if (!version || version.project_id !== projectId) throw new StoreError('not_found');
@@ -162,13 +162,16 @@ export function caseRunPostgresMethods({ query, transaction, isId, iso, addAudit
 
     async listCaseRuns({ workspaceId, projectId, versionId }) {
       if (![workspaceId, projectId, versionId].every(isId)) return [];
-      const rows = (await query('SELECT * FROM eval_case_runs WHERE workspace_id = $1 AND project_id = $2 AND version_id = $3 ORDER BY created_at, id', [workspaceId, projectId, versionId])).rows;
-      return rows.map((row) => {
-        const view = presentRun(runRow(row), []);
-        delete view.results;
-        delete view.passages;
-        return view;
-      });
+      const rows = (await query('SELECT id FROM eval_case_runs WHERE workspace_id = $1 AND project_id = $2 AND version_id = $3 ORDER BY created_at, id', [workspaceId, projectId, versionId])).rows;
+      const views = [];
+      for (const row of rows) {
+        const full = await this.getCaseRun({ workspaceId, projectId, runId: row.id });
+        if (!full) continue;
+        delete full.results;
+        delete full.passages;
+        views.push(full);
+      }
+      return views;
     },
   };
 }

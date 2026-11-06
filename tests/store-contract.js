@@ -1016,6 +1016,7 @@ export function runStoreContract(test, makeStore, label) {
     const run = await start('case-run-pass-1');
     assert.equal((await start('case-run-pass-1')).id, run.id);
     await assert.rejects(start('case-run-pass-1', { candidate: { ...candidate, corpus: 'a different source' } }), { code: 'invalid_state' });
+    await assert.rejects(start('case-run-pass-1', { role: 'baseline' }), { code: 'invalid_state' });
     assert.equal(run.settings.promptUsed, false);
     assert.equal(run.runtime.modelId, null);
     assert.equal(run.scored, false);
@@ -1077,6 +1078,12 @@ export function runStoreContract(test, makeStore, label) {
     assert.deepEqual(nosource.results.map((row) => [row.errorKind, row.output, row.scores]), [['no_source', null, null], ['no_source', null, null]]);
 
     const imported = await store.importEvalPredictions({ ...where, versionId: frozen.id, role: 'baseline', label: 'imported', claimedSystem: { identity: 'claimed' }, claimedScorer: null, filename: 'answers.jsonl', jsonl: '{"id":"window","status":"answered","output":"30 days"}\n{"id":"other","status":"answered","output":"30 days"}\n', importedBy: ctx.owner.id });
+    const quiet = await start('case-run-list');
+    await hold(quiet.jobId);
+    await store.finishJob({ runnerId: runner.id, jobId: quiet.jobId, leaseHash, outcome: 'failed', failure: 'cancelled' });
+    const fromList = (await store.listCaseRuns({ ...where, versionId: frozen.id })).find((item) => item.id === quiet.id);
+    assert.equal(fromList.status, 'cancelled');
+    assert.equal(fromList.scored, false);
     assert.equal(imported.batch.label, 'imported');
     assert.equal((await store.getEvalSet({ ...where, setId: set.id })).comparisons.length, 0);
   });
