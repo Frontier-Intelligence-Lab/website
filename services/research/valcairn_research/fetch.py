@@ -35,6 +35,9 @@ def blocked_ip(value):
         return True
     # is_global is false for shared CGNAT (100.64.0.0/10), which is_private does not cover.
     # Multicast can still report is_global, so it stays in the list.
+    # fec0::/10 is deprecated site-local. Python 3.11 reports it as global.
+    if isinstance(ip, ipaddress.IPv6Address) and ip in ipaddress.IPv6Network('fec0::/10'):
+        return True
     return any([
         ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_multicast,
         ip.is_reserved, ip.is_unspecified, not ip.is_global,

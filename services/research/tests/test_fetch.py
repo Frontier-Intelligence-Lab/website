@@ -11,6 +11,7 @@ class FetchTests(unittest.TestCase):
         self.assertTrue(blocked_ip('169.254.169.254'))
         self.assertTrue(blocked_ip('100.64.0.1'))
         self.assertTrue(blocked_ip('::ffff:100.64.0.1'))
+        self.assertTrue(blocked_ip('fec0::1'))
         self.assertFalse(blocked_ip('1.1.1.1'))
         for host in ('127.0.0.1', 'localhost', 'metadata.google.internal', 'printer.local'):
             with self.assertRaises(UnsafeUrl):
