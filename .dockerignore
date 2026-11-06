@@ -9,5 +9,12 @@ reviewers*.json
 .gitignore
 .dockerignore
 Dockerfile
-services
+services/*
+!services/research/
+services/research/*
+!services/research/valcairn_research/
+services/research/valcairn_research/*
+!services/research/valcairn_research/__init__.py
+!services/research/valcairn_research/__main__.py
+!services/research/valcairn_research/fetch.py
 .local

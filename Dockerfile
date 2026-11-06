@@ -27,12 +27,16 @@ USER node
 CMD ["node", "scripts/migrate.js"]
 
 FROM node:24-alpine
+RUN apk add --no-cache python3
 ENV NODE_ENV=production
+ENV RESEARCH_PYTHON=python3
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY src ./src
 COPY --from=build /app/dist ./dist
+COPY services/research/valcairn_research/__init__.py services/research/valcairn_research/__main__.py services/research/valcairn_research/fetch.py ./services/research/valcairn_research/
+COPY data/frontier-ai-labs-seed.json ./data/frontier-ai-labs-seed.json
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
