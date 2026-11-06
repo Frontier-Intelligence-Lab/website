@@ -331,13 +331,13 @@ class SourcePaths(unittest.TestCase):
 
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
-FEATURE_NUMBERS = ("011", "012", "013", "014", "015")
+FEATURE_NUMBERS = ("011", "012", "013", "014", "015", "017")
 # Registered ahead of their files: each is read from migrations/ once it lands there, or until then from a private
 # directory named by RELEASE_GUARDS_TEST_MIGRATIONS holding the exact reviewed blobs (never committed here).
 PENDING = {"014": "014_jobs.sql", "015": "015_evaluation.sql"}
 PENDING_DIRECTORY = os.environ.get("RELEASE_GUARDS_TEST_MIGRATIONS", "")
 ALL_PRIVILEGES = deploy.TABLE_PRIVILEGES + ("MAINTAIN",)
-JOBS, EVALUATION = deploy.TABLE_GROUPS["014"], deploy.TABLE_GROUPS["015"]
+JOBS, EVALUATION, RESEARCH = (deploy.TABLE_GROUPS[n] for n in ("014", "015", "017"))
 
 
 def tables_through(number):
@@ -389,14 +389,14 @@ class FeatureGuards(unittest.TestCase):
         verified, absent = deploy.verify_tables(ledger_through("010"), tables_through("010"))
         self.assertIn("annotations", verified)
         self.assertEqual(absent, sorted(sum((deploy.TABLE_GROUPS[n] for n in FEATURE_NUMBERS), ())))
-        later = ledger_through("010") + ["011_models.sql", "012_devices.sql", "013_capital.sql", "014_jobs.sql", "015_evaluation.sql"]
+        later = ledger_through("017")
         self.assertEqual(deploy.verify_tables(later, deploy.KNOWN_TABLES), (sorted(deploy.KNOWN_TABLES), []))
 
     def test_jobs_and_evaluation_groups_are_independent_and_each_optional(self):
         """Production at 013 (4 November 2026) may later receive 014, 015 or both, in either order; the ledger decides per group."""
         thirteen, base = ledger_through("013"), tables_through("013")
         self.assertEqual(len(thirteen), 13)
-        self.assertEqual((JOBS, len(EVALUATION), len(deploy.KNOWN_TABLES)), (("runners", "jobs", "job_events"), 9, 39))
+        self.assertEqual((JOBS, len(EVALUATION), len(tables_through("016"))), (("runners", "jobs", "job_events"), 9, 39))
         self.assertTrue(all(name.startswith("eval_") for name in EVALUATION))
         accepted = (("013 only", thirteen, base, JOBS + EVALUATION),
                     ("014 without 015", thirteen + ["014_jobs.sql"], base + JOBS, EVALUATION),
@@ -405,7 +405,7 @@ class FeatureGuards(unittest.TestCase):
                     ("both", thirteen + ["014_jobs.sql", "015_evaluation.sql"], base + JOBS + EVALUATION, ()))
         for name, ledger, present, absent in accepted:
             with self.subTest(case=name):
-                self.assertEqual(deploy.verify_tables(ledger, present), (sorted(present), sorted(absent)))
+                self.assertEqual(deploy.verify_tables(ledger, present), (sorted(present), sorted(absent + RESEARCH)))
         refused = (("015 listed but its tables missing", thirteen + ["015_evaluation.sql"], base),
                    ("partial 015 group", thirteen + ["015_evaluation.sql"], base + EVALUATION[:4]),
                    ("015 tables without their ledger entry", thirteen, base + EVALUATION),
@@ -434,6 +434,47 @@ class FeatureGuards(unittest.TestCase):
             with self.subTest(case=name), self.assertRaises(deploy.ReleaseError):
                 deploy.verify_tables(ledger, present)
 
+    def test_research_is_an_independent_complete_group_and_every_row_is_in_the_restore_manifest(self):
+        before, old_tables = ledger_through("016"), tables_through("016")
+        self.assertEqual(len(RESEARCH), 12)
+        self.assertEqual(deploy.verify_tables(before, old_tables), (sorted(old_tables), sorted(RESEARCH)))
+        self.assertEqual(deploy.verify_tables(ledger_through("017"), deploy.KNOWN_TABLES), (sorted(deploy.KNOWN_TABLES), []))
+        for ledger, tables in ((before, old_tables + RESEARCH[:1]), (ledger_through("017"), old_tables),
+                               (ledger_through("017"), old_tables + RESEARCH[:-1])):
+            with self.subTest(ledger=ledger[-1], count=len(tables)), self.assertRaises(deploy.ReleaseError):
+                deploy.verify_tables(ledger, tables)
+        program = deploy.snapshot_program()
+        for table in RESEARCH:
+            self.assertIn('"' + table + '"', program)
+            self.assertIn("FROM " + table + " t", deploy.manifest_sql(RESEARCH))
+
+    def test_research_grants_match_store_statements_and_identity_sequence_never_gets_direct_access(self):
+        expected = {
+            "research_projects": ("SELECT", "INSERT", "UPDATE"), "research_sources": ("SELECT", "INSERT"),
+            "research_entities": ("SELECT", "INSERT", "UPDATE"), "research_claims": ("SELECT", "INSERT", "UPDATE"),
+            "research_relationships": ("SELECT",), "research_memberships": ("SELECT", "INSERT"),
+            "research_lists": ("SELECT", "INSERT"), "research_list_items": ("SELECT", "INSERT", "DELETE"),
+            "research_runs": ("SELECT", "INSERT", "UPDATE"), "research_run_events": ("SELECT", "INSERT"),
+            "research_revisions": ("SELECT", "INSERT"), "research_duplicate_candidates": ("SELECT", "INSERT"),
+        }
+        self.assertEqual({t: deploy.GRANTS[t] for t in RESEARCH}, expected)
+        seq_name, table = "research_run_events_id_seq", "research_run_events"
+        state = {t: {"held": set()} for t in RESEARCH}
+        state[table].update(sequences=[{"name": seq_name}], seq_held={seq_name: set()})
+        release = self.grant_release(state)
+        release.ensure_grants()
+        self.assertEqual({t: release.receipt["grants"]["tables"][t] for t in RESEARCH}, {t: list(p) for t, p in expected.items()})
+        self.assertEqual(release.receipt["grants"]["sequences"], {seq_name: []})
+        self.assertEqual(sum("GRANT " in code for code in release.programs), len(RESEARCH))
+        for extra in ("USAGE", "SELECT", "UPDATE"):
+            state[table]["seq_held"][seq_name].add(extra)
+            with self.subTest(extra=extra), self.assertRaises(deploy.ReleaseError):
+                self.grant_release(state).ensure_grants()
+            state[table]["seq_held"][seq_name].remove(extra)
+        state["research_sources"]["held"].add("UPDATE")
+        with self.assertRaises(deploy.ReleaseError):
+            self.grant_release(state).ensure_grants()
+
     def test_qualified_validators_repair_is_function_only_and_the_ledger_accepts_it(self):
         """016 re-creates the Capital and Evaluation validators that call other validators, with schema-qualified nested calls,
         so a backup holding Capital or Evaluation rows restores under pg_restore's empty search_path. It adds no table, grant
@@ -447,7 +488,7 @@ class FeatureGuards(unittest.TestCase):
         self.assertEqual(ledger_through("016"), ledger_through("015") + [name])
         thirteen, base = ledger_through("013"), tables_through("013")
         accepted = ((thirteen + [name], base), (thirteen + ["014_jobs.sql", name], base + JOBS),
-                    (thirteen + ["015_evaluation.sql", name], base + EVALUATION), (ledger_through("016"), deploy.KNOWN_TABLES))
+                    (thirteen + ["015_evaluation.sql", name], base + EVALUATION), (ledger_through("016"), tables_through("016")))
         for ledger, present in accepted:
             with self.subTest(ledger=ledger[13:]):
                 self.assertEqual(deploy.verify_tables(ledger, present), (sorted(present), sorted(set(deploy.KNOWN_TABLES) - set(present))))
@@ -619,7 +660,8 @@ class FeatureGuards(unittest.TestCase):
 
     def test_job_events_get_usage_on_their_one_sequence_and_nothing_more(self):
         self.assertEqual(deploy.GRANTS["job_events"], ("SELECT", "INSERT"))
-        self.assertEqual(deploy.SEQUENCE_GRANTS, {"job_events": {"job_events_id_seq": ("USAGE",)}})
+        self.assertEqual(deploy.SEQUENCE_GRANTS, {"job_events": {"job_events_id_seq": ("USAGE",)},
+                                               "research_run_events": {"research_run_events_id_seq": ()}})
         seq = [{"name": "job_events_id_seq"}]
         release = self.grant_release({"job_events": {"held": {"SELECT", "INSERT"}, "sequences": seq, "seq_held": {"job_events_id_seq": set()}}})
         release.ensure_grants()
@@ -1136,17 +1178,17 @@ class PostgresSemantics(unittest.TestCase):
         real, fingerprinted and frozen-checked, while the pending 014 and 015 groups are reported absent, not required."""
         self.assertEqual(self.migrate("013"), [name for name in ledger_through("013") if name[:3] > "010"])
         record = self.snapshot(self.urls["migrator"])
-        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("013")), sorted(JOBS + EVALUATION)))
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("013")), sorted(JOBS + EVALUATION + RESEARCH)))
         release = self.release_as(app)
         release.ensure_grants()
         self.assertEqual(set(release.receipt["grants"]["tables"]), set(deploy.GRANTS))
-        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(JOBS + EVALUATION))
+        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(JOBS + EVALUATION + RESEARCH))
         self.assertEqual(sum("GRANT " in code for code in release.programs), len(set(deploy.GRANTS) & set(tables_through("013"))) - 2)
         self.assertEqual(release.receipt["grants"]["sequences"], {})
         # The frozen-record queries run as the app role against the landed schema, so every column they name must exist.
         release = self.release_as(app, via=self.urls["app"])
         before = release.protected_snapshot()
-        self.assertEqual(set(before), {"reviewers", "reviews", "versions", "frozen_projects"} | (set(deploy.FROZEN_QUERIES) - set(EVALUATION)))
+        self.assertEqual(set(before), {"reviewers", "reviews", "versions", "frozen_projects"} | (set(deploy.FROZEN_QUERIES) - set(EVALUATION + RESEARCH)))
         self.assertEqual(release.receipt["protected_records"], {table: 0 for table in before})
         deploy.verify_protected_records(before, release.protected_snapshot())
 
@@ -1158,7 +1200,7 @@ class PostgresSemantics(unittest.TestCase):
         self.assertEqual(self.migrate("013", "015"), ledger_through("013") + ["015_evaluation.sql"])
         self.statement(self.admin, "GRANT SELECT ON reviewer_accounts, reviews, dataset_versions, projects TO " + app)
         record = self.snapshot(self.urls["migrator"])
-        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("013") + EVALUATION), sorted(JOBS)))
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("013") + EVALUATION), sorted(JOBS + RESEARCH)))
         self.assertEqual({table: record["manifest"][table]["count"] for table in EVALUATION}, {table: 0 for table in EVALUATION})
         # Nothing on the evaluation tables yet, then exactly the contract: no sequence, no DELETE on frozen rows.
         for table in EVALUATION:
@@ -1169,7 +1211,7 @@ class PostgresSemantics(unittest.TestCase):
         release = self.release_as(app)
         release.ensure_grants()
         self.assertEqual({t: v for t, v in release.receipt["grants"]["tables"].items() if t in EVALUATION}, {t: list(deploy.GRANTS[t]) for t in EVALUATION})
-        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(JOBS))
+        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(JOBS + RESEARCH))
         self.assertEqual(release.receipt["grants"]["sequences"], {})
         self.assertEqual(sum("GRANT " in code for code in release.programs), len(set(deploy.GRANTS) & set(tables_through("013") + EVALUATION)))
         self.assertFalse(any("ON SEQUENCE" in code for code in release.programs))
@@ -1186,15 +1228,15 @@ class PostgresSemantics(unittest.TestCase):
         # Frozen digests run as the app role: every column each query names exists in the real 015 schema.
         release = self.release_as(app, via=self.urls["app"])
         before = release.protected_snapshot()
-        self.assertLessEqual(set(deploy.FROZEN_QUERIES), set(before))
+        self.assertLessEqual(set(deploy.FROZEN_QUERIES) - set(RESEARCH), set(before))
         self.assertEqual({table: release.receipt["protected_records"][table] for table in EVALUATION if table in before}, {t: 0 for t in set(EVALUATION) & set(before)})
         # Now 014 lands on top (a database that applied 015 first): the jobs group, its exact grants and the one USAGE-only sequence.
         self.assertEqual(self.migrate("013", "015", "014"), ["014_jobs.sql"])
         record = self.snapshot(self.urls["migrator"])
-        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(deploy.KNOWN_TABLES), []))
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("016")), sorted(RESEARCH)))
         release = self.release_as(app)
         release.ensure_grants()
-        self.assertNotIn("absent", release.receipt["grants"]["tables"].values())
+        self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(RESEARCH))
         self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
         self.assertEqual(sum("GRANT " in code and "ON TABLE" in code for code in release.programs), len(JOBS))
         self.assertEqual(sum("GRANT USAGE ON SEQUENCE job_events_id_seq TO" in code for code in release.programs), 1)
@@ -1214,7 +1256,7 @@ class PostgresSemantics(unittest.TestCase):
             self.assertEqual(self.migrate("013", "014"), ledger_through("013") + ["014_jobs.sql"])
             self.statement(self.admin, "GRANT SELECT ON reviewer_accounts, reviews, dataset_versions, projects TO " + app)
             record = self.snapshot(self.urls["migrator"])
-            self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("014")), sorted(EVALUATION)))
+            self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(tables_through("014")), sorted(EVALUATION + RESEARCH)))
             state = self.node(self.urls["migrator"], deploy.grant_check_program(app, "job_events"))
             self.assertEqual(state["sequences"], [{"name": "job_events_id_seq"}])
             self.assertEqual(deploy.sequence_gap(state["sequenceRows"]["job_events_id_seq"], ("USAGE",)), ([], ["SELECT"]))
@@ -1229,7 +1271,7 @@ class PostgresSemantics(unittest.TestCase):
             release = self.release_as(app)
             release.ensure_grants()
             self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"]})
-            self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(EVALUATION))
+            self.assertEqual({t for t, v in release.receipt["grants"]["tables"].items() if v == "absent"}, set(EVALUATION + RESEARCH))
             self.assertFalse(any("ON SEQUENCE" in code for code in release.programs))
             self.assertEqual(self.node(self.urls["app"], "console.log(JSON.stringify({n:(await pool.query(\"SELECT nextval('job_events_id_seq')::int AS n\")).rows[0].n}));"), {"n": 1})
             self.assertTrue(self.denied("SELECT last_value FROM job_events_id_seq"))
@@ -1418,10 +1460,11 @@ class PostgresSemantics(unittest.TestCase):
         self.assertEqual(self.migrate("016"), ["014_jobs.sql", "015_evaluation.sql", "016_qualified_validators.sql"])
         self.assertEqual(self.migrate("016"), [])
         record = self.snapshot(self.urls["migrator"])
-        self.assertEqual((deploy.verify_tables(record["ledger"], record["tables"]), len(record["ledger"])), ((sorted(deploy.KNOWN_TABLES), []), 16))
+        self.assertEqual((deploy.verify_tables(record["ledger"], record["tables"]), len(record["ledger"])), ((sorted(tables_through("016")), sorted(RESEARCH)), 16))
         release = self.release_as(app)
         release.ensure_grants()
-        self.assertEqual((release.receipt["grants"]["tables"], release.receipt["grants"]["sequences"]), ({t: list(p) for t, p in deploy.GRANTS.items()}, {"job_events_id_seq": ["USAGE"]}))
+        self.assertEqual((release.receipt["grants"]["tables"], release.receipt["grants"]["sequences"]),
+                         ({t: list(p) if t in tables_through("016") else "absent" for t, p in deploy.GRANTS.items()}, {"job_events_id_seq": ["USAGE"]}))
         drafts = [{"costItems": [{"amountCents": cents, "category": "compute", "period": "monthly", "basis": "quoted"}]} for cents in (1, -1)]
         rules = [{"version": 1, "scoreBasis": "human_only", "minPassRate": rate, "minCoverage": 1, "criticalMustPass": True, "requireHumanOnCritical": True,
                   "requireHumanOnDisagreement": True, "requireHumanWhenNoExpectedAnswer": True} for rate in (0.9, 1.5)]
@@ -1430,6 +1473,48 @@ class PostgresSemantics(unittest.TestCase):
                  "public.eval_acceptance_valid($3::jsonb) AS rule,public.eval_acceptance_valid($4::jsonb) AS bad_rule',"
                  + json.dumps([json.dumps(d) for d in drafts + rules]) + ")).rows[0]));await c.query('ROLLBACK');}finally{c.release();}")
         self.assertEqual(self.node(self.urls["app"], probe), {"ok": True, "bad": False, "rule": True, "bad_rule": False})
+
+
+    def test_research_017_has_real_table_fingerprints_exact_grants_and_zero_identity_privileges(self):
+        self.reset_schema()
+        self.assertEqual(self.migrate("017"), ledger_through("017"))
+        self.assertEqual(self.migrate("017"), [])
+        record = self.snapshot(self.urls["migrator"])
+        self.assertEqual(deploy.verify_tables(record["ledger"], record["tables"]), (sorted(deploy.KNOWN_TABLES), []))
+        self.assertEqual({t: record["manifest"][t]["count"] for t in RESEARCH}, {t: 0 for t in RESEARCH})
+        app = self.roles["app"]
+        release = self.release_as(app)
+        release.ensure_grants()
+        self.assertEqual({t: release.receipt["grants"]["tables"][t] for t in RESEARCH}, {t: list(deploy.GRANTS[t]) for t in RESEARCH})
+        self.assertEqual(release.receipt["grants"]["sequences"], {"job_events_id_seq": ["USAGE"], "research_run_events_id_seq": []})
+        # GENERATED ALWAYS uses an internal identity default: INSERT works without granting direct nextval access.
+        fixture = self.node(self.urls["migrator"], "const {createPostgresStore}=await import('./src/store/postgres.js');const s=createPostgresStore({connectionString:process.env.DATABASE_URL});try{"
+                            "const u=await s.createUser({email:'research-restore@example.test',name:'QA ONLY',passwordHash:'synthetic-test-hash'});"
+                            "const w=await s.createWorkspace({kind:'organization',name:'QA ONLY',slug:'research-proof',ownerId:u.id});"
+                            "const p=await s.createResearchProject({workspaceId:w.id,createdBy:u.id,template:'collection',name:'QA ONLY',brief:'',question:'Fixture',checklist:{}});"
+                            "const r=await s.createResearchRun({workspaceId:w.id,projectId:p.id,createdBy:u.id,question:'No fetch',scope:{},limits:{},permissions:{}});"
+                            "console.log(JSON.stringify({runId:r.id}));}finally{await s.close();}")
+        inserted = self.node(self.urls["app"], "const r=await pool.query(\"INSERT INTO research_run_events(run_id,kind,message) VALUES($1,'progress','QA ONLY implicit identity') RETURNING id\",["
+                             + json.dumps(fixture["runId"]) + "]);console.log(JSON.stringify({inserted:r.rowCount}));")
+        self.assertEqual(inserted, {"inserted": 1})
+        record = self.snapshot(self.urls["migrator"])
+        self.assertGreater(record["manifest"]["research_run_events"]["count"], 0)
+        self.assertGreater(len(record["tables"]), 50, "this exercises PostgreSQL's old variadic JSON function limit")
+        restored_manifest = self.node(self.urls["migrator"], "console.log(JSON.stringify((await pool.query("
+                                      + json.dumps(deploy.manifest_sql(record["tables"])) + ")).rows[0].json_object_agg));")
+        self.assertEqual(restored_manifest, record["manifest"], "snapshot and restore manifest builders agree on every actual row")
+        self.assertEqual(self.node(self.urls["app"], "console.log(JSON.stringify({usage:(await pool.query(\"SELECT has_sequence_privilege(current_user,'research_run_events_id_seq','USAGE') AS p\")).rows[0].p}));"), {"usage": False})
+        for sql in ("SELECT nextval('research_run_events_id_seq')", "SELECT last_value FROM research_run_events_id_seq", "SELECT setval('research_run_events_id_seq', 1)",
+                    "UPDATE research_sources SET url=url", "DELETE FROM research_sources", "UPDATE research_run_events SET message=message",
+                    "DELETE FROM research_run_events", "UPDATE research_revisions SET patch=patch", "DELETE FROM research_revisions",
+                    "INSERT INTO research_relationships DEFAULT VALUES", "TRUNCATE research_runs"):
+            self.assertTrue(self.denied(sql), sql)
+        self.statement(self.admin, "GRANT SELECT ON reviewer_accounts,reviews,dataset_versions,projects TO " + app)
+        protected = self.release_as(app, via=self.urls["app"]).protected_snapshot()
+        self.assertLessEqual({"research_sources", "research_revisions", "research_run_events", "research_runs"}, set(protected))
+        self.statement(self.urls["migrator"], "GRANT UPDATE ON research_sources TO " + app)
+        with self.assertRaises(deploy.ReleaseError):
+            self.release_as(app).ensure_grants()
 
 
 if __name__ == "__main__":

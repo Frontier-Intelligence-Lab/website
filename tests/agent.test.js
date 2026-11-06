@@ -496,6 +496,8 @@ test('Delete history is refused while any tab executes; a clear that slips past 
   await assert.rejects(withLedgerLock(ledger.scopeKey, 'exclusive', () => ledger.clear(), locks), (e) => e.kind === 'ledger_busy');
   assert.equal((await ledger.runs()).length, 1, 'nothing was deleted');
   // A second handle clears the same records without the lock (as a bug or crash could), while A's model call is in flight.
+  const started = Date.now();
+  while (typeof answer !== 'function' && Date.now() - started < 2000) await new Promise((resolve) => setTimeout(resolve, 10));
   const second = openLedger({ scopeKey: ledger.scopeKey, backend });
   await second.clear();
   answer();

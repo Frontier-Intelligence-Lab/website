@@ -6,6 +6,7 @@ import { CASE_DECISIONS, capitalSnapshot, citedEvidenceIds, draftComplete, refer
 import { snapshotHash } from '../lib/capital-hash.js';
 import { LEASE_MS, MAX_ATTEMPTS, stableJson } from '../lib/jobs.js';
 import { evalPostgresMethods } from './eval-postgres.js';
+import { researchPostgresMethods } from './research-postgres.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (value) => typeof value === 'string' && UUID.test(value);
@@ -49,6 +50,7 @@ function databaseError(error) {
       eval_batches_version_id_role_label_key: 'invalid_state',
       eval_reports_comparison_id_revision_key: 'invalid_state',
     }[error.constraint];
+    if (error.constraint === 'research_lists_project_id_name_key') return new StoreError('invalid_state', 'A list with that name already exists in this project.');
     if (code) return new StoreError(code);
   }
   if (error.code === '23503') return new StoreError('not_found');
@@ -1290,5 +1292,9 @@ export function createPostgresStore(options) {
     },
     async close() { await pool.end(); },
   };
-  return Object.assign(store, evalPostgresMethods({ query, transaction, isId, iso, addAudit }));
+  return Object.assign(
+    store,
+    evalPostgresMethods({ query, transaction, isId, iso, addAudit }),
+    researchPostgresMethods({ query, transaction, isId, addAudit }),
+  );
 }
