@@ -1,21 +1,30 @@
 import { createBrowserRouter, redirect, useLoaderData } from 'react-router';
 import { api } from './api.js';
 import { forgetIfSignedOut } from './app/memory.js';
+import { resolveReviewerEntry } from './reviewer-entry.js';
 import SiteLayout, { Loading, RouteError } from './site/SiteLayout.jsx';
 import Home from './site/Home.jsx';
 import Contact from './site/Contact.jsx';
 import DemoLogin from './site/DemoLogin.jsx';
 import NotFound from './site/NotFound.jsx';
 
-// The dashboard chunk is built under /private/ and only loads after the session check passes.
-async function reviewLoader() {
-  const { reviewer } = await api.session();
-  if (!reviewer) {
+async function enterReviewerProduct(reviewer) {
+  const entry = await resolveReviewerEntry({ reviewer, fetchAccount: api.account, enterWorkspace: api.demoEnter });
+  if (entry.kind === 'workspace') throw redirect(entry.to);
+  if (entry.kind === 'signed_out') {
     // The reviewer session ended before the Dashboard could mount (disabled account, expiry): this tab's local-memory
     // keys go with it, unless an ordinary account still holds them or that cannot be confirmed.
-    await forgetIfSignedOut({ reviewer, fetchAccount: api.account });
+    await forgetIfSignedOut({ reviewer: null, fetchAccount: api.account });
     throw redirect('/demo');
   }
+  if (entry.kind === 'unavailable') throw new Response(entry.message, { status: entry.status });
+}
+
+// Only the admin audit overview remains a separate private chunk. Mapped
+// external reviewers use the exact same /w/:slug product as normal accounts.
+async function reviewLoader() {
+  const { reviewer } = await api.session();
+  await enterReviewerProduct(reviewer);
   const { default: Dashboard } = await import('./private/Dashboard.jsx');
   return { reviewer, Dashboard };
 }
@@ -38,7 +47,10 @@ export const router = createBrowserRouter([
         path: 'demo',
         loader: async () => {
           const [config, { reviewer }] = await Promise.all([api.config(), api.session()]);
-          if (reviewer) throw redirect('/demo/review');
+          if (reviewer) {
+            await enterReviewerProduct(reviewer);
+            throw redirect('/demo/review');
+          }
           // Same confirmed-loss rule as the overview loader: a stale reviewer connection is not left behind here.
           await forgetIfSignedOut({ reviewer, fetchAccount: api.account });
           return config;
