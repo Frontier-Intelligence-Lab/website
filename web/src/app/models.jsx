@@ -431,8 +431,8 @@ function RunPlan({ account, entry, role, options, run }) {
   const { pulls, datasets: eligible, catalog, methods, compute } = options;
   const pulledModels = catalog.filter((m) => pulls.some((p) => p.modelId === m.id));
   const writer = WRITERS.includes(role);
-  // In the reviewer demo the server refuses plan approval; drafts stay editable.
-  const manager = MANAGERS.includes(role) && !account.demoAccess;
+  // Approval follows the same owner/admin role checks in every workspace.
+  const manager = MANAGERS.includes(role);
   const [plan, setPlan] = useState(() => ({
     name: run?.name ?? '',
     baseModelId: run?.baseModelId ?? (pulledModels.some((m) => m.id === params.get('base')) ? params.get('base') : pulledModels[0]?.id ?? ''),
@@ -600,7 +600,7 @@ function RunPlan({ account, entry, role, options, run }) {
             {writer && <button type="button" className="btn-ghost" disabled={status.pending} onClick={saveDraft}>{status.pending ? 'Saving…' : 'Save draft'}</button>}
             {manager
               ? <button type="button" className="btn-app" disabled={status.pending} onClick={requestRun}>Approve cap and request run</button>
-              : writer && <p className="ob-muted" style={{ fontSize: 12.5 }}>{account.demoAccess ? 'Approving the cap and requesting the run is off in the reviewer demo; the workspace operator does that separately.' : 'An owner or admin approves the spending cap and requests the run.'}</p>}
+              : writer && <p className="ob-muted" style={{ fontSize: 12.5 }}>An owner or admin approves the spending cap and requests the run.</p>}
           </section>
         </aside>
       </div>

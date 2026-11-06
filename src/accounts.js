@@ -92,7 +92,7 @@ export async function registerAccountRoutes(app, { config, store, mailTransport,
     // A reviewer-derived session reaches a finite set of registered routes; everything else is refused here, before
     // any route code runs, whatever the URL looks like.
     if (request.demoAccess && !demoRouteAllowed(request)) {
-      return problem(reply, 403, 'The reviewer demo cannot do this. It can plan, edit and evaluate inside the synthetic demo workspace only.', { code: 'demo_access_denied' });
+      return problem(reply, 403, 'This reviewer session can use its own workspace features, but cannot change accounts or access global or staff functions.', { code: 'demo_access_denied' });
     }
   };
   const verified = async (request, reply) => {

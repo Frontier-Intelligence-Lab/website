@@ -83,21 +83,24 @@ export async function resolveDemoAccess({ config, store, reviewer, marker = null
 /** What the session records at entry. Only these three ids, all server-chosen. */
 export const demoMarker = (access) => ({ username: access.reviewer.username, workspaceId: access.workspace.id, userId: access.user.id });
 
-/** The destination the server resolves for an entry: the real Models page of the reviewer's own organization. */
-export const demoDestination = (access) => `/w/${access.workspace.slug}/models`;
+/** The destination the server resolves for an entry: the real home of the reviewer's own organization. */
+export const demoDestination = (access) => `/w/${access.workspace.slug}`;
 
 // What a bridged session can and cannot do, for the UI to explain. The server decides; these only describe it.
 export const DEMO_CAPABILITIES = Object.freeze({
   plan: true, dataset: true, evaluate: true, modelPulls: true, enhanceDrafts: true, device: true, capitalDrafts: true, research: true,
-  team: false, accountChanges: false, runners: false, jobs: false, approvePlans: false, sendCapital: false, credits: false, staff: false,
+  team: true, runners: true, jobs: true, approvePlans: true, sendCapital: true, credits: true,
+  accountChanges: false, staff: false,
 });
 
 // Mutations a bridged session may perform, as REGISTERED Fastify route patterns (POST). Planning, dataset and label
-// editing, evaluation, model pull requests and enhance-plan drafts, the identity's own local-device records,
-// Capital drafts with evidence, and public-source research inside the pinned workspace. Each is checked against
-// the registered routes at startup (src/app.js).
+// editing, evaluation, models/plans, local-device records, runners/jobs, Capital and Team inside the pinned
+// organization. Normal role and service validation still applies. Account/identity flows and staff remain outside
+// this list. Each pattern is checked against the registered routes at startup (src/app.js).
 const P = '/api/workspaces/:workspaceId/projects/:projectId';
 export const DEMO_ALLOWED_MUTATIONS = Object.freeze([
+  '/api/workspaces/:workspaceId/invitations', '/api/workspaces/:workspaceId/invitations/:invitationId/revoke',
+  '/api/workspaces/:workspaceId/join-requests/:requestId/decision',
   '/api/workspaces/:workspaceId/projects',
   P,
   `${P}/upload-grant`, `${P}/uploads`, `${P}/uploads/:uploadId/delete`, `${P}/submit`, `${P}/reopen`, `${P}/dataset-versions`,
@@ -109,10 +112,15 @@ export const DEMO_ALLOWED_MUTATIONS = Object.freeze([
   `${P}/evaluations/:setId/comparisons`, `${P}/evaluations/comparisons/:comparisonId/blind`,
   `${P}/evaluations/comparisons/:comparisonId/judgments`, `${P}/evaluations/comparisons/:comparisonId/approve`,
   '/api/workspaces/:workspaceId/models/pulls', '/api/workspaces/:workspaceId/enhance-runs', '/api/workspaces/:workspaceId/enhance-runs/:runId',
+  '/api/workspaces/:workspaceId/enhance-runs/:runId/request',
+  '/api/workspaces/:workspaceId/runners', '/api/workspaces/:workspaceId/runners/:runnerId/revoke',
+  '/api/workspaces/:workspaceId/jobs', '/api/workspaces/:workspaceId/jobs/:jobId/cancel',
   '/api/workspaces/:workspaceId/devices', '/api/workspaces/:workspaceId/devices/:deviceId/reports', '/api/workspaces/:workspaceId/devices/:deviceId/installs',
   '/api/workspaces/:workspaceId/devices/:deviceId/runs', '/api/workspaces/:workspaceId/devices/:deviceId/revoke',
   '/api/workspaces/:workspaceId/capital/cases', '/api/workspaces/:workspaceId/capital/cases/:caseId',
   '/api/workspaces/:workspaceId/capital/cases/:caseId/evidence', '/api/workspaces/:workspaceId/capital/cases/:caseId/evidence/:evidenceId/delete',
+  '/api/workspaces/:workspaceId/capital/cases/:caseId/submit', '/api/workspaces/:workspaceId/capital/cases/:caseId/withdraw',
+  '/api/workspaces/:workspaceId/capital/credits',
   '/api/workspaces/:workspaceId/research/projects',
   '/api/workspaces/:workspaceId/research/projects/:projectId',
   '/api/workspaces/:workspaceId/research/projects/:projectId/imports',

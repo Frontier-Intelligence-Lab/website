@@ -40,9 +40,7 @@ function ComputeBody({ account, entry, runners: initialRunners, jobs: initialJob
   const { id: open, invalid } = jobParam(params);
   const setOpen = (id) => setParams(jobSearch(id));
   const [notice, setNotice] = useState(null);
-  // In the reviewer demo the server refuses linking machines and queueing, cancelling or exporting jobs; show the records only.
-  const demo = Boolean(account.demoAccess);
-  const manager = MANAGERS.includes(entry.role) && !demo;
+  const manager = MANAGERS.includes(entry.role);
 
   const refresh = useCallback(async () => {
     const [r, j] = await Promise.all([api.runners(entry.id).catch(() => null), api.jobs(entry.id).catch(() => null)]);
@@ -82,7 +80,7 @@ function ComputeBody({ account, entry, runners: initialRunners, jobs: initialJob
         </div>
       </div>
       {notice && <p className={`ob-alert${notice.tone === 'ok' ? ' ob-alert--ok' : ''}`} role={notice.tone === 'ok' ? 'status' : 'alert'}>{notice.text}</p>}
-      {manager ? <LinkCard workspaceId={entry.id} onLinked={refresh} /> : <p className="ob-muted">{demo ? 'In the reviewer demo, linking a machine and starting, cancelling or exporting jobs are off: the workspace operator runs them separately, and what the runner recorded shows here.' : 'Owners and admins link runners and start jobs. You can see them here.'}</p>}
+      {manager ? <LinkCard workspaceId={entry.id} onLinked={refresh} /> : <p className="ob-muted">Owners and admins link runners and start jobs. You can see them here.</p>}
       {manager && plans.length > 0 && <PlansCard plans={plans} catalog={catalog} runners={active} onStart={(runner, plan) => queue(runner, { kind: 'train', enhanceRunId: plan.id }, `Training “${plan.name}”`)} />}
       <RunnersCard runners={runners} manager={manager} onProbe={queueProbe} workspaceId={entry.id} onChange={refresh} />
       <JobsCard jobs={jobs} runners={runners} manager={manager} workspaceId={entry.id} open={open} invalid={invalid} setOpen={setOpen} onChange={refresh} hasRunner={active.length > 0} />
