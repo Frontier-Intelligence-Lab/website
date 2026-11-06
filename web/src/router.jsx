@@ -72,6 +72,7 @@ function accountRoutes() {
   const agents = () => import('./app/agents.jsx');
   const compute = () => import('./app/compute.jsx');
   const evaluate = () => import('./app/evaluate.jsx');
+  const research = () => import('./app/research.jsx');
   return [
     { path: '/signup', lazy: page(auth, 'SignUp', 'signUpLoader') },
     { path: '/signin', lazy: page(auth, 'SignIn', 'signInLoader') },
@@ -82,6 +83,10 @@ function accountRoutes() {
     { path: '/setup/match', lazy: page(org, 'OrgMatch', 'matchLoader') },
     { path: '/setup/personal', lazy: page(personal, 'Personal', 'personalLoader') },
     { path: '/w/:slug', lazy: page(project, 'WorkspaceHome', 'workspaceHomeLoader') },
+    { path: '/w/:slug/research', lazy: page(research, 'ResearchHome', 'researchHomeLoader') },
+    { path: '/w/:slug/research/:projectId', lazy: page(research, 'ResearchProject', 'researchProjectLoader') },
+    { path: '/w/:slug/research/:projectId/entities/:entityId', lazy: page(research, 'ResearchEntity', 'researchEntityLoader') },
+    { path: '/w/:slug/research/:projectId/runs/:runId', lazy: page(research, 'ResearchRun', 'researchRunLoader') },
     { path: '/w/:slug/setup/team', lazy: page(org, 'OrgTeam', 'teamLoader') },
     { path: '/w/:slug/projects/new', lazy: page(project, 'ProjectGoal', 'goalLoader') },
     { path: '/w/:slug/projects/:projectId', lazy: page(project, 'ProjectHome', 'projectHomeLoader') },

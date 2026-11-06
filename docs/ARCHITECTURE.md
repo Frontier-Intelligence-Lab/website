@@ -21,7 +21,7 @@ Browser ── HTTPS ──► web (Node/Fastify) ── SQL ──► Postgres 
 
 Workers that run on a customer's own machine (Valcairn Runners, `docs/RUNNERS.md`) do not connect to Postgres. They call `web` over HTTPS with a runner key and lease jobs from the same Postgres queue through it, so tenancy and roles are checked by `web` on every call and the machine needs no inbound port or database credentials.
 
-Public-source research is a separate path (`docs/RESEARCH.md`). The schema, planner, stores and existing company catalog are in this storage unit. The separate Python standard-library fetch worker, its credential-free runtime, the Fastify routes and Research screens follow in coherent units. Research is not a train job or the saved-note Agent. File upload stays on `services/ingest`.
+Public-source research is a separate path (`docs/RESEARCH.md`). The existing schema/planner/stores keep workspace-scoped evidence. The runtime unit packages the credential-free Python standard-library worker and Node adapter; these Research routes now authorize and invoke that bounded public-HTTPS retrieval path, and the React workspace exposes its actual records. It is neither a training job nor the saved-note Agent. File upload stays on `services/ingest`. Source availability is not a deployment or model-synthesis claim.
 
 ## Rules that hold across services
 

@@ -88,13 +88,14 @@ export const demoDestination = (access) => `/w/${access.workspace.slug}/models`;
 
 // What a bridged session can and cannot do, for the UI to explain. The server decides; these only describe it.
 export const DEMO_CAPABILITIES = Object.freeze({
-  plan: true, dataset: true, evaluate: true, modelPulls: true, enhanceDrafts: true, device: true, capitalDrafts: true,
+  plan: true, dataset: true, evaluate: true, modelPulls: true, enhanceDrafts: true, device: true, capitalDrafts: true, research: true,
   team: false, accountChanges: false, runners: false, jobs: false, approvePlans: false, sendCapital: false, credits: false, staff: false,
 });
 
 // Mutations a bridged session may perform, as REGISTERED Fastify route patterns (POST). Planning, dataset and label
-// editing, evaluation, model pull requests and enhance-plan drafts, the identity's own local-device records, and
-// Capital drafts with evidence. Each is checked against the registered routes at startup (src/app.js).
+// editing, evaluation, model pull requests and enhance-plan drafts, the identity's own local-device records,
+// Capital drafts with evidence, and public-source research inside the pinned workspace. Each is checked against
+// the registered routes at startup (src/app.js).
 const P = '/api/workspaces/:workspaceId/projects/:projectId';
 export const DEMO_ALLOWED_MUTATIONS = Object.freeze([
   '/api/workspaces/:workspaceId/projects',
@@ -112,6 +113,19 @@ export const DEMO_ALLOWED_MUTATIONS = Object.freeze([
   '/api/workspaces/:workspaceId/devices/:deviceId/runs', '/api/workspaces/:workspaceId/devices/:deviceId/revoke',
   '/api/workspaces/:workspaceId/capital/cases', '/api/workspaces/:workspaceId/capital/cases/:caseId',
   '/api/workspaces/:workspaceId/capital/cases/:caseId/evidence', '/api/workspaces/:workspaceId/capital/cases/:caseId/evidence/:evidenceId/delete',
+  '/api/workspaces/:workspaceId/research/projects',
+  '/api/workspaces/:workspaceId/research/projects/:projectId',
+  '/api/workspaces/:workspaceId/research/projects/:projectId/imports',
+  '/api/workspaces/:workspaceId/research/projects/:projectId/sources',
+  '/api/workspaces/:workspaceId/research/projects/:projectId/lists',
+  '/api/workspaces/:workspaceId/research/projects/:projectId/checklist',
+  '/api/workspaces/:workspaceId/research/projects/:projectId/runs',
+  '/api/workspaces/:workspaceId/research/entities/:entityId/corrections',
+  '/api/workspaces/:workspaceId/research/lists/:listId/items',
+  '/api/workspaces/:workspaceId/research/lists/:listId/items/:entityId/remove',
+  '/api/workspaces/:workspaceId/research/runs/:runId/start',
+  '/api/workspaces/:workspaceId/research/runs/:runId/cancel',
+  '/api/workspaces/:workspaceId/research/runs/:runId/accept',
 ]);
 // Reads outside a workspace that the real pages need. Every other signed-in route either carries :workspaceId (then
 // the workspace guard pins it) or is refused.
