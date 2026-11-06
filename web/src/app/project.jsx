@@ -586,14 +586,19 @@ export function WorkspaceHome() {
       <div className="ob-actions" style={{ alignItems: 'flex-end' }}>
         <div className="ob-intro" style={{ gap: 8 }}>
           <h1 className="ob-h1">Projects</h1>
-          <span className="ob-muted">{plural(projects.length, 'project')} in {entry.name}</span>
+          <span className="ob-muted">{plural(projects.length, 'dataset or model project')} in {entry.name}</span>
         </div>
         {writer && <Link className="btn-app" to={`/w/${entry.slug}/projects/new`}>New project</Link>}
       </div>
+      <section className="ob-card">
+        <h2>Research projects and directories</h2>
+        <p className="ob-muted">Collect public-source records, inspect their evidence and curate lists in Research. These collections stay separate from datasets approved for training.</p>
+        <Link className="btn-ghost" to={`/w/${entry.slug}/research`}>Open Research</Link>
+      </section>
       {projects.length === 0 ? (
         <section className="ob-card" style={{ alignItems: 'flex-start' }}>
           <Tile icon="grid" tone="orange" size="lg" />
-          <h2>No projects yet</h2>
+          <h2>No dataset or model projects yet</h2>
           {writer
             ? <><p className="ob-muted">Start with the task you want a model to do. Setup takes a few minutes and saves as you go.</p><Link className="btn-app" to={`/w/${entry.slug}/projects/new`}>Start your first project</Link></>
             : <p className="ob-muted">You have {roleName(entry.role)} access, so you can view projects here once someone on the team starts one. Owners, admins and members can create them.</p>}

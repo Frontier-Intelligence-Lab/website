@@ -22,6 +22,7 @@ import { registerDeviceRoutes } from './devices.js';
 import { registerCapitalRoutes } from './capital.js';
 import { registerEvalRoutes } from './eval.js';
 import { registerJobRoutes } from './jobs.js';
+import { registerResearchRoutes } from './research.js';
 import { UNAVAILABLE, buildDemoOverview } from './lib/demo-overview.js';
 import { DEMO_ALLOWED_MUTATIONS, DEMO_ALLOWED_READS, demoDestination, demoEntryFor, demoMarker, resolveDemoAccess } from './lib/demo-access.js';
 
@@ -44,6 +45,8 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   }
 
   const app = Fastify({ logger, trustProxy: config.trustProxy, bodyLimit: 32 * 1024 });
+  // Tests replace this with a stub. The real worker is used only when it stays null.
+  app.decorate('researchExecutor', null);
   const delivery = createDelivery(config.smtp, contactTransport);
   const signins = await createSigninLog(config.signinLogFile, app.log);
   const accountStore = store === undefined ? await createStore(config, app.log) : store;
@@ -171,6 +174,7 @@ export async function buildApp({ config, logger = false, contactTransport, mailT
   registerCapitalRoutes(app, { config, store: accountStore, helpers, guards });
   registerEvalRoutes(app, { store: accountStore, helpers, guards });
   registerJobRoutes(app, { config, store: accountStore, helpers, guards });
+  registerResearchRoutes(app, { config, store: accountStore, helpers, guards });
   for (const url of DEMO_ALLOWED_MUTATIONS) if (!registeredRoutes.has(`POST ${url}`)) throw new Error(`reviewer demo allowlist names an unregistered route: POST ${url}`);
   for (const url of DEMO_ALLOWED_READS) if (!registeredRoutes.has(`GET ${url}`)) throw new Error(`reviewer demo allowlist names an unregistered route: GET ${url}`);
 

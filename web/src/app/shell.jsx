@@ -75,6 +75,7 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
         </Link>
         <nav aria-label="Workspace">
           <Link to={`/w/${entry.slug}`} title="Projects" aria-current={current === 'projects' ? 'page' : undefined}><Tile icon="grid" tone="orange" size="sm" /><span className="ob-side-label">Projects</span></Link>
+          <Link to={`/w/${entry.slug}/research`} title="Research" aria-current={current === 'research' ? 'page' : undefined}><Tile icon="study" tone="teal" size="sm" /><span className="ob-side-label">Research</span></Link>
           {project && (
             <div className="ob-side-sub">
               <Link to={projectBase} aria-current={current === 'project' ? 'page' : undefined} title={project.name} className="ob-side-project">{project.name}</Link>
@@ -116,8 +117,8 @@ export function WorkspaceShell({ account, entry, role, title, current = 'project
         </div>
       </aside>
       <main className="ob-body">
-        {demo && <p className="ob-alert" role="note"><strong>Reviewer demo mode.</strong> Signed in as reviewer <strong>{demo.reviewer.username}</strong>, working as the dedicated demo owner “{account.user.name}” of the synthetic organization {entry.name}, which exists only for this demonstration. You can plan, edit and evaluate here, request model pulls and draft plans, record your own local device runs and draft Capital cases. Linking machines, starting or cancelling jobs, approving plans, sending Capital to review, credit records, team and account changes are off for reviewers; the Valcairn operator does those separately.</p>}
-        {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Its inputs are generated samples and it is not a real customer. The statuses and results shown here are only what was actually recorded in it: reviews, dataset versions, imported-answer evaluations, and any training or export that an approved plan ran on a linked compatible machine. Hosted GPU scheduling and charges, deployment and funding are planned, not running.</p>}
+        {demo && <p className="ob-alert" role="note"><strong>Reviewer demo mode.</strong> Signed in as reviewer <strong>{demo.reviewer.username}</strong>, working as the dedicated demo owner “{account.user.name}” of the synthetic organization {entry.name}, which exists only for this demonstration. You can plan, edit and evaluate here, request model pulls and draft plans, record your own local device runs, draft Capital cases, and collect public-source research inside this workspace. Linking machines, starting or cancelling jobs, approving plans, sending Capital to review, credit records, team and account changes are off for reviewers; the Valcairn operator does those separately.</p>}
+        {entry.synthetic && <p className="ob-alert ob-alert--info" role="note"><strong>Synthetic demo workspace.</strong> Its dataset inputs are generated samples and it is not a real customer. Research records in this workspace, when you add them, are public-source or catalog research and keep the status each field actually has. The dataset statuses and results shown here are only what was actually recorded: reviews, dataset versions, imported-answer evaluations, and any training or export that an approved plan ran on a linked compatible machine. Hosted GPU scheduling and charges, deployment and funding are planned, not running.</p>}
         {children}
       </main>
     </div>
