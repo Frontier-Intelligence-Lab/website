@@ -64,20 +64,30 @@ CREATE FUNCTION eval_case_run_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE finished timestamptz;
 DECLARE scored boolean;
 BEGIN
-  SELECT r.finished_at, r.scored INTO finished, scored FROM eval_case_runs r WHERE r.id = NEW.run_id;
+  IF TG_OP = 'DELETE' THEN
+    SELECT r.finished_at INTO finished FROM eval_case_runs r WHERE r.id = OLD.run_id FOR UPDATE;
+    IF finished IS NOT NULL THEN RAISE EXCEPTION 'eval_case_run_frozen'; END IF;
+    RETURN OLD;
+  END IF;
+  -- A result belongs to one case in one run for its whole lifetime, including while open.
+  -- Checking only NEW's parent lets a terminal receipt be moved under an unfinished run.
+  IF TG_OP = 'UPDATE' AND (NEW.run_id IS DISTINCT FROM OLD.run_id OR NEW.case_key IS DISTINCT FROM OLD.case_key) THEN
+    RAISE EXCEPTION 'eval_case_run_frozen';
+  END IF;
+  SELECT r.finished_at, r.scored INTO finished, scored FROM eval_case_runs r WHERE r.id = NEW.run_id FOR UPDATE;
   IF NEW.scores IS NOT NULL AND scored IS NOT TRUE THEN RAISE EXCEPTION 'eval_unscored'; END IF;
   IF finished IS NULL THEN RETURN NEW; END IF;
   IF TG_OP = 'INSERT' THEN RAISE EXCEPTION 'eval_case_run_frozen'; END IF;
-  IF OLD.scores IS NOT NULL OR NEW.output IS DISTINCT FROM OLD.output OR NEW.error_kind IS DISTINCT FROM OLD.error_kind
+  IF scored IS NOT TRUE OR OLD.scores IS NOT NULL OR NEW.scores IS NULL
+     OR NEW.output IS DISTINCT FROM OLD.output OR NEW.error_kind IS DISTINCT FROM OLD.error_kind
      OR NEW.latency_ms IS DISTINCT FROM OLD.latency_ms OR NEW.passages::text IS DISTINCT FROM OLD.passages::text
-     OR NEW.citations::text IS DISTINCT FROM OLD.citations::text
-     OR (NEW.scores IS NULL AND NEW.explanation IS DISTINCT FROM OLD.explanation) THEN
+     OR NEW.citations::text IS DISTINCT FROM OLD.citations::text THEN
     RAISE EXCEPTION 'eval_case_run_frozen';
   END IF;
   RETURN NEW;
 END $$;
 
-CREATE TRIGGER eval_case_results_guard BEFORE INSERT OR UPDATE ON eval_case_results
+CREATE TRIGGER eval_case_results_guard BEFORE INSERT OR UPDATE OR DELETE ON eval_case_results
   FOR EACH ROW EXECUTE FUNCTION eval_case_run_guard();
 
 CREATE FUNCTION eval_case_scores_final() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -96,8 +106,9 @@ CREATE CONSTRAINT TRIGGER eval_case_results_scores_final
 CREATE FUNCTION eval_case_run_freeze() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF OLD.finished_at IS NOT NULL THEN RAISE EXCEPTION 'eval_case_run_frozen'; END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
   RETURN NEW;
 END $$;
 
-CREATE TRIGGER eval_case_runs_freeze BEFORE UPDATE ON eval_case_runs
+CREATE TRIGGER eval_case_runs_freeze BEFORE UPDATE OR DELETE ON eval_case_runs
   FOR EACH ROW EXECUTE FUNCTION eval_case_run_freeze();

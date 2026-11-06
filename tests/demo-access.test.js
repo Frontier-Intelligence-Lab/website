@@ -153,7 +153,7 @@ test('without a mapping (unset or empty), a viewer stays signed in but gets no o
 test('each reviewer enters its own organization as its dedicated owner; the admin reviewer is not mapped by role', async () => {
   const f = await fixture();
   const yc = await f.login(YC);
-  assert.equal(yc.res.json().to, `/w/${f.yc.slug}/models`);
+  assert.equal(yc.res.json().to, `/w/${f.yc.slug}`);
   assert.deepEqual([yc.res.json().workspace.id, yc.res.json().workspace.name], [f.yc.id, 'YC']);
   assert.ok(!yc.res.body.includes('passwordHash'));
   const account = (await yc.c.get('/api/account')).json();
@@ -161,7 +161,10 @@ test('each reviewer enters its own organization as its dedicated owner; the admi
   assert.deepEqual(account.workspaces.map((w) => [w.id, w.name, w.role, w.synthetic]), [[f.yc.id, 'YC', 'owner', true]]);
   assert.deepEqual([account.isStaff, account.staffScope, account.staffWorkspace, account.joinRequests, account.match, account.signupOpen], [false, null, null, [], null, false]);
   assert.deepEqual([account.demoAccess.reviewer.username, account.demoAccess.reviewer.role, account.demoAccess.workspace.name], [YC, 'viewer', 'YC']);
-  assert.deepEqual([account.demoAccess.capabilities.runners, account.demoAccess.capabilities.jobs, account.demoAccess.capabilities.team, account.demoAccess.capabilities.plan], [false, false, false, true]);
+  const { accountChanges, staff, ...workspaceCapabilities } = account.demoAccess.capabilities;
+  assert.equal(accountChanges, false);
+  assert.equal(staff, false);
+  assert.ok(Object.values(workspaceCapabilities).every((allowed) => allowed === true), 'the mapped owner gets every implemented workspace capability');
   for (const canary of ['SPEEDRUN', 'OPERATOR', 'FOREIGN', f.operator.email, f.pin.id, f.sr.id]) assert.ok(!JSON.stringify(account).includes(canary), canary);
 
   // Real pages read real data of that organization, as its owner.
@@ -180,7 +183,7 @@ test('each reviewer enters its own organization as its dedicated owner; the admi
   assert.ok(!overview.body.includes('SPEEDRUN') && !overview.body.includes('OPERATOR'));
 
   const sr = await f.login(SR);
-  assert.equal(sr.res.json().to, `/w/${f.sr.slug}/models`);
+  assert.equal(sr.res.json().to, `/w/${f.sr.slug}`);
   const srAccount = (await sr.c.get('/api/account')).json();
   assert.deepEqual([srAccount.user.id, srAccount.user.name, srAccount.workspaces[0].name, srAccount.workspaces[0].role], [f.srOwner.id, 'a16z Speedrun', 'a16z Speedrun', 'owner']);
   assert.notEqual(srAccount.user.id, account.user.id);
@@ -222,8 +225,15 @@ test('one reviewer never reaches the other organization, the operator workspace 
     }
     const before = (await f.store.listProjects(o)).length;
     for (const [url, body] of [[`/api/workspaces/${o}/projects`, { name: 'Sneaky', task: 'x', modalities: ['Text'], startingPoint: 'own' }], [`/api/workspaces/${o}/projects/${p.id}`, { name: 'Renamed' }],
-      [`/api/workspaces/${o}/models/pulls`, { modelId: 'fixture-dense-8b' }], [`/api/workspaces/${o}/devices`, { label: 'Mine' }], [`/api/workspaces/${o}/capital/cases`, { title: 'x' }],
-      [`/api/workspaces/${o}/projects/${p.id}/evaluations`, { name: 'x', purpose: 'development' }]]) {
+      [`/api/workspaces/${o}/models/pulls`, { modelId: f.config.modelCatalog[0].id }], [`/api/workspaces/${o}/devices`, { label: 'Mine' }], [`/api/workspaces/${o}/capital/cases`, { title: 'x' }],
+      [`/api/workspaces/${o}/projects/${p.id}/evaluations`, { name: 'x', purpose: 'development' }],
+      [`/api/workspaces/${o}/runners`, { label: 'SYNTHETIC foreign attempt' }], [`/api/workspaces/${o}/runners/${randomUUID()}/revoke`, {}],
+      [`/api/workspaces/${o}/jobs`, { kind: 'probe', runnerId: randomUUID(), idempotencyKey: 'synthetic-foreign-probe' }], [`/api/workspaces/${o}/jobs/${randomUUID()}/cancel`, {}],
+      [`/api/workspaces/${o}/enhance-runs/${randomUUID()}/request`, { expectedUpdatedAt: new Date().toISOString() }],
+      [`/api/workspaces/${o}/capital/credits`, { provider: 'SYNTHETIC QA', status: 'claimed', amountCents: 100 }],
+      [`/api/workspaces/${o}/capital/cases/${randomUUID()}/submit`, {}], [`/api/workspaces/${o}/capital/cases/${randomUUID()}/withdraw`, {}],
+      [`/api/workspaces/${o}/invitations`, { invites: [{ email: 'synthetic-member@reviewer-demo.invalid', role: 'member' }] }],
+      [`/api/workspaces/${o}/invitations/${randomUUID()}/revoke`, {}], [`/api/workspaces/${o}/join-requests/${randomUUID()}/decision`, { approve: true }]]) {
       assert.equal((await c.post(url, body, { 'x-workspace-id': f.yc.id })).statusCode, 404, url);
     }
     assert.equal((await f.store.listProjects(o)).length, before);
@@ -282,7 +292,7 @@ test('an existing reviewer session enters with a same-origin POST, never a GET, 
   assert.equal((await f.app.inject({ method: 'POST', url: '/api/demo/enter', headers: postHeaders, payload: '{}' })).statusCode, 401, 'anonymous');
   const enter = await c.post('/api/demo/enter');
   assert.equal(enter.statusCode, 200, enter.body);
-  assert.equal(enter.json().to, `/w/${f.sr.slug}/models`);
+  assert.equal(enter.json().to, `/w/${f.sr.slug}`);
   assert.equal(enter.headers['cache-control'], 'private, no-store');
   assert.equal((await c.get(`/api/workspaces/${f.sr.id}/projects`)).statusCode, 200);
 
@@ -375,9 +385,11 @@ test('every link is re-checked on each request: entry, workspace, synthetic flag
   const g = await fixture({ storeKind: 'postgres' });
   for (const a of g.accounts) await g.store.upsertReviewer(a);
   const yc = await g.login(YC);
-  assert.equal(yc.res.json().to, `/w/${g.yc.slug}/models`);
+  assert.equal(yc.res.json().to, `/w/${g.yc.slug}`);
   assert.equal((await yc.c.get(`/api/workspaces/${g.yc.id}/models`)).statusCode, 200);
   await g.store.setReviewerEnabled({ username: YC, enabled: false });
+  assert.equal((await yc.c.post(`/api/workspaces/${g.yc.id}/runners`, { label: 'SYNTHETIC must not be linked' })).statusCode, 401, 'a newly enabled mutation also rechecks the disabled reviewer before acting');
+  assert.deepEqual(await g.store.listRunners(g.yc.id), []);
   await expectSignedOut(yc.c, g.yc.id);
   assert.equal((await yc.c.get('/api/session')).json().reviewer, null);
   assert.equal((await overviewOf(yc.c)).statusCode, 401);
@@ -408,7 +420,14 @@ test('mutations outside the allowlist are refused by registered route, whatever 
     }
   }
   assert.equal(passed, DEMO_ALLOWED_MUTATIONS.length, 'every allowlisted pattern is a registered route the gate lets through');
-  assert.equal(denied, 24, 'the denied set covers account, workspace, team, runner, job, case-run start, plan approval, Capital send, credit and staff routes');
+  assert.equal(denied, 12, 'account/identity/workspace-creation/staff routes remain denied; full workspace actions now reach their normal guards');
+  const identityFlows = new Set(['/api/workspaces/:workspaceId/join-requests', '/api/workspaces/:workspaceId/academic/send', '/api/workspaces/:workspaceId/academic/verify']);
+  for (const entry of f.app.registeredRoutes) {
+    const [method, pattern] = entry.split(' ');
+    if (method === 'POST' && pattern.startsWith('/api/workspaces/:workspaceId/')) {
+      assert.equal(allowed.has(pattern), !identityFlows.has(pattern), `${pattern}: workspace features are explicit; account/identity flows remain outside the grant`);
+    }
+  }
 
   for (const url of ['/api/workspaces/slug-available?slug=x', '/api/staff/reviews', '/api/staff/capital', `/api/staff/reviews/${randomUUID()}`, `/api/staff/capital/${randomUUID()}`]) {
     const res = await c.get(url);
@@ -416,10 +435,22 @@ test('mutations outside the allowlist are refused by registered route, whatever 
     assert.equal(res.json().code, 'demo_access_denied', url);
   }
   const p = f.yc.id;
-  for (const [url, headers] of [[`/api/workspaces/${p}/runners/`, {}], [`/api/workspaces/${p}/RUNNERS`, {}], [`/api/workspaces/${p}/runners?allow=1`, {}], [`/api/workspaces/${p}/runners`, { 'x-http-method-override': 'GET' }],
-    [`/api/workspaces/${p}/jobs`, { 'x-original-url': `/api/workspaces/${p}/projects` }], [`/api/workspaces/${p}%2Frunners`, {}], [`/api/workspaces/${p}/capital/credits`, { 'x-workspace-id': f.sr.id }]]) {
+  for (const url of [`/api/workspaces/${p}/runners/`, `/api/workspaces/${p}/RUNNERS`, `/api/workspaces/${p}%2Frunners`]) {
+    const res = await c.post(url, {});
+    assert.equal(res.statusCode, 404, url);
+  }
+  for (const [url, headers] of [[`/api/account/verify?path=/api/workspaces/${p}/runners`, { 'x-http-method-override': 'GET' }],
+    ['/api/workspaces', { 'x-original-url': `/api/workspaces/${p}/projects` }], ['/api/invitations/' + 'x'.repeat(30) + '/accept', { 'x-workspace-id': p }]]) {
     const res = await c.post(url, { label: 'Mine' }, headers);
-    assert.ok([403, 404].includes(res.statusCode), `${url} ${res.statusCode}`);
+    assert.equal(res.statusCode, 403, url);
+    assert.equal(res.json().code, 'demo_access_denied', url);
+  }
+  // A query or spoofed header does not block a permitted action or replace its normal payload validation.
+  for (const [url, headers] of [[`/api/workspaces/${p}/runners?allow=1`, {}], [`/api/workspaces/${p}/jobs`, { 'x-original-url': `/api/workspaces/${p}/projects` }],
+    [`/api/workspaces/${p}/capital/credits`, { 'x-workspace-id': f.sr.id }]]) {
+    const res = await c.post(url, {}, headers);
+    assert.equal(res.statusCode, 400, url);
+    assert.notEqual(res.json().code, 'demo_access_denied', url);
   }
   assert.equal((await c.post('/api/account/signup', { name: 'x', email: 'x@y.example', password: 'long-enough-password' })).json().code, 'demo_access_denied');
   assert.equal((await f.store.listWorkspacesForUser(f.ycOwner.id)).length, 1);
@@ -430,13 +461,13 @@ test('mutations outside the allowlist are refused by registered route, whatever 
   await f.close();
 });
 
-test('allowed demo edits persist under each dedicated owner; execution and money authority stay refused', async () => {
+test('both mapped owners use normal workspace features: edits, Team, runner jobs, approved plans and Capital records persist', async () => {
   const f = await fixture();
   const yc = (await f.login(YC)).c;
   const sr = (await f.login(SR)).c;
   for (const [c, ws, ownerId] of [[yc, f.yc, f.ycOwner.id], [sr, f.sr, f.srOwner.id]]) {
     const p = ws.id;
-    const created = await c.post(`/api/workspaces/${p}/projects`, { name: `${ws.name} reviewer project`, task: 'Flag damaged boxes.', modalities: ['Images'], startingPoint: 'own' });
+    const created = await c.post(`/api/workspaces/${p}/projects`, { name: `${ws.name} reviewer project`, task: 'Answer synthetic policy questions.', modalities: ['Text'], startingPoint: 'own' });
     assert.equal(created.statusCode, 200, created.body);
     const projectId = created.json().project.id;
     assert.equal((await f.store.getProject({ workspaceId: p, projectId })).createdBy, ownerId);
@@ -444,7 +475,8 @@ test('allowed demo edits persist under each dedicated owner; execution and money
     assert.ok((await f.store.listAudit(p)).some((a) => a.action === 'project.updated' && a.actorId === ownerId), 'audit rows name this organization\'s dedicated owner');
     assert.equal((await c.post(`/api/workspaces/${p}/projects/${projectId}/evaluations`, { name: 'Reviewer set', purpose: 'development' })).statusCode, 200);
     assert.equal((await f.store.listEvalSets({ workspaceId: p, projectId })).length, 1);
-    const pull = await c.post(`/api/workspaces/${p}/models/pulls`, { modelId: 'fixture-dense-8b' });
+    const modelId = f.config.modelCatalog[0].id;
+    const pull = await c.post(`/api/workspaces/${p}/models/pulls`, { modelId });
     assert.equal(pull.statusCode, 200, pull.body);
     assert.equal((await f.store.listModelPulls(p))[0].requestedBy, ownerId);
     assert.equal((await c.post(`/api/workspaces/${p}/devices`, { label: 'Reviewer laptop' })).statusCode, 200);
@@ -452,18 +484,120 @@ test('allowed demo edits persist under each dedicated owner; execution and money
     const kase = await c.post(`/api/workspaces/${p}/capital/cases`, { title: 'Reviewer plan' });
     assert.equal(kase.statusCode, 200, kase.body);
     const caseId = kase.json().case.id;
-    for (const [url, body] of [[`/api/workspaces/${p}/capital/cases/${caseId}/submit`, { expectedRevision: 1, contentHash: 'a'.repeat(64), sendToReview: true }], [`/api/workspaces/${p}/capital/cases/${caseId}/withdraw`, {}],
-      [`/api/workspaces/${p}/capital/credits`, { provider: 'Cloud', status: 'claimed', amountCents: 100, expiresOn: null, restrictions: '', reference: '' }],
-      [`/api/workspaces/${p}/runners`, { label: 'Mine' }], [`/api/workspaces/${p}/jobs`, { kind: 'probe', runnerId: randomUUID(), idempotencyKey: 'key-00000001' }],
-      [`/api/workspaces/${p}/enhance-runs/${randomUUID()}/request`, { expectedUpdatedAt: new Date().toISOString() }], [`/api/workspaces/${p}/invitations`, { invites: [{ email: 'x@y.example', role: 'member' }] }]]) {
-      assert.equal((await c.post(url, body)).json().code, 'demo_access_denied', url);
+    // Team uses the ordinary invitation and decision paths, without SMTP/outreach in this local fixture.
+    const invited = await c.post(`/api/workspaces/${p}/invitations`, { invites: [{ email: 'synthetic-member@reviewer-demo.invalid', role: 'member' }] });
+    assert.equal(invited.statusCode, 200);
+    assert.deepEqual([invited.json().saved, invited.json().delivered], [1, false]);
+    const [invitation] = (await c.get(`/api/workspaces/${p}`)).json().invitations;
+    assert.equal(invitation.invitedBy, ownerId);
+    assert.equal((await c.post(`/api/workspaces/${p}/invitations/${invitation.id}/revoke`)).statusCode, 200);
+    assert.deepEqual(await f.store.listInvitations(p), []);
+    const joinRequest = await f.store.createJoinRequest({ workspaceId: p, userId: f.stranger.id, note: 'SYNTHETIC existing request' });
+    const decision = await c.post(`/api/workspaces/${p}/join-requests/${joinRequest.id}/decision`, { approve: true });
+    assert.equal(decision.statusCode, 200);
+    assert.equal(decision.json().joinRequest.decidedBy, ownerId);
+    assert.deepEqual(await f.store.getMembership(p, f.stranger.id), { role: 'member' });
+
+    // One independent, pre-approved synthetic dataset is fixture setup, not a reviewer staff grant.
+    const where = { workspaceId: p, projectId };
+    await f.store.updateProject({ ...where, patch: { success: { measure: 'accuracy', target: 'synthetic QA target' }, dataSource: { mode: 'upload', provenance: 'SYNTHETIC QA data', allowedUses: ['training'] } } });
+    await f.store.createUpload({ ...where, uploadedBy: ownerId, objectKey: `${projectId}/synthetic.txt`, sha256: 'a'.repeat(64), sizeBytes: 10, contentType: 'text/plain', filename: 'synthetic.txt' });
+    const review = await f.store.submitForReview({ ...where, submittedBy: ownerId });
+    assert.equal((await c.post(`/api/staff/reviews/${review.id}/decision`, { decision: 'approved', checks: {} })).json().code, 'demo_access_denied');
+    await f.store.decideReview({ reviewId: review.id, reviewerId: f.operator.id, decision: 'approved', checks: {} });
+    const version = await c.post(`/api/workspaces/${p}/projects/${projectId}/dataset-versions`);
+    assert.equal(version.statusCode, 200);
+    const plan = await c.post(`/api/workspaces/${p}/enhance-runs`, { name: 'SYNTHETIC reviewed plan', baseModelId: modelId, datasets: [{ projectId, version: version.json().version.number }], steps: ['sft'], compute: 'runner', spendCapUsd: 25 });
+    assert.equal(plan.statusCode, 200);
+    const run = plan.json().run;
+    const planPath = `/api/workspaces/${p}/enhance-runs/${run.id}/request`;
+    assert.equal((await c.post(planPath, { expectedUpdatedAt: new Date(Date.parse(run.updatedAt) - 1000).toISOString() })).json().code, 'stale_plan');
+    const requested = await c.post(planPath, { expectedUpdatedAt: run.updatedAt });
+    assert.equal(requested.statusCode, 200);
+    assert.deepEqual([requested.json().run.status, requested.json().run.requestedBy], ['requested', ownerId]);
+    assert.equal((await c.post(planPath, { expectedUpdatedAt: run.updatedAt })).json().code, 'run_requested');
+
+    // These jobs are only queued and cancelled in memory: no runner, GPU, model or paid provider is executed.
+    const linked = await c.post(`/api/workspaces/${p}/runners?workspaceId=${f.foreign.id}`, { label: 'SYNTHETIC local machine', workspaceId: f.foreign.id, createdBy: f.operator.id }, { 'x-workspace-id': f.foreign.id });
+    assert.equal(linked.statusCode, 200);
+    const runner = linked.json().runner; // The generated one-time key is never logged or sent to a machine.
+    assert.deepEqual([runner.workspaceId, runner.createdBy], [p, ownerId], 'query/body/header hints never replace the path pin or mapped actor');
+    for (const kind of ['probe', 'train']) {
+      const queued = await c.post(`/api/workspaces/${p}/jobs`, { kind, runnerId: runner.id, idempotencyKey: `synthetic-${kind}-job`, ...(kind === 'train' ? { enhanceRunId: run.id } : {}) });
+      assert.equal(queued.statusCode, 200);
+      const job = queued.json().job;
+      assert.deepEqual([job.workspaceId, job.status, job.createdBy], [p, 'queued', ownerId]);
+      assert.equal((await c.post(`/api/workspaces/${p}/jobs/${job.id}/cancel`)).statusCode, 200);
+      assert.equal((await f.store.getJob({ workspaceId: p, jobId: job.id })).status, 'cancelled');
     }
+    for (const kind of ['evaluate', 'export']) {
+      const missingArtifact = await c.post(`/api/workspaces/${p}/jobs`, { kind, runnerId: runner.id, enhanceRunId: run.id, trainJobId: randomUUID(), idempotencyKey: `synthetic-${kind}-job` });
+      assert.equal(missingArtifact.statusCode, 400);
+      assert.ok(missingArtifact.json().errors.trainJobId, 'normal artifact validation still applies');
+    }
+    assert.equal((await c.post(`/api/workspaces/${p}/runners/${runner.id}/revoke`)).statusCode, 200);
+    assert.equal((await f.store.getRunner({ workspaceId: p, runnerId: runner.id })).status, 'revoked');
+    assert.deepEqual((await c.get(`/api/workspaces/${p}/jobs`)).json().jobs.map((job) => job.status), ['cancelled', 'cancelled']);
+    assert.deepEqual((await c.get(`/api/workspaces/${p}/runners`)).json().runners.map((machine) => machine.status), ['revoked']);
+
+    // Credits are claimed records, and sending is internal review only: no funds or lender decision is fabricated.
+    const credit = await c.post(`/api/workspaces/${p}/capital/credits`, { provider: 'SYNTHETIC QA provider', status: 'claimed', amountCents: 10000, expiresOn: null, restrictions: 'Synthetic test only; not funded', reference: 'QA only' });
+    assert.equal(credit.statusCode, 200);
+    assert.deepEqual([credit.json().credit.status, credit.json().credit.createdBy], ['claimed', ownerId]);
+    const casePath = `/api/workspaces/${p}/capital/cases/${caseId}`;
+    const saved = await c.post(casePath, { expectedRevision: 1, draft: { purpose: 'SYNTHETIC internal review QA', requestedAmountCents: 10000, company: { legalName: 'SYNTHETIC QA company' }, costItems: [{ category: 'compute', label: 'Synthetic estimate', amountCents: 10000, period: 'one_time', basis: 'estimated', source: 'SYNTHETIC QA estimate', observedAt: '2026-11-06' }] } });
+    assert.equal(saved.statusCode, 200);
+    const consent = (await c.get(casePath)).json();
+    const send = { expectedRevision: consent.case.revision, contentHash: consent.contentHash };
+    assert.equal((await c.post(`${casePath}/submit`, send)).json().code, 'consent_required');
+    assert.equal((await c.post(`${casePath}/submit`, { ...send, contentHash: '0'.repeat(64), sendToReview: true })).json().code, 'content_changed');
+    const sent = await c.post(`${casePath}/submit`, { ...send, sendToReview: true });
+    assert.equal(sent.statusCode, 200);
+    assert.deepEqual([sent.json().case.status, sent.json().submission.submittedBy], ['submitted', ownerId]);
+    assert.equal((await c.post(`${casePath}/withdraw`)).statusCode, 200);
     assert.equal((await f.store.getCapitalCase({ workspaceId: p, caseId })).status, 'draft');
-    assert.deepEqual(await f.store.listCreditRecords(p), []);
+    assert.equal((await f.store.listCapitalSubmissions({ workspaceId: p, caseId }))[0].decision, 'withdrawn');
+    assert.equal((await c.get(`/api/workspaces/${p}/capital`)).json().credits.length, 1, 'the claimed record is returned on a fresh read');
+    assert.equal((await c.get(`/api/workspaces/${p}`)).json().members.find((member) => member.user.id === f.stranger.id).role, 'member');
   }
   // Device records stay with the identity that made them: neither owner sees the other's, in either organization.
   assert.equal((await f.store.listDevices({ workspaceId: f.yc.id, ownerId: f.srOwner.id })).length, 0);
   assert.equal((await f.store.listDevices({ workspaceId: f.sr.id, ownerId: f.ycOwner.id })).length, 0);
+  await f.close();
+});
+
+test('new owner actions retain same-origin protection and stop immediately when the mapping is removed', async () => {
+  const f = await fixture();
+  const { c } = await f.login(YC);
+  const base = `/api/workspaces/${f.yc.id}`;
+  const attempts = [
+    [`${base}/runners`, { label: 'SYNTHETIC must not be linked' }],
+    [`${base}/invitations`, { invites: [{ email: 'synthetic@reviewer-demo.invalid', role: 'member' }] }],
+    [`${base}/capital/credits`, { provider: 'SYNTHETIC QA', status: 'claimed', amountCents: 100 }],
+    [`${base}/enhance-runs/${randomUUID()}/request`, { expectedUpdatedAt: new Date().toISOString() }],
+    [`${base}/jobs`, { kind: 'probe', runnerId: randomUUID(), idempotencyKey: 'synthetic-csrf-attempt' }],
+  ];
+  for (const [url, body] of attempts) {
+    for (const headers of [{ 'content-type': 'application/json' }, { ...postHeaders, origin: 'https://foreign.example' }]) {
+      const res = await f.app.inject({ method: 'POST', url, cookies: c.cookies(), headers, payload: json(body) });
+      assert.equal(res.statusCode, 403, url);
+      assert.equal(res.json().error, 'This request did not come from this site.', 'the request is refused before its feature handler');
+    }
+  }
+  assert.deepEqual(await f.store.listRunners(f.yc.id), []);
+  assert.deepEqual(await f.store.listInvitations(f.yc.id), []);
+  assert.deepEqual(await f.store.listCreditRecords(f.yc.id), []);
+  assert.deepEqual(await f.store.listJobs({ workspaceId: f.yc.id }), []);
+
+  const mapping = f.config.demoReviewerUsers;
+  f.config.demoReviewerUsers = mapping.filter((entry) => entry.username !== YC);
+  assert.equal((await c.post(`${base}/runners`, { label: 'SYNTHETIC revoked mapping' })).statusCode, 401);
+  assert.deepEqual(await f.store.listRunners(f.yc.id), []);
+  f.config.demoReviewerUsers = mapping;
+  assert.equal((await c.post(`${base}/runners`, { label: 'SYNTHETIC no automatic re-entry' })).statusCode, 401);
+  assert.equal((await c.post('/api/demo/enter')).statusCode, 200);
+  assert.equal((await c.post(`${base}/runners`, { label: 'SYNTHETIC explicit re-entry' })).statusCode, 200);
+  assert.equal((await c.get(`${base}/runners`)).json().runners.length, 1);
   await f.close();
 });
 

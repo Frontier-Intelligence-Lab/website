@@ -57,6 +57,7 @@ def case_eval(ctx) -> dict:
     """Run the recipe in the training image with no network, then post the outputs."""
     from .sandbox import Limits, Step
     from .training import JobFailure
+    from .api import case_result_batches
 
     if not ctx.capabilities.get("sandbox", {}).get("available"):
         raise JobFailure("sandbox_unavailable", "Docker is not running on this machine.")
@@ -87,8 +88,15 @@ def case_eval(ctx) -> dict:
             raise JobFailure("runtime_error", "The recipe did not write answers.") from err
     if not isinstance(answers, list):
         raise JobFailure("runtime_error", "The recipe did not write answers.")
-    for start in range(0, len(answers), 20):
-        ctx.api.case_results(ctx.job["id"], ctx.job["leaseToken"], answers[start:start + 20])
+    try:
+        batches = list(case_result_batches(answers, ctx.job["leaseToken"]))
+    except ValueError as err:
+        raise JobFailure("runtime_error", "A recipe result exceeds the upload limit.") from err
+    for batch in batches:
+        if ctx.cancelled.is_set():
+            from .sandbox import Cancelled
+            raise Cancelled()
+        ctx.api.case_results(ctx.job["id"], ctx.job["leaseToken"], batch)
     errors = sum(1 for row in answers if row.get("errorKind"))
     return {"recipe": "support-qa", "recipeVersion": payload.get("recipeVersion") or "", "answered": len(answers) - errors, "errors": errors}
 

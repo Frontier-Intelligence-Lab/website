@@ -1,12 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptBatch, acceptPosted, decideRun, validateCandidate } from '../src/lib/case-run.js';
+import { acceptBatch, acceptPosted, decideRun, runnerFresh, validateCandidate } from '../src/lib/case-run.js';
 import { buildJobSpec, projectResult } from '../src/lib/jobs.js';
 import { loadConfig } from '../src/config.js';
 
 const cases = [{ caseKey: 'window', input: 'How long?', expectedAnswer: '30 days', reviewCriteria: null }];
 const posted = (extra = {}) => new Map([['window', { caseKey: 'window', output: '30 days', errorKind: null, passages: [], citations: ['p1'], latencyMs: 1, ...extra }]]);
 const corpus = [{ id: 'p1', citation: 'p1', text: '30 days' }];
+
+test('runner freshness keeps the exact minute bound and rejects future, absent and invalid reports', () => {
+  const now = Date.parse('2026-01-01T00:01:00.000Z');
+  for (const elapsed of [0, 59_999, 60_000]) assert.equal(runnerFresh(new Date(now - elapsed).toISOString(), now), true);
+  for (const reported of [new Date(now - 60_001).toISOString(), new Date(now + 1).toISOString(), null, 'invalid']) assert.equal(runnerFresh(reported, now), false);
+});
 
 test('exact fact, rubric and citation decide, and token overlap does not', () => {
   const pass = decideRun({ cases, posted: posted(), corpus });
@@ -66,4 +72,19 @@ test('the public job queue cannot start a case run, and its result is counts onl
   assert.equal(loadConfig(base).evalRecipeVersion, '1');
   assert.throws(() => loadConfig({ ...base, EVAL_RECIPE_VERSION: '' }), /EVAL_RECIPE_VERSION/);
   assert.throws(() => loadConfig({ ...base, EVAL_RECIPE_VERSION: 'has space' }), /EVAL_RECIPE_VERSION/);
+});
+
+test('every supported retrieval depth can be received without dropping its passage receipts', () => {
+  for (const retrievalK of [1, 8, 9, 20]) {
+    const candidate = validateCandidate({ candidate: { corpus: 'Policy', retrievalK }, catalog: [] });
+    assert.equal(candidate.error, undefined);
+    const passages = Array.from({ length: retrievalK }, (_, i) => ({ citation: `p${i}`, text: 'Policy' }));
+    const accepted = acceptPosted({ caseKey: 'window', output: 'Policy', passages, citations: passages.map((p) => p.citation) });
+    assert.deepEqual(accepted.result.passages, passages);
+    assert.equal(accepted.result.citations.length, retrievalK);
+  }
+  const passages = Array.from({ length: 21 }, () => ({ citation: 'p', text: 'Policy' }));
+  assert.match(acceptPosted({ caseKey: 'window', output: 'Policy', passages }).error, /too many/);
+  assert.match(acceptPosted({ caseKey: 'window', output: 'Policy', citations: passages.map((p) => p.citation) }).error, /citation/);
+  assert.ok(validateCandidate({ candidate: { corpus: 'Policy', retrievalK: 21 }, catalog: [] }).error);
 });

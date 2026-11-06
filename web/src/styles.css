@@ -970,3 +970,9 @@ th:has(> .sr-only) { position: relative; }
 .eval-tabs [role="tab"][aria-selected="true"] { background: var(--solid); color: var(--on-solid); border-color: var(--solid); }
 .eval-pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; }
 @media (max-width: 720px) { .eval-grid { grid-template-columns: 1fr; } }
+
+/* Research evidence and actions keep their full reading width on phones. */
+@media (max-width: 720px) {
+  .research-list > li { flex-direction: column; align-items: stretch; gap: 6px; }
+  .research-list > li > * { min-width: 0; max-width: 100%; }
+}

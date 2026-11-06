@@ -186,5 +186,12 @@ export function loadConfig(env = process.env) {
     localRuntimeOrigins,
     localMemoryOrigins,
     localModelCatalog,
+    // Web research. The model id is read from the environment and is not called by this server.
+    // RESEARCH_SEARCH_BASE is intentionally unread: paid search is not called.
+    research: {
+      python: env.RESEARCH_PYTHON || 'python',
+      model: env.RESEARCH_MODEL || null,
+      modelBaseUrl: env.RESEARCH_MODEL_BASE_URL || null,
+    },
   };
 }

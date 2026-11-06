@@ -2,9 +2,9 @@
 
 A team that already has a support or document assistant can see which answers fail, tie each failure to the source version they cited, correct the case or the source, and check the next imported answers against a rule they approved.
 
-Training is not part of this loop. A failure may need a better document, a retrieval change, a prompt change, or an abstention. Valcairn does not call a model, run an uploaded scorer, or start a job from these pages.
+Training is not part of the imported-answer comparison loop. A failure may need a better document, a retrieval change, a prompt change, or an abstention. Imported comparisons do not call a model, run an uploaded scorer, or start training. The case-run API can start the extractive sandbox recipe described below; this backend increment does not add a start form.
 
-Executed case runs are a separate record (`migrations/018_case_runs.sql`, `src/lib/case-run.js`). An owner or admin starts one runner job for one frozen version. The runner answers every case inside the sandbox. The server scores exact fact, rubric, and citation, and stores token overlap only as a diagnostic labelled "token overlap". Imported batches stay claims. A case run does not create a comparison. A partial, failed, or cancelled run is kept and has no score.
+Executed case runs are a separate record (`migrations/018_case_runs.sql`, `src/lib/case-run.js`). An owner or admin starts one runner job for one frozen version. The `support-qa` recipe extracts the highest-ranked source passage inside the sandbox; it makes no model call. The server scores exact fact, rubric, and citation, and stores token overlap only as a diagnostic labelled "token overlap". Imported batches stay claims. A case run does not create a comparison. A partial, failed, or cancelled run is kept and has no score.
 
 The labels `development` and `final_assessment` say how the team uses the set. Neither label means the set is secret, leakage-free, or representative of later traffic.
 

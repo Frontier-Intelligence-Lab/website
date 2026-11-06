@@ -123,6 +123,38 @@ export const api = {
   approveEvalReport: (id, projectId, comparisonId, body) => request(`/api/workspaces/${id}/projects/${projectId}/evaluations/comparisons/${comparisonId}/approve`, body),
   evalReport: (id, projectId, reportId) => load(`/api/workspaces/${id}/projects/${projectId}/evaluations/reports/${reportId}`),
   evalExportUrl: (id, projectId, reportId) => `/api/workspaces/${id}/projects/${projectId}/evaluations/reports/${reportId}/export`,
+
+  researchProjects: (id) => load(`/api/workspaces/${id}/research/projects`),
+  researchProject: (id, projectId) => load(`/api/workspaces/${id}/research/projects/${projectId}`),
+  createResearchProject: (id, body) => request(`/api/workspaces/${id}/research/projects`, body),
+  updateResearchProject: (id, projectId, body) => request(`/api/workspaces/${id}/research/projects/${projectId}`, body),
+  importResearch: (id, projectId, body) => request(`/api/workspaces/${id}/research/projects/${projectId}/imports`, body),
+  checkResearchSource: (id, projectId, url) => request(`/api/workspaces/${id}/research/projects/${projectId}/sources`, { url }),
+  researchDirectory: (id, projectId, { directory, listId, q = '', page = 1, sort = 'name' }) => {
+    const query = new URLSearchParams({ q, page: String(page), sort });
+    if (directory) query.set('directory', directory);
+    if (listId) query.set('listId', listId);
+    return load(`/api/workspaces/${id}/research/projects/${projectId}/directory?${query}`);
+  },
+  researchQuality: (id, projectId) => load(`/api/workspaces/${id}/research/projects/${projectId}/quality`),
+  saveResearchChecklist: (id, projectId, checklist) => request(`/api/workspaces/${id}/research/projects/${projectId}/checklist`, { checklist }),
+  researchEntity: (id, entityId) => load(`/api/workspaces/${id}/research/entities/${entityId}`),
+  correctResearchClaim: (id, entityId, body) => request(`/api/workspaces/${id}/research/entities/${entityId}/corrections`, body),
+  createResearchList: (id, projectId, body) => request(`/api/workspaces/${id}/research/projects/${projectId}/lists`, body),
+  addResearchListItem: (id, listId, body) => request(`/api/workspaces/${id}/research/lists/${listId}/items`, body),
+  removeResearchListItem: (id, listId, entityId) => request(`/api/workspaces/${id}/research/lists/${listId}/items/${entityId}/remove`, {}),
+  createResearchRun: (id, projectId, body) => request(`/api/workspaces/${id}/research/projects/${projectId}/runs`, body),
+  researchRun: (id, runId) => load(`/api/workspaces/${id}/research/runs/${runId}`),
+  startResearchRun: (id, runId) => request(`/api/workspaces/${id}/research/runs/${runId}/start`, {}),
+  cancelResearchRun: (id, runId) => request(`/api/workspaces/${id}/research/runs/${runId}/cancel`, {}),
+  acceptResearchRun: (id, runId, externalKeys) => request(`/api/workspaces/${id}/research/runs/${runId}/accept`, { externalKeys }),
+  researchExportUrl: (id, projectId, { directory, listId } = {}) => {
+    const query = new URLSearchParams();
+    if (directory) query.set('directory', directory);
+    if (listId) query.set('listId', listId);
+    const suffix = query.toString();
+    return `/api/workspaces/${id}/research/projects/${projectId}/exports${suffix ? `?${suffix}` : ''}`;
+  },
 };
 
 /**

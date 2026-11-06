@@ -21,7 +21,7 @@ Browser ── HTTPS ──► web (Node/Fastify) ── SQL ──► Postgres 
 
 Workers that run on a customer's own machine (Valcairn Runners, `docs/RUNNERS.md`) do not connect to Postgres. They call `web` over HTTPS with a runner key and lease jobs from the same Postgres queue through it, so tenancy and roles are checked by `web` on every call and the machine needs no inbound port or database credentials.
 
-Public-source research is a separate path (`docs/RESEARCH.md`). The schema, planner, stores and existing company catalog are in this storage unit. The separate Python standard-library fetch worker, its credential-free runtime, the Fastify routes and Research screens follow in coherent units. Research is not a train job or the saved-note Agent. File upload stays on `services/ingest`.
+Public-source research is a separate path (`docs/RESEARCH.md`). The existing schema/planner/stores keep workspace-scoped evidence. The runtime unit packages the credential-free Python standard-library worker and Node adapter; these Research routes now authorize and invoke that bounded public-HTTPS retrieval path, and the React workspace exposes its actual records. It is neither a training job nor the saved-note Agent. File upload stays on `services/ingest`. Source availability is not a deployment or model-synthesis claim.
 
 ## Rules that hold across services
 
@@ -29,6 +29,7 @@ Public-source research is a separate path (`docs/RESEARCH.md`). The schema, plan
 - **Files never pass through `web`.** Browsers upload straight to `ingest`, using a short-lived grant signed by `web` (HMAC, `INGEST_SHARED_SECRET`). `ingest` returns a receipt signed with the same secret, and `web` records only receipts it can verify. Object keys are derived from the workspace and grant, never chosen by the client.
 - **Previews are inert and short-lived.** For any workspace member, `web` signs a 30-minute `preview` link naming one object and the type to serve it as. `ingest` serves only images, audio, video and plain text inline (`/v1/preview`, with byte ranges for seeking), under `Content-Security-Policy: default-src 'none'; sandbox` and `nosniff`. Downloads (`/v1/objects`) stay attachment-only and are signed only for roles that can edit.
 - **Tenancy is enforced by the service that answers.** `web` checks workspace membership on every route. `ingest` accepts only a grant scoped to one workspace, project and size limit. Workers act on job rows that carry their workspace id.
+- **One workspace product.** Normal accounts and mapped YC/Speedrun reviewers use the same workspace routes, shell, navigation, components, forms and backend workflows. Their specialized organization records and genuinely recorded experiments differ; no lite/demo product fork, mocked completion or invented result replaces the real product. Reviewer owner actions stay inside the server-pinned organization and use normal role/validation/freeze checks; account-global and staff authority remain separate. Local runtime, gateway and runner prerequisites must actually exist.
 - **Fail closed.** A missing secret, database or storage location turns the feature off with a clear message. It never falls back to something unsafe.
 - **No secrets in Git.** Configuration comes from the environment. Each service documents its variables in its own README.
 
