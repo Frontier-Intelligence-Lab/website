@@ -85,6 +85,7 @@ export function registerEvalRoutes(app, { store, helpers, guards }) {
     return {
       ...flags(role),
       comparison,
+      version: { id: detail.version.id, number: detail.version.number, contentHash: detail.version.contentHash },
       summary,
       review: toReviewView({ comparison: detail.comparison, rows }),
       ...(hidden ? {} : { baseline: publicBatch(detail.baselineBatch), candidate: publicBatch(detail.candidateBatch) }),

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.js';
-import { RECIPE_ID, acceptBatch, decideRun, presentRun, runnerFresh, unscoredRun, validateCandidate } from '../lib/case-run.js';
+import { RECIPE_ID, acceptBatch, decideRun, listRunView, presentRun, runnerFresh, unscoredRun, validateCandidate } from '../lib/case-run.js';
 
 const invalid = (message) => new StoreError('invalid_state', message);
 const KEY = /^[A-Za-z0-9_-]{8,100}$/;
@@ -145,10 +145,7 @@ export function caseRunMemoryMethods({ stamp, copy, audit }) {
       const views = [];
       for (const row of matched) {
         const full = await this.getCaseRun({ workspaceId, projectId, runId: row.id });
-        const view = { ...full };
-        delete view.results;
-        delete view.passages;
-        views.push(view);
+        views.push(listRunView(full));
       }
       return views;
     },

@@ -1022,6 +1022,8 @@ export function runStoreContract(test, makeStore, label) {
     assert.equal(run.scored, false);
     const listed = await store.listCaseRuns({ ...where, versionId: frozen.id });
     assert.equal(listed[0].passages, undefined);
+    assert.equal(listed[0].results, undefined);
+    assert.equal(listed[0].passCount, null);
     assert.equal(listed[0].passageCount, 1);
     const leaseHash = 'd'.repeat(64);
     const hold = async (jobId) => {
@@ -1084,6 +1086,13 @@ export function runStoreContract(test, makeStore, label) {
     const fromList = (await store.listCaseRuns({ ...where, versionId: frozen.id })).find((item) => item.id === quiet.id);
     assert.equal(fromList.status, 'cancelled');
     assert.equal(fromList.scored, false);
+    assert.equal(fromList.passCount, null);
+    const scoredList = (await store.listCaseRuns({ ...where, versionId: frozen.id })).find((item) => item.id === run.id);
+    const partialList = (await store.listCaseRuns({ ...where, versionId: frozen.id })).find((item) => item.id === partial.id);
+    assert.equal(scoredList.passCount, 2);
+    assert.equal(scoredList.results, undefined);
+    assert.equal(partialList.status, 'partial');
+    assert.equal(partialList.passCount, null);
     assert.equal(imported.batch.label, 'imported');
     assert.equal((await store.getEvalSet({ ...where, setId: set.id })).comparisons.length, 0);
   });

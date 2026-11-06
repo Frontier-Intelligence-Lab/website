@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { requireWorkspace } from './ui.jsx';
 import { WorkspaceShell } from './shell.jsx';
 import { PLANNED, SYNTHETIC_CASES, SYNTHETIC_PREDICTIONS } from '../../../src/lib/eval-shared.js';
+import { ImportTriage, RunPair } from './triage.jsx';
 
 const TABS = [['cases', 'Cases'], ['quality', 'Quality'], ['comparisons', 'Comparisons']];
 const PURPOSES = [['development', 'Development'], ['final_assessment', 'Final assessment']];
@@ -28,7 +29,13 @@ export async function evalHomeLoader({ params }) {
 }
 export async function evalSetLoader({ params }) {
   const base = await workspaceProject(params);
-  return { ...base, ...(await api.evaluation(base.entry.id, params.projectId, params.setId)) };
+  const detail = await api.evaluation(base.entry.id, params.projectId, params.setId);
+  const caseRuns = [];
+  for (const version of detail.versions ?? []) {
+    const listed = await api.caseRuns(base.entry.id, params.projectId, params.setId, version.id);
+    for (const run of listed.runs ?? []) caseRuns.push(run);
+  }
+  return { ...base, ...detail, caseRuns };
 }
 export async function evalReviewLoader({ params }) {
   const base = await workspaceProject(params);
@@ -193,7 +200,7 @@ export function EvalSet() {
   const revalidator = useRevalidator();
   const [params, setParams] = useSearchParams();
   const tab = TABS.some(([id]) => id === params.get('tab')) ? params.get('tab') : 'cases';
-  const { account, entry, project, set, cases, issues, counts, sources, versions, comparisons, reports, canWrite, canApprove } = data;
+  const { account, entry, project, set, cases, issues, counts, sources, versions, comparisons, reports, caseRuns = [], canWrite, canApprove } = data;
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState(null);
@@ -301,6 +308,7 @@ export function EvalSet() {
                 <PredictionForm entry={entry} project={project} set={set} version={version} text={predictions} setText={setPredictions} pending={pending} act={act} />
               )}
               {canWrite && <CompareForm entry={entry} project={project} set={set} version={version} pending={pending} act={act} />}
+              <RunPair entry={entry} project={project} set={set} version={version} runs={caseRuns.filter((run) => run.versionId === version.id)} />
             </section>
           ))}
           <ul className="ob-list">
@@ -310,7 +318,7 @@ export function EvalSet() {
                 <li key={comparison.id}>
                   <div>
                     <Link to={`${base}/review/${comparison.id}`}><strong>Review comparison</strong></Link>
-                    <span className="ob-muted">Revision {comparison.revision}{comparison.blind?.hideIdentity ? ' · identities hidden on the review screen' : ''}</span>
+                    <span className="ob-muted">Imported answers · revision {comparison.revision}{comparison.blind?.hideIdentity ? ' · identities hidden on the review screen' : ''}</span>
                     {report && <Link to={`${base}/reports/${report.id}`}>Report: {report.decision}</Link>}
                   </div>
                 </li>
@@ -511,7 +519,7 @@ function Side({ title, side, hidden, values, setValues, prefix }) {
 export function EvalReview() {
   const data = useLoaderData();
   const revalidator = useRevalidator();
-  const { account, entry, project, comparison, summary, review, baseline, candidate, canWrite, canApprove } = data;
+  const { account, entry, project, comparison, version, summary, review, baseline, candidate, canWrite, canApprove } = data;
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState(null);
@@ -604,6 +612,7 @@ export function EvalReview() {
         <p>Revision {comparison.revision}. {hidden ? 'System names are hidden on this screen. The saved left and right assignment is stored and shown again on the approved report.' : 'System names are visible.'} Normalized exact match is not semantic correctness.</p>
       </div>
       <Banner status={status} error={error} onRetry={() => revalidator.revalidate()} />
+      <ImportTriage review={review} summary={summary} baseline={baseline} candidate={candidate} version={version} />
       <Summary summary={summary} />
       {canWrite && (
         <div className="ob-row-actions">
@@ -614,7 +623,7 @@ export function EvalReview() {
       {review.cases.map((row) => {
         const values = valuesFor(row);
         return (
-          <article key={row.caseKey} className="ob-card">
+          <article key={row.caseKey} id={`review-${row.caseKey}`} className="ob-card">
             <h2>{row.caseKey}{row.severity === 'critical' ? ' · critical' : ''}</h2>
             <p>{row.input}</p>
             <p className="ob-muted">Expected: {row.expectedAnswer ?? 'none'}. Criteria: {row.reviewCriteria ?? 'none'}. Category: {row.category ?? 'none'}.</p>
