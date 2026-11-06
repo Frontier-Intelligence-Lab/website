@@ -88,7 +88,7 @@ export function ResearchHome() {
       <section className="ob-card" aria-labelledby="research-projects-h">
         <h2 id="research-projects-h">Projects</h2>
         {projects.length === 0 ? <p className="ob-muted">No research projects yet.</p> : (
-          <ul className="ob-list">
+          <ul className="ob-list research-list">
             {projects.map((project) => (
               <li key={project.id}><Link to={`/w/${entry.slug}/research/${project.id}`}>{project.name}</Link> <span className="ob-muted">{project.template}</span></li>
             ))}
@@ -191,7 +191,7 @@ export function ResearchProject() {
           </select>
         </label>
         {listing.total === 0 ? <p className="ob-muted">{listId ? (q ? 'No list members match this search.' : `This list has no members. ${canWrite ? 'Open a directory record and add it to this list.' : 'A workspace writer can add records to this list.'}`) : EMPTY[directory]}</p> : (
-          <ul className="ob-list">
+          <ul className="ob-list research-list">
             {listing.rows.map((row) => (
               <li key={row.entity.id}>
                 <Link to={`${base}/entities/${row.entity.id}`}>{row.entity.name}</Link>
@@ -239,7 +239,7 @@ export function ResearchProject() {
           if (res) navigate(`${base}/runs/${res.data.run.id}`);
         }} />}
         {runs.length === 0 ? <p className="ob-muted">No runs yet. A proposed run fetches nothing until you start it.</p> : (
-          <ul className="ob-list">
+          <ul className="ob-list research-list">
             {runs.map((run) => <li key={run.id}><Link to={`${base}/runs/${run.id}`}>{run.question}</Link> <span className="ob-muted">{run.status}</span></li>)}
           </ul>
         )}
@@ -247,7 +247,7 @@ export function ResearchProject() {
       <section className="ob-card" aria-labelledby="research-lists-h">
         <h2 id="research-lists-h">Lists</h2>
         <p className="ob-muted">A list is a shortlist you curate. It does not qualify a record.</p>
-        {lists.length === 0 ? <p className="ob-muted">No lists yet.</p> : <ul className="ob-list">{lists.map((list) => <li key={list.id}>
+        {lists.length === 0 ? <p className="ob-muted">No lists yet.</p> : <ul className="ob-list research-list">{lists.map((list) => <li key={list.id}>
           <strong>{list.name}</strong> <span className="ob-muted">{list.count} members</span>
           <Link to={`${base}?listId=${encodeURIComponent(list.id)}&page=1&sort=name`} aria-current={list.id === listId ? 'page' : undefined}>Inspect {list.name}</Link>
           <a href={api.researchExportUrl(entry.id, project.id, { listId: list.id })}>Export {list.name} CSV</a>
@@ -436,7 +436,7 @@ export function ResearchEntity() {
       <section className="ob-card" aria-labelledby="claims-h">
         <h2 id="claims-h">Claims</h2>
         {claims.length === 0 ? <p className="ob-muted">No claims.</p> : (
-          <ul className="ob-list">
+          <ul className="ob-list research-list">
             {claims.map((claim) => (
               <li key={claim.id}>
                 <div style={{ overflowWrap: 'anywhere' }}>
@@ -453,7 +453,7 @@ export function ResearchEntity() {
       <section className="ob-card" aria-labelledby="rel-h">
         <h2 id="rel-h">Relationships</h2>
         {relationships.length === 0 ? <p className="ob-muted">No relationships recorded.</p> : (
-          <ul className="ob-list">{relationships.map((row) => <li key={row.id}>{row.kind}</li>)}</ul>
+          <ul className="ob-list research-list">{relationships.map((row) => <li key={row.id}>{row.kind}</li>)}</ul>
         )}
         {duplicates.length > 0 && <p>Open duplicate candidates: {duplicates.filter((row) => row.status === 'open').length}. Same name and kind with a different key. They were not merged.</p>}
       </section>
@@ -485,7 +485,7 @@ export function ResearchEntity() {
       )}
       <section className="ob-card" aria-labelledby="entity-lists-h">
         <h2 id="entity-lists-h">Lists</h2>
-        {lists.length === 0 ? <p className="ob-muted">Not on a list.</p> : <ul className="ob-list">{lists.map((list) => <li key={list.id}>{list.name}</li>)}</ul>}
+        {lists.length === 0 ? <p className="ob-muted">Not on a list.</p> : <ul className="ob-list research-list">{lists.map((list) => <li key={list.id}>{list.name}</li>)}</ul>}
         {canWrite && project.lists?.length > 0 && (
           <form onSubmit={async (event) => {
             event.preventDefault();
@@ -557,7 +557,7 @@ export function ResearchRun() {
       {notice && <p className="ob-alert ob-alert--ok" role="status">{notice}</p>}
       <section className="ob-card" aria-labelledby="perm-h">
         <h2 id="perm-h">Permissions for this run</h2>
-        <ul className="ob-list">
+        <ul className="ob-list research-list">
           <li>Fetch the https URLs named here: {(run.permissions?.urls ?? []).join(', ') || 'none'}</li>
           <li>Wikimedia search: {run.permissions?.wikimedia ? 'yes' : 'no'}</li>
           <li>Paid web search: not called</li>
@@ -574,15 +574,15 @@ export function ResearchRun() {
         <section className="ob-card" aria-labelledby="report-h">
           <h2 id="report-h">Report</h2>
           <h3>Findings</h3>
-          {output.findings?.length ? <ul className="ob-list">{output.findings.map((finding) => <li key={finding.sourceUrl}>{finding.text} <span className="ob-muted">{finding.label}. {finding.sourceUrl}</span></li>)}</ul> : <p className="ob-muted">No findings.</p>}
+          {output.findings?.length ? <ul className="ob-list research-list">{output.findings.map((finding) => <li key={finding.sourceUrl}>{finding.text} <span className="ob-muted">{finding.label}. {finding.sourceUrl}</span></li>)}</ul> : <p className="ob-muted">No findings.</p>}
           <h3>Interpretation</h3>
           <p className="ob-muted">{output.interpretation?.length ? output.interpretation.join(' ') : 'No interpretation was added.'}</p>
           <h3>Uncertainty</h3>
-          <ul className="ob-list">{(output.uncertainty ?? []).map((item) => <li key={item}>{item}</li>)}</ul>
+          <ul className="ob-list research-list">{(output.uncertainty ?? []).map((item) => <li key={item}>{item}</li>)}</ul>
           <h3>Limitations</h3>
-          <ul className="ob-list">{(output.limitations ?? []).map((item) => <li key={item}>{item}</li>)}</ul>
+          <ul className="ob-list research-list">{(output.limitations ?? []).map((item) => <li key={item}>{item}</li>)}</ul>
           <h3>Citations</h3>
-          <ul className="ob-list">{(output.citations ?? []).map((citation) => <li key={citation.url}><a href={citation.url}>{citation.title || citation.url}</a></li>)}</ul>
+          <ul className="ob-list research-list">{(output.citations ?? []).map((citation) => <li key={citation.url}><a href={citation.url}>{citation.title || citation.url}</a></li>)}</ul>
           {canWrite && run.status === 'completed' && (
             <form onSubmit={(event) => { event.preventDefault(); act(() => api.acceptResearchRun(entry.id, run.id, picked), 'The findings were not accepted.', 'accept'); }}>
               <fieldset>
@@ -601,7 +601,7 @@ export function ResearchRun() {
       )}
       <section className="ob-card" aria-labelledby="events-h">
         <h2 id="events-h">Events</h2>
-        <ul className="ob-list">{events.map((event) => <li key={event.id}><span className="ob-muted">{event.kind}</span> {event.message}</li>)}</ul>
+        <ul className="ob-list research-list">{events.map((event) => <li key={event.id}><span className="ob-muted">{event.kind}</span> {event.message}</li>)}</ul>
       </section>
     </WorkspaceShell>
   );
