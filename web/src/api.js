@@ -27,7 +27,12 @@ export const api = {
 
   account: () => load('/api/account'),
   signup: (fields) => request('/api/account/signup', fields),
-  signin: (fields) => request('/api/account/signin', fields),
+  signin: (fields) => {
+    const identifier = fields?.email ?? fields?.username;
+    return typeof identifier === 'string' && identifier.includes('@')
+      ? request('/api/account/signin', { ...fields, email: identifier })
+      : request('/api/login', { username: identifier, password: fields?.password });
+  },
   signout: () => request('/api/account/signout', {}),
   verify: (code) => request('/api/account/verify', { code }),
   resendCode: () => request('/api/account/verify/resend', {}),
