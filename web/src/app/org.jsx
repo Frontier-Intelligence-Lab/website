@@ -3,6 +3,7 @@ import { Link, redirect, useLoaderData, useNavigate, useRevalidator } from 'reac
 import { api } from '../api.js';
 import { FieldError, Icon, SetupShell, Tile, initials, requireVerified, requireWorkspace } from './ui.jsx';
 import { forgetConnections } from './memory.js';
+import { WorkspaceShell } from './shell.jsx';
 
 const PERSONAL = ['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'proton.me', 'protonmail.com', 'aol.com'];
 const domainOf = (email) => email.split('@')[1]?.toLowerCase() ?? '';
@@ -315,9 +316,9 @@ export function OrgMatch() {
 }
 
 export async function teamLoader({ params }) {
-  const { entry } = await requireWorkspace(params.slug);
+  const { account, entry } = await requireWorkspace(params.slug);
   if (entry.kind !== 'organization') throw redirect(`/w/${entry.slug}`);
-  return { entry, detail: await api.workspace(entry.id) };
+  return { account, entry, detail: await api.workspace(entry.id) };
 }
 
 // Matches the server's checks in src/accounts.js (CAN) and src/datasets.js. Access is workspace-wide.
@@ -390,22 +391,22 @@ function Members({ members }) {
 }
 
 export function OrgTeam() {
-  const { entry, detail } = useLoaderData();
+  const { account, entry, detail } = useLoaderData();
   const manage = ['owner', 'admin'].includes(detail.role);
-  return manage ? <OrgTeamManage entry={entry} detail={detail} /> : (
-    <SetupShell tone="blue" context={detail.workspace.name} status={null} exit={{ to: `/w/${entry.slug}`, label: 'Back to workspace' }}>
-      <title>Team — Valcairn</title>
-      <main className="ob-main ob-main--narrow">
-        <h1 className="ob-h1">Team</h1>
-        <p className="ob-lede">Only owners and admins can invite people or approve requests to join.</p>
+  return (
+    <WorkspaceShell account={account} entry={entry} role={detail.role} title="Team" current="team">
+      {manage ? <OrgTeamManage entry={entry} detail={detail} /> : <>
+        <div className="ob-intro">
+          <h1 className="ob-h1">Team</h1>
+          <p className="ob-lede">Only owners and admins can invite people or approve requests to join.</p>
+        </div>
         <Members members={detail.members} />
-      </main>
-    </SetupShell>
+      </>}
+    </WorkspaceShell>
   );
 }
 
 function OrgTeamManage({ entry, detail }) {
-  const navigate = useNavigate();
   const [rows, setRows] = useState([{ email: '', role: 'member' }, { email: '', role: 'member' }]);
   const [message, setMessage] = useState(null);
   const [saved, setSaved] = useState(null);
@@ -422,20 +423,18 @@ function OrgTeamManage({ entry, detail }) {
   async function submit(event) {
     event.preventDefault();
     const invites = rows.filter((r) => r.email.trim());
-    if (!invites.length) return navigate(next);
+    if (!invites.length) return;
     const res = await api.invite(entry.id, invites).catch(() => null);
     if (res?.ok) setSaved(res.data);
     else setMessage(res?.data.error ?? 'Could not save the invitations.');
   }
 
   return (
-    <SetupShell tone="blue" context={detail.workspace.name} status="Organization created" exit={{ to: `/w/${entry.slug}`, label: 'Exit setup' }} steps={['Organization', 'Team and roles', 'First project']} current={1}>
-      <title>Invite your team — Valcairn</title>
-      <form className="ob-main" onSubmit={submit} noValidate>
+      <form className="ob-main" style={{ padding: 0, maxWidth: 'none' }} onSubmit={submit} noValidate>
         <section className="ob-col">
           <div className="ob-intro">
-            <h1 className="ob-h1">Who else should be here?</h1>
-            <p className="ob-lede">Invite the people you'll work with. Roles decide who can see and change data, who approves plans and links machines, and who plans costs on Capital. Enforced spend limits and funding are planned.</p>
+            <h1 className="ob-h1">Team</h1>
+            <p className="ob-lede">Invite people and manage workspace access.</p>
           </div>
           {message && <p className="ob-alert" role="alert">{message}</p>}
           {(detail.joinRequests.length > 0 || detail.workspace.joinByDomain) && <JoinRequests workspaceId={entry.id} requests={detail.joinRequests} />}
@@ -474,13 +473,8 @@ function OrgTeamManage({ entry, detail }) {
             </div>
           </section>
           <div className="ob-actions">
-            <Link className="btn-ghost" to="/start">Back</Link>
-            <div>
-              {saved ? <Link className="btn-app" to={next}>Continue <Icon name="arrow" size={16} /></Link> : <>
-                <Link className="btn-text" to={next}>Skip, I'll invite later</Link>
-                <button className="btn-app" type="submit">Send invites <Icon name="arrow" size={16} /></button>
-              </>}
-            </div>
+            <Link className="btn-ghost" to={next}>Create a project <Icon name="arrow" size={16} /></Link>
+            {!saved && <button className="btn-app" type="submit" disabled={!rows.some((row) => row.email.trim())}>Send invites <Icon name="arrow" size={16} /></button>}
           </div>
         </section>
         <aside className="ob-aside">
@@ -505,6 +499,5 @@ function OrgTeamManage({ entry, detail }) {
           <div className="ob-note tile--amber"><span>The Finance role sees projects read-only and, with owners and admins, plans costs, records outside credits and gathers evidence on Capital. Only owners and admins send a case to Valcairn's internal review. Lender offers and funding are planned, not available.</span></div>
         </aside>
       </form>
-    </SetupShell>
   );
 }
